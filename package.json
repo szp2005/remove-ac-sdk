@@ -1,6 +1,6 @@
 {
   "name": "remove-ac",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Official zero-dependency Node.js 18+ SDK & CLI for remove.ac (/v1.0/removebg + up to 25 MB zero-disk GPU streaming).",
   "type": "module",
   "main": "./node/index.mjs",

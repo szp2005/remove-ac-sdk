@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import struct
 import urllib.error
 import urllib.request
 import uuid
@@ -12,12 +13,106 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 DEFAULT_BASE_URL = "https://remove.ac"
 DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024
+DIRECT_RGBA_PNG_PIXELS = 5_000_000
+DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000
+
+
+def parse_image_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    if not data or len(data) < 10:
+        return None
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        w, h = struct.unpack(">II", data[16:24])
+        return (w, h) if 0 < w <= 1_000_000 and 0 < h <= 1_000_000 else None
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        w, h = struct.unpack("<HH", data[6:10])
+        return (w, h) if w > 0 and h > 0 else None
+    if len(data) >= 25 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
+            w, h = struct.unpack("<HH", data[26:30])
+            w &= 0x3FFF
+            h &= 0x3FFF
+            return (w, h) if w > 0 and h > 0 else None
+        if chunk == b"VP8L" and data[20] == 0x2F:
+            b0, b1, b2, b3 = data[21], data[22], data[23], data[24]
+            w = 1 + (b0 | ((b1 & 0x3F) << 8))
+            h = 1 + ((b1 >> 6) | (b2 << 2) | ((b3 & 0x0F) << 10))
+            return (w, h) if w > 0 and h > 0 else None
+        if chunk == b"VP8X" and len(data) >= 30:
+            w = 1 + (data[24] | (data[25] << 8) | (data[26] << 16))
+            h = 1 + (data[27] | (data[28] << 8) | (data[29] << 16))
+            return (w, h) if w > 0 and h > 0 else None
+    if data[:2] == b"\xff\xd8":
+        pos = 2
+        steps = 0
+        while steps < 512 and pos + 3 < len(data):
+            steps += 1
+            if data[pos] != 0xFF:
+                break
+            while pos < len(data) and data[pos] == 0xFF:
+                pos += 1
+            if pos >= len(data):
+                break
+            marker = data[pos]
+            pos += 1
+            if marker in (0xD9, 0xDA):
+                break
+            if marker in (0x00, 0x01) or (0xD0 <= marker <= 0xD7):
+                continue
+            if pos + 1 >= len(data):
+                break
+            seg_len = (data[pos] << 8) | data[pos + 1]
+            if seg_len < 2:
+                break
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                if pos + 6 >= len(data):
+                    break
+                h = (data[pos + 3] << 8) | data[pos + 4]
+                w = (data[pos + 5] << 8) | data[pos + 6]
+                return (w, h) if w > 0 and h > 0 else None
+            pos += seg_len
+    return None
+
+
+def _should_preflight_via_ticket(
+    img_bytes: Optional[bytes], size: str, fmt: str, channels: str, crop: bool
+) -> bool:
+    if not img_bytes:
+        return False
+    if fmt not in ("png", "auto", "zip") or channels == "alpha":
+        return False
+    dims = parse_image_dimensions(img_bytes)
+    if not dims:
+        return False
+    input_px = dims[0] * dims[1]
+    if size in ("preview", "small", "regular"):
+        eff = min(input_px, 250_000)
+    elif size == "medium":
+        eff = min(input_px, 1_500_000)
+    elif size == "hd":
+        eff = min(input_px, 4_000_000)
+    elif size == "4k":
+        eff = min(input_px, 10_000_000)
+    else:
+        eff = input_px
+    return eff > (DIRECT_CROPPED_RGBA_PNG_PIXELS if crop else DIRECT_RGBA_PNG_PIXELS)
 
 
 class RemoveAcError(Exception):
     def __init__(self, status_code: int, message: str):
         super().__init__(f"[HTTP {status_code}] {message}")
         self.status_code = status_code
+
+
+def derive_sub_idempotency_key(idem: str, suffix: str) -> str:
+    trimmed = (idem or "").strip()
+    if not trimmed or len(trimmed) > 255:
+        raise RemoveAcError(400, "idempotency_key must be between 1 and 255 characters")
+    direct = f"{trimmed}:{suffix}"
+    if len(direct) <= 255:
+        return direct
+    digest = hashlib.sha256(trimmed.encode("utf-8")).hexdigest()[:32]
+    return f"{trimmed[:180]}:{digest}:{suffix}"
 
 
 def _encode_multipart(
@@ -104,6 +199,7 @@ class RemoveAcClient:
         format: str = "png",
         channels: str = "rgba",
         type: str = "auto",
+        type_level: Optional[str] = None,
         roi: Optional[str] = None,
         scale: Optional[str] = None,
         position: Optional[str] = None,
@@ -121,7 +217,13 @@ class RemoveAcClient:
     ) -> bytes:
         if not self.api_key:
             raise RemoveAcError(403, "Missing remove.ac API key")
-        idem = idempotency_key or f"pysdk-{uuid.uuid4()}"
+        if idempotency_key is not None:
+            trimmed_idem = idempotency_key.strip()
+            if not trimmed_idem or len(trimmed_idem) > 255:
+                raise RemoveAcError(400, "idempotency_key must be between 1 and 255 characters")
+            idem = trimmed_idem
+        else:
+            idem = f"pysdk-{uuid.uuid4()}"
         img_bytes: Optional[bytes] = None
         img_name = "image.png"
         img_url: Optional[str] = None
@@ -150,6 +252,8 @@ class RemoveAcClient:
             }
             if type and type != "auto":
                 payload["type"] = type
+            if type_level:
+                payload["type_level"] = type_level
             if roi:
                 payload["roi"] = roi
             if scale:
@@ -177,7 +281,7 @@ class RemoveAcClient:
                 {
                     "Content-Type": "application/json",
                     "X-Api-Key": self.api_key,
-                    "Idempotency-Key": f"{idem}:{suffix}",
+                    "Idempotency-Key": derive_sub_idempotency_key(idem, suffix),
                 },
                 json.dumps(payload).encode("utf-8"),
                 30,
@@ -200,7 +304,11 @@ class RemoveAcClient:
                 raise RemoveAcError(d_status, d_body.decode("utf-8", errors="replace"))
             return d_body
 
-        if img_bytes is not None and (direct or len(img_bytes) > DIRECT_THRESHOLD_BYTES):
+        if img_bytes is not None and (
+            direct
+            or len(img_bytes) > DIRECT_THRESHOLD_BYTES
+            or _should_preflight_via_ticket(img_bytes, size, format, channels, crop)
+        ):
             return _via_ticket("direct")
 
         fields: Dict[str, str] = {
@@ -213,6 +321,8 @@ class RemoveAcClient:
             fields["image_url"] = img_url
         if type and type != "auto":
             fields["type"] = type
+        if type_level:
+            fields["type_level"] = type_level
         if roi:
             fields["roi"] = roi
         if scale:
@@ -247,6 +357,22 @@ class RemoveAcClient:
             mp_body,
             timeout,
         )
+        if (
+            status == 409
+            and idempotency_key is None
+            and b"idempotency_replay_unavailable" in body
+        ):
+            status, _, body = self._transport(
+                "POST",
+                f"{self.base_url}/v1.0/removebg",
+                {
+                    "X-Api-Key": self.api_key,
+                    "Idempotency-Key": f"pysdk-{uuid.uuid4()}",
+                    "Content-Type": mp_ct,
+                },
+                mp_body,
+                timeout,
+            )
         if status == 413 and img_bytes is not None:
             return _via_ticket("fallback413")
         if status < 200 or status >= 300:
