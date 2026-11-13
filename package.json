@@ -1,0 +1,48 @@
+{
+  "name": "remove-ac",
+  "version": "1.0.0",
+  "description": "Official zero-dependency Node.js 18+ SDK & CLI for remove.ac (/v1.0/removebg + up to 25 MB zero-disk GPU streaming).",
+  "type": "module",
+  "main": "./node/index.mjs",
+  "types": "./node/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./node/index.mjs",
+      "types": "./node/index.d.ts"
+    }
+  },
+  "bin": {
+    "remove-ac": "./bin/remove-ac-cli.mjs"
+  },
+  "files": [
+    "node/",
+    "bin/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/node-sdk.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/szp2005/remove-ac-sdk.git"
+  },
+  "homepage": "https://remove.ac/api-info",
+  "bugs": {
+    "url": "https://github.com/szp2005/remove-ac-sdk/issues"
+  },
+  "keywords": [
+    "remove.ac",
+    "remove.bg",
+    "background-removal",
+    "image-segmentation",
+    "matting",
+    "cutout",
+    "sdk",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
