@@ -3,6 +3,7 @@ export interface RemoveBackgroundOptions {
   format?: "auto" | "png" | "jpg" | "webp" | "zip";
   channels?: "rgba" | "alpha";
   type?: "auto" | "person" | "product" | "car" | "animal" | "graphic" | "transportation";
+  typeLevel?: "none" | "1" | "2" | "latest";
   roi?: string;
   scale?: string;
   position?: string;
@@ -25,6 +26,12 @@ export interface RemoveBackgroundResult {
   creditsCharged: number;
   mediaType: string;
 }
+
+export declare function parseImageDimensions(
+  bytes: Uint8Array | ArrayBuffer,
+): { width: number; height: number } | null;
+
+export declare function deriveSubIdempotencyKey(idem: string, suffix: string): string;
 
 export declare class RemoveAcError extends Error {
   statusCode: number;
