@@ -1,7 +1,7 @@
 {
   "name": "remove-ac",
-  "version": "1.0.1",
-  "description": "Official zero-dependency Node.js 18+ SDK & CLI for remove.ac (/v1.0/removebg + up to 25 MB zero-disk GPU streaming).",
+  "version": "1.1.0",
+  "description": "Official zero-dependency Node.js 18+ SDK, CLI & MCP Server for remove.ac (/v1.0/removebg + up to 25 MB zero-disk GPU streaming).",
   "type": "module",
   "main": "./node/index.mjs",
   "types": "./node/index.d.ts",
@@ -12,16 +12,20 @@
     }
   },
   "bin": {
-    "remove-ac": "./bin/remove-ac-cli.mjs"
+    "remove-ac": "./bin/remove-ac-cli.mjs",
+    "remove-ac-mcp": "./bin/remove-ac-mcp.mjs"
   },
   "files": [
     "node/",
     "bin/",
+    "smithery.yaml",
+    "glama.json",
+    "server.json",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/node-sdk.test.mjs"
+    "test": "node --test test/node-sdk.test.mjs test/mcp-server.test.mjs"
   },
   "repository": {
     "type": "git",
@@ -39,7 +43,11 @@
     "matting",
     "cutout",
     "sdk",
-    "cli"
+    "cli",
+    "mcp",
+    "model-context-protocol",
+    "claude-desktop",
+    "cursor"
   ],
   "engines": {
     "node": ">=18.0.0"

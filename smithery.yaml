@@ -1,0 +1,23 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - removeAcApiKey
+    properties:
+      removeAcApiKey:
+        type: string
+        description: Your remove.ac API key (rac_live_... — claim 5 free trial credits at https://remove.ac/api-info)
+      removeAcBaseUrl:
+        type: string
+        default: https://remove.ac
+        description: Optional custom remove.ac API base URL
+  commandFunction: |-
+    (config) => ({
+      command: "node",
+      args: ["./bin/remove-ac-mcp.mjs"],
+      env: {
+        REMOVE_AC_API_KEY: config.removeAcApiKey,
+        ...(config.removeAcBaseUrl ? { REMOVE_AC_BASE_URL: config.removeAcBaseUrl } : {})
+      }
+    })

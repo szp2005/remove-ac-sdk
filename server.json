@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "name": "io.github.szp2005/remove-ac",
+  "description": "Stateless Cloud GPU background removal MCP server (/v1.0/removebg + up to 25 MB zero-disk streaming).",
+  "repository": {
+    "url": "https://github.com/szp2005/remove-ac-sdk",
+    "source": "github"
+  },
+  "version": "1.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "remove-ac",
+      "version": "1.1.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "REMOVE_AC_API_KEY",
+          "description": "remove.ac API key (rac_live_...). Claim 5 free trial credits on verified signup at https://remove.ac/api-info.",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
