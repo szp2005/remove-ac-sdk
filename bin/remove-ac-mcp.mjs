@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { RemoveAcClient } from "../node/index.mjs";
 
 export const SERVER_NAME = "remove-ac-mcp";
-export const SERVER_VERSION = "1.1.1";
+export const SERVER_VERSION = "1.1.2";
 export const MAX_MCP_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_MCP_HEADER_BYTES = 16 * 1024;
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";

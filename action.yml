@@ -1,0 +1,79 @@
+name: "remove.ac Background Remover"
+author: "remove.ac"
+description: "Drop-in /v1.0/removebg Cloud GPU background removal for local files, folders, or URLs (up to 25 MB zero-disk streaming)."
+branding:
+  icon: "scissors"
+  color: "purple"
+
+inputs:
+  api_key:
+    description: "remove.ac API key (rac_live_...). Falls back to REMOVE_AC_API_KEY env var."
+    required: false
+  input_path:
+    description: "Local image file (.png, .jpg, .jpeg, .webp) or folder of images inside GITHUB_WORKSPACE."
+    required: false
+  image_url:
+    description: "Public https:// or http:// image URL to remove the background from (mutually exclusive with input_path)."
+    required: false
+  output_path:
+    description: "Destination file path for single-file or image_url mode. Defaults to '<stem>-nobg.<ext>' for single local files."
+    required: false
+  output_dir:
+    description: "Destination folder when input_path is a directory. Defaults to '<input_path>/cutouts'."
+    required: false
+  overwrite:
+    description: "Allow overwriting existing output files ('true' or 'false')."
+    required: false
+    default: "false"
+  size:
+    description: "Output resolution tier: auto, preview, small, regular, medium, hd, 4k, or full."
+    required: false
+    default: "full"
+  format:
+    description: "Output image format: png, jpg, webp, or zip."
+    required: false
+    default: "png"
+  bg_color:
+    description: "Optional solid background hex color (e.g. 'FFFFFF') instead of transparency."
+    required: false
+  crop:
+    description: "Trim transparent padding around the foreground subject ('true' or 'false')."
+    required: false
+    default: "false"
+  type:
+    description: "Foreground category hint: auto, person, product, car, animal, graphic, or transportation."
+    required: false
+    default: "auto"
+  add_shadow:
+    description: "Render a drop or contact shadow under the cutout ('true' or 'false')."
+    required: false
+    default: "false"
+  shadow_type:
+    description: "Shadow preset when add_shadow is true: auto, car, 3d, drop, or contact."
+    required: false
+  base_url:
+    description: "remove.ac HTTPS API origin (defaults to https://remove.ac)."
+    required: false
+    default: "https://remove.ac"
+  allow_outside_workspace:
+    description: "Allow reading/writing paths outside GITHUB_WORKSPACE ('true' or 'false')."
+    required: false
+    default: "false"
+
+outputs:
+  output_path:
+    description: "Resolved path to the generated cutout file (or output directory in batch mode)."
+  output_files_json:
+    description: "JSON array of all generated cutout file paths."
+  processed_count:
+    description: "Number of images processed."
+  credits_charged:
+    description: "Total remove.ac API credits charged across this step."
+  width:
+    description: "Output width in pixels (single-image mode)."
+  height:
+    description: "Output height in pixels (single-image mode)."
+
+runs:
+  using: "node20"
+  main: "bin/remove-ac-action.mjs"

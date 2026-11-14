@@ -16,11 +16,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run Node.js SDK tests
+      - name: Run Node.js SDK, MCP & GitHub Action tests
         run: npm test
       - name: Run CLI --help smoke check
         run: node ./bin/remove-ac-cli.mjs --help
       - name: Run MCP server --help smoke check
         run: node ./bin/remove-ac-mcp.mjs --help
+      - name: Run GitHub Action --help smoke check
+        run: node ./bin/remove-ac-action.mjs --help
       - name: Run Python SDK tests
         run: python3 -m unittest discover -s tests -v
