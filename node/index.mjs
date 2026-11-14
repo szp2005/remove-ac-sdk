@@ -1,6 +1,12 @@
 import crypto from "node:crypto";
+import dns from "node:dns";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  fetchWithoutRedirects,
+  isLoopbackTestOrigin,
+  validateHttpsEndpointUrl,
+} from "./net-safety.mjs";
 
 const DEFAULT_BASE_URL = "https://remove.ac";
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024;
@@ -131,11 +137,23 @@ export class RemoveAcClient {
     this.baseUrl = (options.baseUrl || process.env.REMOVE_AC_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.apiKey = options.apiKey || process.env.REMOVE_AC_API_KEY || process.env.REMOVE_BG_API_KEY || "";
     this.fetchImpl = options.fetch || globalThis.fetch;
+    this.lookupImpl = options.lookup || dns.promises.lookup;
+  }
+
+  async _request(url, init = {}) {
+    try {
+      return await fetchWithoutRedirects(this.fetchImpl, url, init);
+    } catch (err) {
+      if (err && typeof err.statusCode === "number") {
+        throw new RemoveAcError(err.statusCode, err.message);
+      }
+      throw err;
+    }
   }
 
   async getAccount() {
     if (!this.apiKey) throw new RemoveAcError(403, "Missing remove.ac API key");
-    const res = await this.fetchImpl(`${this.baseUrl}/v1.0/account`, {
+    const res = await this._request(`${this.baseUrl}/v1.0/account`, {
       headers: { "X-Api-Key": this.apiKey },
     });
     if (!res.ok) throw new RemoveAcError(res.status, await res.text());
@@ -196,7 +214,7 @@ export class RemoveAcClient {
         ...(options.shadowOpacity !== undefined ? { shadow_opacity: options.shadowOpacity } : {}),
         ...(options.semitransparency !== undefined ? { semitransparency: options.semitransparency } : {}),
       };
-      const tRes = await this.fetchImpl(`${this.baseUrl}/v1.0/removebg/ticket`, {
+      const tRes = await this._request(`${this.baseUrl}/v1.0/removebg/ticket`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -207,11 +225,29 @@ export class RemoveAcClient {
       });
       if (!tRes.ok) throw new RemoveAcError(tRes.status, await tRes.text());
       const tJson = await tRes.json();
+      const ticketToken = tJson?.data?.ticket;
+      const directEndpoint = tJson?.data?.directEndpoint;
+      if (
+        typeof ticketToken !== "string" ||
+        !ticketToken.trim() ||
+        typeof directEndpoint !== "string" ||
+        !directEndpoint.trim()
+      ) {
+        throw new RemoveAcError(502, "Missing ticket or directEndpoint in /v1.0/removebg/ticket response");
+      }
+      const epErr = await validateHttpsEndpointUrl(directEndpoint, {
+        lookupFn: this.lookupImpl,
+        allowLoopbackOrigin: isLoopbackTestOrigin(this.baseUrl),
+        label: "directEndpoint",
+      });
+      if (epErr) {
+        throw new RemoveAcError(502, epErr);
+      }
       const fd = new FormData();
       fd.set("image_file", new Blob([sourceBytes]), sourceName);
-      const dRes = await this.fetchImpl(tJson.data.directEndpoint, {
+      const dRes = await this._request(directEndpoint, {
         method: "POST",
-        headers: { Authorization: `Bearer ${tJson.data.ticket}` },
+        headers: { Authorization: `Bearer ${ticketToken}` },
         body: fd,
       });
       if (!dRes.ok) throw new RemoveAcError(dRes.status, await dRes.text());
@@ -256,7 +292,7 @@ export class RemoveAcClient {
       return fd;
     };
 
-    let res = await this.fetchImpl(`${this.baseUrl}/v1.0/removebg`, {
+    let res = await this._request(`${this.baseUrl}/v1.0/removebg`, {
       method: "POST",
       headers: { "X-Api-Key": this.apiKey, "Idempotency-Key": idem },
       body: buildFormData(),
@@ -264,7 +300,7 @@ export class RemoveAcClient {
     if (res.status === 409 && !options.idempotencyKey) {
       const errBody = await res.text();
       if (errBody.includes("idempotency_replay_unavailable")) {
-        res = await this.fetchImpl(`${this.baseUrl}/v1.0/removebg`, {
+        res = await this._request(`${this.baseUrl}/v1.0/removebg`, {
           method: "POST",
           headers: { "X-Api-Key": this.apiKey, "Idempotency-Key": `sdk-${crypto.randomUUID()}` },
           body: buildFormData(),
@@ -288,14 +324,24 @@ export class RemoveAcClient {
 }
 
 export async function removeBackgroundFromImageFile(opts) {
-  const client = new RemoveAcClient({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, fetch: opts.fetch });
+  const client = new RemoveAcClient({
+    apiKey: opts.apiKey,
+    baseUrl: opts.baseUrl,
+    fetch: opts.fetch,
+    lookup: opts.lookup,
+  });
   const out = await client.removeBackground(opts.path, opts);
   if (opts.outputFile) fs.writeFileSync(opts.outputFile, out.buffer);
   return { base64img: out.buffer.toString("base64"), ...out };
 }
 
 export async function removeBackgroundFromImageUrl(opts) {
-  const client = new RemoveAcClient({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, fetch: opts.fetch });
+  const client = new RemoveAcClient({
+    apiKey: opts.apiKey,
+    baseUrl: opts.baseUrl,
+    fetch: opts.fetch,
+    lookup: opts.lookup,
+  });
   const out = await client.removeBackground(opts.url, opts);
   if (opts.outputFile) fs.writeFileSync(opts.outputFile, out.buffer);
   return { base64img: out.buffer.toString("base64"), ...out };

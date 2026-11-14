@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import os
+import socket
 import struct
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 DEFAULT_BASE_URL = "https://remove.ac"
 DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024
@@ -140,6 +143,150 @@ def _encode_multipart(
 
 
 TransportFn = Callable[[str, str, Dict[str, str], Optional[bytes], int], Tuple[int, Dict[str, str], bytes]]
+ResolverFn = Callable[[str], Sequence[str]]
+
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_BENCHMARK_NET = ipaddress.ip_network("198.18.0.0/15")
+_DISCARD_V6_NET = ipaddress.ip_network("100::/64")
+_NAT64_LOCAL_NET = ipaddress.ip_network("64:ff9b:1::/48")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def http_error_302(self, req, fp, code, msg, headers):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _is_disallowed_ip(raw_ip: str) -> bool:
+    clean = raw_ip.strip().strip("[]").split("%", 1)[0]
+    try:
+        ip_obj = ipaddress.ip_address(clean)
+    except ValueError:
+        return True
+
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None:
+            return _is_disallowed_ip(str(ip_obj.ipv4_mapped))
+        ip_int = int(ip_obj)
+        # Well-known NAT64 64:ff9b::/96
+        if (ip_int >> 32) == 0x0064FF9B0000000000000000:
+            return _is_disallowed_ip(str(ipaddress.IPv4Address(ip_int & 0xFFFFFFFF)))
+        if ip_obj in _NAT64_LOCAL_NET or ip_obj in _DISCARD_V6_NET:
+            return True
+        # IPv4-compatible ::w.x.y.z or SIIT ::ffff:0:w.x.y.z
+        if (ip_int >> 32) in (0, 0xFFFF0000) and ip_int > 1:
+            return _is_disallowed_ip(str(ipaddress.IPv4Address(ip_int & 0xFFFFFFFF)))
+        return (
+            not ip_obj.is_global
+            or ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+            or ip_obj.is_site_local
+        )
+
+    if ip_obj in _CGNAT_NET or ip_obj in _BENCHMARK_NET:
+        return True
+    return (
+        not ip_obj.is_global
+        or ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+def _default_resolver(host: str) -> List[str]:
+    infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return [str(entry[4][0]) for entry in infos if entry and len(entry) >= 5 and entry[4]]
+
+
+def _is_loopback_test_origin(raw_url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(raw_url.strip())
+    except Exception:
+        return False
+    if parsed.scheme.lower() != "http":
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def validate_https_endpoint_url(
+    raw_url: str,
+    *,
+    allow_loopback_origin: bool = False,
+    resolver: Optional[ResolverFn] = None,
+    label: str = "directEndpoint",
+) -> Optional[str]:
+    try:
+        parsed = urllib.parse.urlsplit((raw_url or "").strip())
+    except Exception:
+        return f"Invalid {label} URL"
+    if parsed.username or parsed.password:
+        return f"{label} must not contain embedded credentials"
+    if allow_loopback_origin and _is_loopback_test_origin(raw_url):
+        return None
+    if parsed.scheme.lower() != "https":
+        return f"{label} must use https://"
+    host = (parsed.hostname or "").lower()
+    if (
+        not host
+        or host == "localhost"
+        or host.endswith(".localhost")
+        or host.endswith(".local")
+        or host.endswith(".internal")
+        or host.endswith(".home.arpa")
+    ):
+        return f"Disallowed {label} (local or internal hostname)"
+
+    clean_host = host.split("%", 1)[0]
+    try:
+        ipaddress.ip_address(clean_host)
+        is_literal = True
+    except ValueError:
+        is_literal = False
+
+    if is_literal:
+        if _is_disallowed_ip(clean_host):
+            return f"Disallowed {label} (private, loopback, or reserved IP address)"
+        return None
+
+    if "." not in host or host.isdigit() or host.startswith("0x"):
+        return f"Disallowed {label} (single-label or numeric hostname)"
+
+    resolve_fn = resolver or _default_resolver
+    try:
+        addrs = list(resolve_fn(host))
+    except Exception:
+        return f"Disallowed {label} (unable to resolve hostname '{host}')"
+    if not addrs:
+        return f"Disallowed {label} (hostname '{host}' returned no DNS records)"
+    allow_tun_fake_ip = host == "remove.ac" or host.endswith(".remove.ac")
+    for addr in addrs:
+        if not addr:
+            return f"Disallowed {label} (hostname '{host}' resolves to a private, loopback, or reserved IP)"
+        clean_addr = str(addr).strip().strip("[]").split("%", 1)[0]
+        try:
+            addr_obj = ipaddress.ip_address(clean_addr)
+        except ValueError:
+            return f"Disallowed {label} (hostname '{host}' resolves to an invalid IP)"
+        if allow_tun_fake_ip and isinstance(addr_obj, ipaddress.IPv4Address) and addr_obj in _BENCHMARK_NET:
+            continue
+        if _is_disallowed_ip(clean_addr):
+            return f"Disallowed {label} (hostname '{host}' resolves to a private, loopback, or reserved IP)"
+    return None
 
 
 def _default_transport(
@@ -151,13 +298,16 @@ def _default_transport(
 ) -> Tuple[int, Dict[str, str], bytes]:
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
             return resp.status, resp_headers, resp.read()
     except urllib.error.HTTPError as exc:
-        err_body = exc.read() if exc.fp else b""
-        resp_headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
-        return exc.code, resp_headers, err_body
+        try:
+            err_body = exc.read() if exc.fp else b""
+            resp_headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
+            return exc.code, resp_headers, err_body
+        finally:
+            exc.close()
 
 
 class RemoveAcClient:
@@ -166,6 +316,7 @@ class RemoveAcClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         transport: Optional[TransportFn] = None,
+        resolver: Optional[ResolverFn] = None,
     ):
         self.api_key = (
             api_key
@@ -176,6 +327,7 @@ class RemoveAcClient:
         resolved_base = base_url or os.environ.get("REMOVE_AC_BASE_URL") or DEFAULT_BASE_URL
         self.base_url = resolved_base.rstrip("/")
         self._transport = transport or _default_transport
+        self._resolver = resolver
 
     def get_account(self, timeout: int = 15) -> Dict[str, Any]:
         if not self.api_key:
@@ -288,13 +440,34 @@ class RemoveAcClient:
             )
             if t_status < 200 or t_status >= 300:
                 raise RemoveAcError(t_status, t_body.decode("utf-8", errors="replace"))
-            t_data = json.loads(t_body.decode("utf-8"))["data"]
+            try:
+                parsed_ticket = json.loads(t_body.decode("utf-8"))
+            except Exception as exc:
+                raise RemoveAcError(502, "Invalid JSON in /v1.0/removebg/ticket response") from exc
+            t_data = parsed_ticket.get("data") if isinstance(parsed_ticket, dict) else None
+            ticket_tok = t_data.get("ticket") if isinstance(t_data, dict) else None
+            direct_ep = t_data.get("directEndpoint") if isinstance(t_data, dict) else None
+            if (
+                not isinstance(ticket_tok, str)
+                or not ticket_tok.strip()
+                or not isinstance(direct_ep, str)
+                or not direct_ep.strip()
+            ):
+                raise RemoveAcError(502, "Missing ticket or directEndpoint in /v1.0/removebg/ticket response")
+            ep_err = validate_https_endpoint_url(
+                direct_ep,
+                allow_loopback_origin=_is_loopback_test_origin(self.base_url),
+                resolver=self._resolver,
+                label="directEndpoint",
+            )
+            if ep_err:
+                raise RemoveAcError(502, ep_err)
             mp_body, mp_ct = _encode_multipart({}, ("image_file", img_name, img_bytes))
             d_status, _, d_body = self._transport(
                 "POST",
-                t_data["directEndpoint"],
+                direct_ep,
                 {
-                    "Authorization": f"Bearer {t_data['ticket']}",
+                    "Authorization": f"Bearer {ticket_tok}",
                     "Content-Type": mp_ct,
                 },
                 mp_body,
@@ -389,8 +562,14 @@ class RemoveBg:
         error_log_file: Optional[str] = None,
         base_url: str = DEFAULT_BASE_URL,
         transport: Optional[TransportFn] = None,
+        resolver: Optional[ResolverFn] = None,
     ):
-        self.client = RemoveAcClient(api_key=api_key, base_url=base_url, transport=transport)
+        self.client = RemoveAcClient(
+            api_key=api_key,
+            base_url=base_url,
+            transport=transport,
+            resolver=resolver,
+        )
         self.error_log_file = error_log_file
 
     def remove_background_from_img_file(

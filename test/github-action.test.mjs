@@ -217,3 +217,114 @@ test("writeGithubOutputs safely wraps multiline values without delimiter injecti
   const text = fs.readFileSync(outFile, "utf8");
   assert.match(text, /^output_path<<ghadelim_[0-9a-f]{32}\n\/workspace\/line1\nINJECTED=evil\nEOF\nghadelim_[0-9a-f]{32}\n$/);
 });
+
+test("MF-3 & MF-4: GitHub Action protects GITHUB_STATE, uncreated runner files under symlinked dirs, dangling symlink ancestors (0 API calls), and exact shadow_type allowlist", async (t) => {
+  const ws = createTempWorkspace(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "remove-ac-outside-mf3-"));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+
+  // 1) GITHUB_STATE must be protected even if not yet created on disk
+  const uncreatedState = path.join(ws, "_runner_state_uncreated");
+  assert.throws(
+    () =>
+      resolveSafeActionPath("_runner_state_uncreated", {
+        env: { GITHUB_WORKSPACE: ws, GITHUB_STATE: uncreatedState },
+        cwd: ws,
+        forWrite: true,
+      }),
+    /protected GitHub Actions runner control file/
+  );
+
+  // 2) Uncreated GITHUB_OUTPUT referenced through a symlinked runner directory alias must still match canonical path
+  const realRunnerDir = path.join(outside, "real-runner");
+  fs.mkdirSync(realRunnerDir);
+  const aliasRunnerDir = path.join(outside, "alias-runner");
+  fs.symlinkSync(realRunnerDir, aliasRunnerDir);
+  const uncreatedOutputViaAlias = path.join(aliasRunnerDir, "uncreated_output.txt");
+  const uncreatedOutputViaReal = path.join(realRunnerDir, "uncreated_output.txt");
+  assert.throws(
+    () =>
+      resolveSafeActionPath(uncreatedOutputViaReal, {
+        env: {
+          GITHUB_WORKSPACE: ws,
+          GITHUB_OUTPUT: uncreatedOutputViaAlias,
+        },
+        cwd: ws,
+        allowOutsideWorkspace: true,
+        forWrite: true,
+      }),
+    /protected GitHub Actions runner control file/
+  );
+
+  // 3) Dangling symlink ancestor directory inside GITHUB_WORKSPACE must fail BEFORE calling remove.ac API (0 HTTP calls)
+  const inputFile = path.join(ws, "item.png");
+  fs.writeFileSync(inputFile, TINY_PNG);
+  const danglingDir = path.join(ws, "escape_dir");
+  fs.symlinkSync(path.join(outside, "nonexistent_target_dir"), danglingDir);
+
+  let apiCalls = 0;
+  await assert.rejects(
+    () =>
+      runGithubAction({
+        env: {
+          GITHUB_WORKSPACE: ws,
+          INPUT_API_KEY: "rac_live_no_burn",
+          INPUT_INPUT_PATH: "item.png",
+          INPUT_OUTPUT_PATH: "escape_dir/cutout.png",
+          INPUT_BASE_URL: "http://127.0.0.1:8787",
+        },
+        cwd: ws,
+        stdout: { write() {} },
+        allowLoopbackBaseUrlForTest: true,
+        fetchImpl: async () => {
+          apiCalls += 1;
+          return new Response(TINY_PNG, { status: 200 });
+        },
+      }),
+    /symbolic link/
+  );
+  assert.equal(apiCalls, 0, "Must make 0 HTTP calls when output traverses a dangling symlink");
+
+  // 4) MF-4: shadow_type rejects '3d' and accepts 'soft' / 'reflection' / 'none'
+  await assert.rejects(
+    () =>
+      runGithubAction({
+        env: {
+          GITHUB_WORKSPACE: ws,
+          INPUT_API_KEY: "rac_live_test",
+          INPUT_INPUT_PATH: "item.png",
+          INPUT_SHADOW_TYPE: "3d",
+          INPUT_BASE_URL: "http://127.0.0.1:8787",
+        },
+        cwd: ws,
+        stdout: { write() {} },
+        allowLoopbackBaseUrlForTest: true,
+      }),
+    /Unsupported shadow_type '3d'/
+  );
+
+  for (const validShadow of ["soft", "reflection", "none"]) {
+    const res = await runGithubAction({
+      env: {
+        GITHUB_WORKSPACE: ws,
+        INPUT_API_KEY: "rac_live_test",
+        INPUT_INPUT_PATH: "item.png",
+        INPUT_OUTPUT_PATH: `item-${validShadow}.png`,
+        INPUT_ADD_SHADOW: "true",
+        INPUT_SHADOW_TYPE: validShadow,
+        INPUT_BASE_URL: "http://127.0.0.1:8787",
+      },
+      cwd: ws,
+      stdout: { write() {} },
+      allowLoopbackBaseUrlForTest: true,
+      fetchImpl: async (_url, init) => {
+        assert.equal(init.body.get("shadow_type"), validShadow);
+        return new Response(TINY_PNG, {
+          status: 200,
+          headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+        });
+      },
+    });
+    assert.equal(res.processed_count, "1");
+  }
+});

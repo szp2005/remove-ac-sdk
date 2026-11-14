@@ -52,6 +52,10 @@ test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.1.
     MCP_TOOLS.map((t) => t.name),
     ["remove_background_file", "remove_background_url", "get_account_balance"],
   );
+  assert.deepEqual(
+    MCP_TOOLS[0].inputSchema.properties.shadowType.enum,
+    ["auto", "car", "drop", "soft", "contact", "reflection", "none"],
+  );
 });
 
 test("MCP get_account_balance surfaces totalCredits cleanly for positive and zero balances", async () => {
@@ -97,6 +101,7 @@ test("MCP remove_background_file writes cutout output and upgrades >4 MB files v
   const fakeClient = () =>
     new RemoveAcClient({
       apiKey: "rac_live_mcp_test",
+      lookup: async () => [{ address: "93.184.216.34", family: 4 }],
       fetch: async (url) => {
         calls.push(url);
         if (url.endsWith("/v1.0/removebg/ticket")) {

@@ -44,7 +44,11 @@ class PythonSdkTest(unittest.TestCase):
                 return 200, {"content-type": "application/json"}, payload
             return 200, {"content-type": "image/png"}, b"\x89PNG_DIRECT"
 
-        client = RemoveAcClient(api_key="rac_live_test_example", transport=fake_transport)
+        client = RemoveAcClient(
+            api_key="rac_live_test_example",
+            transport=fake_transport,
+            resolver=lambda _host: ["93.184.216.34"],
+        )
         out = client.remove_background(big, size="full")
         self.assertEqual(out, b"\x89PNG_DIRECT")
         self.assertEqual(len(calls), 2)
@@ -88,7 +92,11 @@ class PythonSdkTest(unittest.TestCase):
                 return 200, {"content-type": "application/json"}, payload
             return 200, {"content-type": "image/png"}, b"DIRECT_PY_PNG"
 
-        client = RemoveAcClient(api_key="rac_live_test_example", transport=fake_transport)
+        client = RemoveAcClient(
+            api_key="rac_live_test_example",
+            transport=fake_transport,
+            resolver=lambda _host: ["93.184.216.34"],
+        )
         out = client.remove_background(jpeg_24mp, size="auto", format="png")
         self.assertEqual(out, b"DIRECT_PY_PNG")
         self.assertEqual(
@@ -127,11 +135,93 @@ class PythonSdkTest(unittest.TestCase):
                 return 200, {"content-type": "application/json"}, payload
             return 200, {"content-type": "image/png"}, b"OK_FALLBACK"
 
-        client = RemoveAcClient(api_key="rac_live_test_example", transport=fake_transport)
+        client = RemoveAcClient(
+            api_key="rac_live_test_example",
+            transport=fake_transport,
+            resolver=lambda _host: ["93.184.216.34"],
+        )
         res = client.remove_background(b"small_input", idempotency_key=long_250)
         self.assertEqual(res, b"OK_FALLBACK")
         ticket_hdr = seen_headers[1][1]["Idempotency-Key"]
         self.assertLessEqual(len(ticket_hdr), 255)
+
+    def test_mf1_and_mf2_blocks_3xx_redirects_and_unsafe_direct_endpoints(self):
+        import http.server
+        import threading
+
+        leak_hits = []
+
+        class LeakHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                leak_hits.append(dict(self.headers))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"LEAKED")
+
+            def log_message(self, *args):
+                pass
+
+        leak_srv = http.server.HTTPServer(("127.0.0.1", 0), LeakHandler)
+        leak_port = leak_srv.server_port
+
+        class RedirectHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(307)
+                self.send_header("Location", f"http://127.0.0.1:{leak_port}/steal")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        redir_srv = http.server.HTTPServer(("127.0.0.1", 0), RedirectHandler)
+        redir_port = redir_srv.server_port
+
+        t1 = threading.Thread(target=leak_srv.serve_forever, daemon=True)
+        t2 = threading.Thread(target=redir_srv.serve_forever, daemon=True)
+        t1.start()
+        t2.start()
+        try:
+            live_client = RemoveAcClient(
+                api_key="rac_live_secret_py",
+                base_url=f"http://127.0.0.1:{redir_port}",
+            )
+            with self.assertRaises(RemoveAcError) as ctx:
+                live_client.get_account(timeout=5)
+            self.assertEqual(ctx.exception.status_code, 307)
+            self.assertEqual(len(leak_hits), 0)
+        finally:
+            redir_srv.shutdown()
+            leak_srv.shutdown()
+            redir_srv.server_close()
+            leak_srv.server_close()
+
+        bad_endpoints = [
+            None,
+            "http://gpu.remove.ac/v1.0/direct-cutout",
+            "https://127.0.0.1/v1.0/direct-cutout",
+            "https://[::ffff:169.254.169.254]/latest/meta-data",
+            "https://rebind.example.com/v1.0/direct-cutout",
+        ]
+        for bad_ep in bad_endpoints:
+            calls = []
+
+            def bad_ticket_transport(method, url, headers, body, timeout):
+                calls.append(url)
+                data_obj = {"ticket": "tkt_bad"}
+                if bad_ep is not None:
+                    data_obj["directEndpoint"] = bad_ep
+                return 200, {"content-type": "application/json"}, json.dumps({"data": data_obj}).encode("utf-8")
+
+            c = RemoveAcClient(
+                api_key="rac_live_test",
+                base_url="https://remove.ac",
+                transport=bad_ticket_transport,
+                resolver=lambda _host: ["10.0.0.8"],
+            )
+            with self.assertRaises(RemoveAcError) as err_ctx:
+                c.remove_background(b"abc", direct=True)
+            self.assertEqual(err_ctx.exception.status_code, 502)
+            self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

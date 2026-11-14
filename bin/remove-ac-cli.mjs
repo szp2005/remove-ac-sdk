@@ -11,9 +11,15 @@
  *   node remove-ac-cli.mjs ./hot-folder --output-dir ./cutouts --watch
  */
 import crypto from "node:crypto";
+import dns from "node:dns";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  fetchWithoutRedirects,
+  isLoopbackTestOrigin,
+  validateHttpsEndpointUrl,
+} from "../node/net-safety.mjs";
 
 const DEFAULT_BASE_URL = "https://remove.ac";
 const SUPPORTED_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -299,7 +305,9 @@ export async function processImageBuffer({
   baseUrl,
   bgInput = null,
   fetchImpl = globalThis.fetch,
+  lookupFn = dns.promises.lookup,
 }) {
+  const safeFetch = async (url, init = {}) => fetchWithoutRedirects(fetchImpl, url, init);
   const fgSha = sha256Hex(bytes);
   const bgTag = bgInput
     ? bgInput.kind === "url"
@@ -360,23 +368,44 @@ export async function processImageBuffer({
     if (opts.shadowType) ticketBody.shadow_type = opts.shadowType;
     if (opts.shadowOpacity !== "") ticketBody.shadow_opacity = opts.shadowOpacity;
 
-    const ticketRes = await fetchImpl(`${baseUrl}/v1.0/removebg/ticket`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Api-Key": opts.apiKey,
-        "Idempotency-Key": deriveSubIdempotencyKey(idemKey, idemSuffix),
-      },
-      body: JSON.stringify(ticketBody),
-    });
+    let ticketRes;
+    try {
+      ticketRes = await safeFetch(`${baseUrl}/v1.0/removebg/ticket`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Api-Key": opts.apiKey,
+          "Idempotency-Key": deriveSubIdempotencyKey(idemKey, idemSuffix),
+        },
+        body: JSON.stringify(ticketBody),
+      });
+    } catch (err) {
+      if (err && typeof err.statusCode === "number") {
+        return { ok: false, status: err.statusCode, errorText: err.message };
+      }
+      throw err;
+    }
     if (!ticketRes.ok) {
       return { ok: false, status: ticketRes.status, errorText: await ticketRes.text() };
     }
     const ticketJson = await ticketRes.json();
     const ticket = ticketJson?.data?.ticket;
     const directEndpoint = ticketJson?.data?.directEndpoint;
-    if (!ticket || !directEndpoint) {
+    if (
+      typeof ticket !== "string" ||
+      !ticket.trim() ||
+      typeof directEndpoint !== "string" ||
+      !directEndpoint.trim()
+    ) {
       return { ok: false, status: 502, errorText: "Missing ticket or directEndpoint in response" };
+    }
+    const epErr = await validateHttpsEndpointUrl(directEndpoint, {
+      lookupFn,
+      allowLoopbackOrigin: isLoopbackTestOrigin(baseUrl),
+      label: "directEndpoint",
+    });
+    if (epErr) {
+      return { ok: false, status: 502, errorText: epErr };
     }
 
     const directForm = new FormData();
@@ -388,13 +417,21 @@ export async function processImageBuffer({
         path.basename(bgInput.path),
       );
     }
-    const directRes = await fetchImpl(directEndpoint, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${ticket}`,
-      },
-      body: directForm,
-    });
+    let directRes;
+    try {
+      directRes = await safeFetch(directEndpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ticket}`,
+        },
+        body: directForm,
+      });
+    } catch (err) {
+      if (err && typeof err.statusCode === "number") {
+        return { ok: false, status: err.statusCode, errorText: err.message };
+      }
+      throw err;
+    }
     if (!directRes.ok) {
       return { ok: false, status: directRes.status, errorText: await directRes.text() };
     }
@@ -443,26 +480,41 @@ export async function processImageBuffer({
     return form;
   };
 
-  let res = await fetchImpl(`${baseUrl}/v1.0/removebg`, {
-    method: "POST",
-    headers: {
-      "X-Api-Key": opts.apiKey,
-      "Idempotency-Key": idemKey,
-    },
-    body: buildFormData(),
-  });
+  let res;
+  try {
+    res = await safeFetch(`${baseUrl}/v1.0/removebg`, {
+      method: "POST",
+      headers: {
+        "X-Api-Key": opts.apiKey,
+        "Idempotency-Key": idemKey,
+      },
+      body: buildFormData(),
+    });
+  } catch (err) {
+    if (err && typeof err.statusCode === "number") {
+      return { ok: false, status: err.statusCode, errorText: err.message };
+    }
+    throw err;
+  }
 
   if (res.status === 409 && !opts.idempotencyKey) {
     const errText = await res.text();
     if (errText.includes("idempotency_replay_unavailable")) {
-      res = await fetchImpl(`${baseUrl}/v1.0/removebg`, {
-        method: "POST",
-        headers: {
-          "X-Api-Key": opts.apiKey,
-          "Idempotency-Key": `cli:${paramFingerprint}:${crypto.randomUUID()}`,
-        },
-        body: buildFormData(),
-      });
+      try {
+        res = await safeFetch(`${baseUrl}/v1.0/removebg`, {
+          method: "POST",
+          headers: {
+            "X-Api-Key": opts.apiKey,
+            "Idempotency-Key": `cli:${paramFingerprint}:${crypto.randomUUID()}`,
+          },
+          body: buildFormData(),
+        });
+      } catch (err) {
+        if (err && typeof err.statusCode === "number") {
+          return { ok: false, status: err.statusCode, errorText: err.message };
+        }
+        throw err;
+      }
     } else {
       return { ok: false, status: 409, errorText: errText };
     }
@@ -524,10 +576,46 @@ export async function runCli(argv = process.argv.slice(2)) {
     console.error("Error: Missing API key. Pass --api-key <key> or set REMOVE_AC_API_KEY.");
     process.exit(2);
   }
+  if (!opts.account && opts.watch) {
+    if (opts.idempotencyKey) {
+      console.error("Error: --idempotency-key cannot be used with --watch (each watched file requires a distinct key).");
+      process.exit(2);
+    }
+    if (opts.output) {
+      console.error("Error: --watch requires --output-dir instead of --output.");
+      process.exit(2);
+    }
+  }
+
+  let precollectedFiles = null;
+  if (!opts.account && !opts.watch) {
+    precollectedFiles = collectFiles(opts.inputs);
+    if (precollectedFiles.length === 0) {
+      console.error("No supported image files (.jpg, .jpeg, .png, .webp) found.");
+      process.exit(1);
+    }
+    if (opts.idempotencyKey && precollectedFiles.length > 1) {
+      console.error("Error: --idempotency-key can only be used with a single input file.");
+      process.exit(2);
+    }
+    if (opts.output && precollectedFiles.length > 1) {
+      console.error("Error: --output can only be used with a single input file. Use --output-dir for batches.");
+      process.exit(2);
+    }
+  }
+
   const baseUrl = opts.endpoint.replace(/\/+$/, "");
+  const endpointErr = await validateHttpsEndpointUrl(baseUrl, {
+    allowLoopbackOrigin: isLoopbackTestOrigin(baseUrl),
+    label: "endpoint",
+  });
+  if (endpointErr) {
+    console.error(`Error: ${endpointErr}`);
+    process.exit(2);
+  }
 
   if (opts.account) {
-    const res = await fetch(`${baseUrl}/v1.0/account`, {
+    const res = await fetchWithoutRedirects(fetch, `${baseUrl}/v1.0/account`, {
       headers: { "X-Api-Key": opts.apiKey },
     });
     const text = await res.text();
@@ -542,14 +630,6 @@ export async function runCli(argv = process.argv.slice(2)) {
   const bgInput = resolveBgInput(opts.bgImage);
 
   if (opts.watch) {
-    if (opts.idempotencyKey) {
-      console.error("Error: --idempotency-key cannot be used with --watch (each watched file requires a distinct key).");
-      process.exit(2);
-    }
-    if (opts.output) {
-      console.error("Error: --watch requires --output-dir instead of --output.");
-      process.exit(2);
-    }
     if (opts.outputDir) {
       fs.mkdirSync(path.resolve(opts.outputDir), { recursive: true });
     }
@@ -590,19 +670,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
-  const files = collectFiles(opts.inputs);
-  if (files.length === 0) {
-    console.error("No supported image files (.jpg, .jpeg, .png, .webp) found.");
-    process.exit(1);
-  }
-  if (opts.idempotencyKey && files.length > 1) {
-    console.error("Error: --idempotency-key can only be used with a single input file.");
-    process.exit(2);
-  }
-  if (opts.output && files.length > 1) {
-    console.error("Error: --output can only be used with a single input file. Use --output-dir for batches.");
-    process.exit(2);
-  }
+  const files = precollectedFiles;
   if (opts.outputDir) {
     fs.mkdirSync(path.resolve(opts.outputDir), { recursive: true });
   }

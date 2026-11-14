@@ -10,13 +10,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RemoveAcClient } from "../node/index.mjs";
-import { validateRemoteImageUrl } from "./remove-ac-mcp.mjs";
+import { validateRemoteImageUrl } from "../node/net-safety.mjs";
 
 const SUPPORTED_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 const ALLOWED_SIZES = new Set(["auto", "preview", "small", "regular", "medium", "hd", "4k", "full"]);
 const ALLOWED_FORMATS = new Set(["png", "jpg", "webp", "zip"]);
 const ALLOWED_TYPES = new Set(["auto", "person", "product", "car", "animal", "graphic", "transportation"]);
-const ALLOWED_SHADOW_TYPES = new Set(["auto", "car", "3d", "drop", "contact"]);
+const ALLOWED_SHADOW_TYPES = new Set(["auto", "car", "drop", "soft", "contact", "reflection", "none"]);
 
 function readInput(env, name, fallback = "") {
   const upper = name.toUpperCase();
@@ -45,6 +45,65 @@ function nearestExistingRealpath(targetPath) {
   }
 }
 
+function canonicalizePathWithRealAncestor(targetPath) {
+  const abs = path.resolve(targetPath);
+  const tail = [];
+  let cur = abs;
+  while (true) {
+    if (fs.existsSync(cur)) {
+      const realCur = fs.realpathSync(cur);
+      return tail.length === 0 ? realCur : path.join(realCur, ...tail.reverse());
+    }
+    tail.push(path.basename(cur));
+    const parent = path.dirname(cur);
+    if (parent === cur) {
+      return tail.length === 0 ? cur : path.join(cur, ...tail.reverse());
+    }
+    cur = parent;
+  }
+}
+
+function assertNoSymlinkComponentsFromRoot(rootDir, targetPath, rawLabel) {
+  const rel = path.relative(rootDir, targetPath);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return;
+  let probe = rootDir;
+  for (const seg of rel.split(path.sep)) {
+    if (!seg || seg === ".") continue;
+    probe = path.join(probe, seg);
+    let st = null;
+    try {
+      st = fs.lstatSync(probe);
+    } catch (err) {
+      if (err && err.code === "ENOENT") break;
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Refusing to operate on symbolic link path: ${rawLabel}`);
+    }
+  }
+}
+
+function assertNoDanglingSymlinkInChain(targetPath, rawLabel) {
+  let cur = path.resolve(targetPath);
+  while (true) {
+    let st = null;
+    try {
+      st = fs.lstatSync(cur);
+    } catch (err) {
+      if (err && err.code !== "ENOENT") throw err;
+    }
+    if (st && st.isSymbolicLink()) {
+      throw new Error(`Refusing to operate on symbolic link path: ${rawLabel}`);
+    }
+    if (st && fs.existsSync(cur)) {
+      break;
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+}
+
 function isSubpathOrEqual(parentReal, candidateReal) {
   const rel = path.relative(parentReal, candidateReal);
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
@@ -54,8 +113,16 @@ export function resolveSafeActionPath(rawPath, { env = process.env, cwd = proces
   if (!rawPath || typeof rawPath !== "string" || rawPath.includes("\0")) {
     throw new Error("Invalid file path");
   }
-  const baseDir = env.GITHUB_WORKSPACE ? path.resolve(env.GITHUB_WORKSPACE) : cwd;
+  const baseDir = env.GITHUB_WORKSPACE ? path.resolve(env.GITHUB_WORKSPACE) : path.resolve(cwd);
   const resolved = path.resolve(baseDir, rawPath);
+
+  assertNoDanglingSymlinkInChain(resolved, rawPath);
+  assertNoSymlinkComponentsFromRoot(baseDir, resolved, rawPath);
+  if (fs.existsSync(baseDir)) {
+    assertNoSymlinkComponentsFromRoot(fs.realpathSync(baseDir), resolved, rawPath);
+  }
+
+  const resolvedCanonical = canonicalizePathWithRealAncestor(resolved);
 
   if (forWrite) {
     const protectedEnvFiles = [
@@ -63,38 +130,25 @@ export function resolveSafeActionPath(rawPath, { env = process.env, cwd = proces
       env.GITHUB_ENV,
       env.GITHUB_PATH,
       env.GITHUB_STEP_SUMMARY,
+      env.GITHUB_STATE,
     ]
       .filter(Boolean)
-      .map((p) => {
-        const abs = path.resolve(p);
-        return fs.existsSync(abs) ? fs.realpathSync(abs) : abs;
-      });
-
-    const resolvedReal = fs.existsSync(resolved)
-      ? fs.realpathSync(resolved)
-      : path.join(nearestExistingRealpath(path.dirname(resolved)), path.basename(resolved));
+      .map((p) => ({
+        abs: path.resolve(p),
+        canonical: canonicalizePathWithRealAncestor(p),
+      }));
 
     for (const prot of protectedEnvFiles) {
-      if (resolved === prot || resolvedReal === prot) {
+      if (resolved === prot.abs || resolvedCanonical === prot.canonical) {
         throw new Error("Refusing to write output to a protected GitHub Actions runner control file");
       }
     }
   }
 
-  let lstat = null;
-  try {
-    lstat = fs.lstatSync(resolved);
-  } catch (err) {
-    if (err && err.code !== "ENOENT") throw err;
-  }
-  if (lstat && lstat.isSymbolicLink()) {
-    throw new Error(`Refusing to operate on symbolic link path: ${rawPath}`);
-  }
-
   if (env.GITHUB_WORKSPACE && !allowOutsideWorkspace) {
     const workspaceReal = fs.realpathSync(path.resolve(env.GITHUB_WORKSPACE));
     const ancestorReal = nearestExistingRealpath(resolved);
-    if (!isSubpathOrEqual(workspaceReal, ancestorReal)) {
+    if (!isSubpathOrEqual(workspaceReal, ancestorReal) || !isSubpathOrEqual(workspaceReal, resolvedCanonical)) {
       throw new Error(
         `Path '${rawPath}' resolves outside GITHUB_WORKSPACE. Set allow_outside_workspace: 'true' if intentional.`
       );
@@ -240,6 +294,7 @@ export async function runGithubAction({
     apiKey,
     baseUrl,
     fetch: fetchImpl,
+    lookup: lookupFn,
   });
 
   const cutoutOpts = {

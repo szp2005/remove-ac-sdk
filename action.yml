@@ -49,7 +49,7 @@ inputs:
     required: false
     default: "false"
   shadow_type:
-    description: "Shadow preset when add_shadow is true: auto, car, 3d, drop, or contact."
+    description: "Shadow preset when add_shadow is true: auto, car, drop, soft, contact, reflection, or none."
     required: false
   base_url:
     description: "remove.ac HTTPS API origin (defaults to https://remove.ac)."

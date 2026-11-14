@@ -13,12 +13,27 @@
  *   REMOVE_AC_BASE_URL — optional override (defaults to https://remove.ac)
  */
 
-import dns from "node:dns";
 import fs from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RemoveAcClient } from "../node/index.mjs";
+import {
+  isDisallowedIpAddress,
+  isDisallowedRemoteUrl,
+  isPrivateIpv4,
+  isPrivateIpv6,
+  parseIpv6Words,
+  validateRemoteImageUrl,
+} from "../node/net-safety.mjs";
+
+export {
+  isDisallowedIpAddress,
+  isDisallowedRemoteUrl,
+  isPrivateIpv4,
+  isPrivateIpv6,
+  parseIpv6Words,
+  validateRemoteImageUrl,
+};
 
 export const SERVER_NAME = "remove-ac-mcp";
 export const SERVER_VERSION = "1.1.2";
@@ -61,7 +76,7 @@ const SHARED_CUTOUT_PROPERTIES = {
   },
   shadowType: {
     type: "string",
-    enum: ["auto", "car", "3d", "drop", "contact"],
+    enum: ["auto", "car", "drop", "soft", "contact", "reflection", "none"],
     description: "Shadow preset when addShadow is enabled.",
   },
 };
@@ -130,215 +145,6 @@ export const MCP_TOOLS = [
   },
 ];
 
-function isPrivateIpv4Octets(a, b, c, _d) {
-  if (a === 0 || a === 10 || a === 127) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true; // RFC 6598 CGNAT 100.64.0.0/10
-  if (a === 169 && b === 254) return true; // RFC 3927 link-local & cloud metadata
-  if (a === 172 && b >= 16 && b <= 31) return true; // RFC 1918 172.16.0.0/12
-  if (a === 192 && b === 0 && c === 0) return true; // RFC 6890 192.0.0.0/24
-  if (a === 192 && b === 168) return true; // RFC 1918 192.168.0.0/16
-  if (a === 198 && (b === 18 || b === 19)) return true; // RFC 2544 benchmarking 198.18.0.0/15
-  if (a >= 224) return true; // Multicast 224.0.0.0/4 & reserved 240.0.0.0/4 + broadcast
-  return false;
-}
-
-export function isPrivateIpv4(ip) {
-  const parts = String(ip)
-    .split(".")
-    .map((s) => (/^\d{1,3}$/.test(s) ? Number.parseInt(s, 10) : Number.NaN));
-  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
-    return true;
-  }
-  return isPrivateIpv4Octets(parts[0], parts[1], parts[2], parts[3]);
-}
-
-function isPrivateIpv4Words(hi16, lo16) {
-  const a = (hi16 >>> 8) & 0xff;
-  const b = hi16 & 0xff;
-  const c = (lo16 >>> 8) & 0xff;
-  const d = lo16 & 0xff;
-  return isPrivateIpv4Octets(a, b, c, d);
-}
-
-/**
- * Expands any valid IPv6 literal (including :: compression and dotted IPv4 tails)
- * into 8 16-bit words, or returns null if invalid.
- */
-export function parseIpv6Words(rawIp) {
-  let clean = String(rawIp).trim().toLowerCase().replace(/^\[|\]$/g, "");
-  const zoneIdx = clean.indexOf("%");
-  if (zoneIdx !== -1) clean = clean.slice(0, zoneIdx);
-  if (!clean || !clean.includes(":")) return null;
-
-  // Convert trailing dotted-quad IPv4 (e.g. ::ffff:127.0.0.1 or ::127.0.0.1) into 2 hex groups.
-  const lastColon = clean.lastIndexOf(":");
-  const tail = clean.slice(lastColon + 1);
-  if (tail.includes(".")) {
-    const octets = tail
-      .split(".")
-      .map((s) => (/^\d{1,3}$/.test(s) ? Number.parseInt(s, 10) : Number.NaN));
-    if (octets.length !== 4 || octets.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
-      return null;
-    }
-    const w6 = ((octets[0] << 8) | octets[1]).toString(16);
-    const w7 = ((octets[2] << 8) | octets[3]).toString(16);
-    clean = `${clean.slice(0, lastColon + 1)}${w6}:${w7}`;
-  }
-
-  const dblParts = clean.split("::");
-  if (dblParts.length > 2) return null;
-
-  const parseSide = (str) => {
-    if (!str) return [];
-    const groups = str.split(":");
-    const nums = [];
-    for (const g of groups) {
-      if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
-      nums.push(Number.parseInt(g, 16));
-    }
-    return nums;
-  };
-
-  if (dblParts.length === 2) {
-    const left = parseSide(dblParts[0]);
-    const right = parseSide(dblParts[1]);
-    if (!left || !right || left.length + right.length >= 8) return null;
-    const zeros = new Array(8 - left.length - right.length).fill(0);
-    return Uint16Array.from([...left, ...zeros, ...right]);
-  }
-
-  const full = parseSide(clean);
-  if (!full || full.length !== 8) return null;
-  return Uint16Array.from(full);
-}
-
-export function isPrivateIpv6(ip) {
-  const w = parseIpv6Words(ip);
-  if (!w) return true; // Malformed IPv6 is never allowed
-
-  // ::/128 unspecified and ::1/128 loopback
-  if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0 && w[5] === 0) {
-    if (w[6] === 0 && (w[7] === 0 || w[7] === 1)) return true;
-    // IPv4-compatible IPv6 ::w6:w7 (/96 deprecated RFC 4291) — validate embedded IPv4
-    return isPrivateIpv4Words(w[6], w[7]);
-  }
-
-  // IPv4-mapped IPv6 ::ffff:0:0/96 (including WHATWG hex form [::ffff:7f00:1])
-  if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0 && w[5] === 0xffff) {
-    return isPrivateIpv4Words(w[6], w[7]);
-  }
-
-  // IPv4-translated ::ffff:0:w6:w7 (/96 RFC 2765 SIIT)
-  if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0xffff && w[5] === 0) {
-    return isPrivateIpv4Words(w[6], w[7]);
-  }
-
-  // Well-known NAT64 64:ff9b::/96 and local NAT64 64:ff9b:1::/48 embedding private IPv4
-  if (w[0] === 0x0064 && w[1] === 0xff9b) {
-    if (w[2] === 0 && w[3] === 0 && w[4] === 0 && w[5] === 0) {
-      return isPrivateIpv4Words(w[6], w[7]);
-    }
-    if (w[2] === 1) return true;
-  }
-
-  // Discard-only prefix 100::/64 (RFC 6666)
-  if (w[0] === 0x0100 && w[1] === 0 && w[2] === 0 && w[3] === 0) return true;
-
-  // Unique local fc00::/7 (fc00..fdff)
-  if ((w[0] & 0xfe00) === 0xfc00) return true;
-
-  // Link-local fe80::/10 (fe80..febf)
-  if ((w[0] & 0xffc0) === 0xfe80) return true;
-
-  // Deprecated site-local fec0::/10 (fec0..feff)
-  if ((w[0] & 0xffc0) === 0xfec0) return true;
-
-  // Multicast ff00::/8
-  if ((w[0] & 0xff00) === 0xff00) return true;
-
-  return false;
-}
-
-export function isDisallowedIpAddress(ip) {
-  const clean = String(ip).trim().replace(/^\[|\]$/g, "");
-  if (net.isIPv4(clean)) return isPrivateIpv4(clean);
-  if (clean.includes(":")) return isPrivateIpv6(clean);
-  return true;
-}
-
-export function isDisallowedRemoteUrl(rawUrl) {
-  let parsed;
-  try {
-    parsed = new URL(String(rawUrl));
-  } catch {
-    return "Invalid URL syntax";
-  }
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    return "Only http:// and https:// image URLs are allowed";
-  }
-  if (parsed.username || parsed.password) {
-    return "URLs with embedded credentials are not permitted";
-  }
-  const rawHost = parsed.hostname.toLowerCase();
-  const host = rawHost.replace(/^\[|\]$/g, "");
-  if (
-    !host ||
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal") ||
-    host.endsWith(".home.arpa")
-  ) {
-    return "Local or internal hostnames are not permitted";
-  }
-  if (rawHost.startsWith("[") || host.includes(":")) {
-    if (isPrivateIpv6(host)) {
-      return "Private, loopback, or reserved IPv6 addresses are not permitted";
-    }
-    return null;
-  }
-  if (net.isIPv4(host)) {
-    if (isPrivateIpv4(host)) {
-      return "Private, loopback, or reserved IPv4 addresses are not permitted";
-    }
-    return null;
-  }
-  // Block single-label internal hostnames or numeric IPv4 encodings (e.g. http://2130706433/ or http://0x7f000001/)
-  if (!host.includes(".") || /^\d+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) {
-    return "Single-label or non-standard numeric hostnames are not permitted";
-  }
-  return null;
-}
-
-export async function validateRemoteImageUrl(rawUrl, lookupFn = dns.promises.lookup) {
-  const syncErr = isDisallowedRemoteUrl(rawUrl);
-  if (syncErr) return syncErr;
-
-  const parsed = new URL(String(rawUrl));
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (net.isIPv4(host) || host.includes(":")) {
-    return null;
-  }
-
-  let records;
-  try {
-    records = await lookupFn(host, { all: true, verbatim: true });
-  } catch {
-    return `Unable to resolve imageUrl hostname: ${host}`;
-  }
-  const list = Array.isArray(records) ? records : records ? [records] : [];
-  if (list.length === 0) {
-    return `No DNS records returned for hostname: ${host}`;
-  }
-  for (const rec of list) {
-    const addr = typeof rec === "string" ? rec : rec?.address;
-    if (!addr || isDisallowedIpAddress(addr)) {
-      return "Hostname resolves to a private, loopback, or reserved IP address";
-    }
-  }
-  return null;
-}
-
 function resolveDefaultOutputPath(inputPath, format = "png") {
   const parsed = path.parse(inputPath);
   const ext = format === "auto" ? ".png" : `.${format}`;
@@ -388,9 +194,11 @@ function toolFailure(message) {
 
 export async function handleMcpRequest(
   msg,
-  clientFactory = () => new RemoveAcClient(),
+  clientFactory = null,
   options = {},
 ) {
+  const effectiveClientFactory =
+    clientFactory || (() => new RemoveAcClient({ lookup: options.lookup }));
   if (!msg || typeof msg !== "object" || msg.jsonrpc !== "2.0") {
     return {
       jsonrpc: "2.0",
@@ -441,7 +249,7 @@ export async function handleMcpRequest(
     const args = params?.arguments && typeof params.arguments === "object" ? params.arguments : {};
 
     try {
-      const client = clientFactory();
+      const client = effectiveClientFactory();
 
       if (toolName === "get_account_balance") {
         const account = await client.getAccount();

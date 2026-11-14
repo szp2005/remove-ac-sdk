@@ -57,6 +57,7 @@ test("RemoveAcClient automatically upgrades >4 MB payloads to zero-disk direct c
   const largeBuffer = Buffer.alloc(4 * 1024 * 1024 + 64, 0x42);
   const client = new RemoveAcClient({
     apiKey: "rac_live_test_example",
+    lookup: async () => [{ address: "93.184.216.34", family: 4 }],
     fetch: async (url, init) => {
       calls.push({ url, init });
       if (url.endsWith("/v1.0/removebg/ticket")) {
@@ -110,6 +111,7 @@ test("A1: High-MP (<4 MB) PNG/JPEG pre-flights directly to /v1.0/removebg/ticket
   const calls = [];
   const client = new RemoveAcClient({
     apiKey: "rac_live_test_example",
+    lookup: async () => [{ address: "93.184.216.34", family: 4 }],
     fetch: async (url) => {
       calls.push(url);
       if (url.endsWith("/v1.0/removebg/ticket")) {
@@ -209,5 +211,108 @@ test("A1-1 & A2-1 R2: parseImageDimensions(ArrayBuffer), <=255-char sub-idempote
     assert.match(batchRun.stderr, /--idempotency-key can only be used with a single input file/);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("MF-1 & MF-2: Node SDK and CLI block 3xx redirects without leaking X-Api-Key and reject unsafe directEndpoint URLs", async () => {
+  const http = await import("node:http");
+  let leakHits = 0;
+  const leakServer = http.createServer((_req, res) => {
+    leakHits += 1;
+    res.writeHead(200);
+    res.end("LEAKED");
+  });
+  await new Promise((r) => leakServer.listen(0, "127.0.0.1", r));
+  const leakPort = leakServer.address().port;
+
+  const redirServer = http.createServer((_req, res) => {
+    res.writeHead(307, { Location: `http://127.0.0.1:${leakPort}/steal` });
+    res.end();
+  });
+  await new Promise((r) => redirServer.listen(0, "127.0.0.1", r));
+  const redirPort = redirServer.address().port;
+
+  try {
+    const client = new RemoveAcClient({
+      apiKey: "rac_live_secret_do_not_leak",
+      baseUrl: `http://127.0.0.1:${redirPort}`,
+    });
+    await assert.rejects(() => client.getAccount(), (err) => {
+      assert.ok(err instanceof RemoveAcError);
+      assert.equal(err.statusCode, 302);
+      return true;
+    });
+    await assert.rejects(() => client.removeBackground(Buffer.from([1, 2, 3])), RemoveAcError);
+    assert.equal(leakHits, 0, "Redirect target must receive 0 requests");
+
+    const cliOpts = parseCliArgs(["sample.png", "--api-key", "rac_live_secret_do_not_leak"]);
+    const cliRedir = await processImageBuffer({
+      bytes: Buffer.from("abc"),
+      fileName: "sample.png",
+      mimeType: "image/png",
+      opts: cliOpts,
+      baseUrl: `http://127.0.0.1:${redirPort}`,
+    });
+    assert.equal(cliRedir.ok, false);
+    assert.equal(leakHits, 0, "CLI must not follow 307 redirect");
+  } finally {
+    redirServer.close();
+    leakServer.close();
+  }
+
+  // MF-2: Unsafe or missing directEndpoint in /v1.0/removebg/ticket must fail closed with 0 upload calls
+  const badDirectEndpoints = [
+    null,
+    "http://gpu.remove.ac/v1.0/direct-cutout",
+    "https://127.0.0.1/v1.0/direct-cutout",
+    "https://[::ffff:169.254.169.254]/latest/meta-data",
+    "https://rebind.example.com/v1.0/direct-cutout",
+  ];
+
+  for (const badEp of badDirectEndpoints) {
+    const seenUrls = [];
+    const sdkClient = new RemoveAcClient({
+      apiKey: "rac_live_test",
+      baseUrl: "https://remove.ac",
+      lookup: async () => [{ address: "10.0.0.5", family: 4 }],
+      fetch: async (url, init) => {
+        seenUrls.push(String(url));
+        assert.equal(init.redirect, "error");
+        return Response.json({
+          data: {
+            ticket: "tok_test",
+            ...(badEp ? { directEndpoint: badEp } : {}),
+          },
+        });
+      },
+    });
+    await assert.rejects(
+      () => sdkClient.removeBackground(Buffer.from("small"), { direct: true }),
+      (err) => err instanceof RemoveAcError && err.statusCode === 502,
+    );
+    assert.equal(seenUrls.length, 1, `Expected 0 upload requests for bad directEndpoint=${badEp}`);
+
+    const cliCalls = [];
+    const cliRes = await processImageBuffer({
+      bytes: Buffer.from("small"),
+      fileName: "a.png",
+      mimeType: "image/png",
+      opts: parseCliArgs(["a.png", "--api-key", "rac_live_test", "--direct"]),
+      baseUrl: "https://remove.ac",
+      lookupFn: async () => [{ address: "10.0.0.5", family: 4 }],
+      fetchImpl: async (url, init) => {
+        cliCalls.push(String(url));
+        assert.equal(init.redirect, "error");
+        return Response.json({
+          data: {
+            ticket: "tok_cli",
+            ...(badEp ? { directEndpoint: badEp } : {}),
+          },
+        });
+      },
+    });
+    assert.equal(cliRes.ok, false);
+    assert.equal(cliRes.status, 502);
+    assert.equal(cliCalls.length, 1);
   }
 });
