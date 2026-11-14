@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remove-ac"
-version = "1.1.0"
+version = "1.1.1"
 description = "Official zero-dependency Python SDK & removebg 1:1 drop-in replacement for remove.ac"
 readme = "README.md"
 license = { text = "MIT" }

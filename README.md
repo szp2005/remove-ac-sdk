@@ -33,9 +33,11 @@ curl -X POST https://remove.ac/v1.0/removebg \
 
 ## 2. Node.js / TypeScript SDK (`Node 18+`)
 
-### Install directly via GitHub
+### Install via npm or GitHub
 
 ```bash
+npm install remove-ac
+# or directly from GitHub:
 npm install github:szp2005/remove-ac-sdk
 ```
 
@@ -129,7 +131,7 @@ rmbg.remove_background_from_img_file("car.jpg", size="full", new_file_name="car-
   "mcpServers": {
     "remove-ac": {
       "command": "npx",
-      "args": ["-y", "-p", "github:szp2005/remove-ac-sdk", "remove-ac-mcp"],
+      "args": ["-y", "-p", "remove-ac", "remove-ac-mcp"],
       "env": {
         "REMOVE_AC_API_KEY": "rac_live_your_key_here"
       }

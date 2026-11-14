@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { PassThrough } from "node:stream";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,9 +10,12 @@ import { RemoveAcClient } from "../node/index.mjs";
 import {
   handleMcpRequest,
   isDisallowedRemoteUrl,
+  MAX_MCP_MESSAGE_BYTES,
   MCP_TOOLS,
   SERVER_NAME,
   SERVER_VERSION,
+  startStdioServer,
+  validateRemoteImageUrl,
 } from "../bin/remove-ac-mcp.mjs";
 
 const mcpBinPath = path.resolve(
@@ -19,7 +23,8 @@ const mcpBinPath = path.resolve(
   "../bin/remove-ac-mcp.mjs",
 );
 
-test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract", async () => {
+test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.1.1", async () => {
+  assert.equal(SERVER_VERSION, "1.1.1");
   const initRes = await handleMcpRequest({
     jsonrpc: "2.0",
     id: 1,
@@ -29,7 +34,7 @@ test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract", async 
   assert.equal(initRes.id, 1);
   assert.equal(initRes.result.protocolVersion, "2024-11-05");
   assert.equal(initRes.result.serverInfo.name, SERVER_NAME);
-  assert.equal(initRes.result.serverInfo.version, SERVER_VERSION);
+  assert.equal(initRes.result.serverInfo.version, "1.1.1");
 
   const notifRes = await handleMcpRequest({
     jsonrpc: "2.0",
@@ -47,6 +52,40 @@ test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract", async 
     MCP_TOOLS.map((t) => t.name),
     ["remove_background_file", "remove_background_url", "get_account_balance"],
   );
+});
+
+test("MCP get_account_balance surfaces totalCredits cleanly for positive and zero balances", async () => {
+  for (const total of [41, 0]) {
+    const fakeClient = () => ({
+      getAccount: async () => ({
+        data: {
+          attributes: {
+            credits: {
+              total,
+              subscription: total > 0 ? 40 : 0,
+              payg: total > 0 ? 1 : 0,
+              enterprise: 0,
+            },
+            api: { free_calls: 0, sizes: "all" },
+          },
+        },
+      }),
+    });
+    const res = await handleMcpRequest(
+      {
+        jsonrpc: "2.0",
+        id: 20 + total,
+        method: "tools/call",
+        params: { name: "get_account_balance", arguments: {} },
+      },
+      fakeClient,
+    );
+    assert.equal(res.result.isError, undefined);
+    const body = JSON.parse(res.result.content[0].text);
+    assert.equal(body.ok, true);
+    assert.equal(body.totalCredits, total);
+    assert.equal(body.account.data.attributes.credits.total, total);
+  }
 });
 
 test("MCP remove_background_file writes cutout output and upgrades >4 MB files via ticket", async () => {
@@ -106,25 +145,125 @@ test("MCP remove_background_file writes cutout output and upgrades >4 MB files v
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("MCP remove_background_url blocks loopback/private SSRF targets", async () => {
-  assert.ok(isDisallowedRemoteUrl("http://127.0.0.1:8080/secret.png"));
-  assert.ok(isDisallowedRemoteUrl("http://169.254.169.254/latest/meta-data"));
-  assert.ok(isDisallowedRemoteUrl("file:///etc/passwd"));
-  assert.equal(isDisallowedRemoteUrl("https://images.unsplash.com/photo-1.jpg"), null);
+test("MCP remove_background_url blocks IPv4, IPv4-mapped/compatible IPv6, fe80::/10, NAT64, and DNS-rebound private targets", async () => {
+  const blockedUrls = [
+    "http://127.0.0.1:8080/secret.png",
+    "http://169.254.169.254/latest/meta-data",
+    "http://[::1]/secret.png",
+    "http://[::]/secret.png",
+    "http://[::ffff:127.0.0.1]/secret.png",
+    "http://[::ffff:169.254.169.254]/latest/meta-data/",
+    "http://[::127.0.0.1]/secret.png",
+    "http://[fe80::1]/secret.png",
+    "http://[febf::1]/secret.png",
+    "http://[fc00::1]/secret.png",
+    "http://[fd12:3456::1]/secret.png",
+    "http://[64:ff9b::10.0.0.1]/secret.png",
+    "http://[64:ff9b::169.254.169.254]/secret.png",
+    "http://[100::1]/secret.png",
+    "http://2130706433/secret.png",
+    "http://user:pass@images.unsplash.com/photo.jpg",
+    "file:///etc/passwd",
+  ];
+  for (const bad of blockedUrls) {
+    assert.ok(isDisallowedRemoteUrl(bad), `Expected URL to be blocked: ${bad}`);
+  }
 
-  const res = await handleMcpRequest({
-    jsonrpc: "2.0",
-    id: 4,
-    method: "tools/call",
-    params: {
-      name: "remove_background_url",
-      arguments: {
-        imageUrl: "http://127.0.0.1/test.png",
-        outputPath: "/tmp/should-not-write.png",
+  assert.equal(isDisallowedRemoteUrl("https://images.unsplash.com/photo-1.jpg"), null);
+  assert.equal(isDisallowedRemoteUrl("https://[2606:4700:4700::1111]/photo.png"), null);
+
+  // DNS resolution guard blocks domains resolving to private/loopback IPv4 or IPv4-mapped IPv6
+  const dnsRebindErr = await validateRemoteImageUrl(
+    "http://127.0.0.1.nip.io/secret.png",
+    async () => [{ address: "127.0.0.1", family: 4 }],
+  );
+  assert.match(dnsRebindErr, /private, loopback, or reserved/i);
+
+  const dnsMappedV6Err = await validateRemoteImageUrl(
+    "http://rebind.example.com/secret.png",
+    async () => [
+      { address: "93.184.216.34", family: 4 },
+      { address: "::ffff:169.254.169.254", family: 6 },
+    ],
+  );
+  assert.match(dnsMappedV6Err, /private, loopback, or reserved/i);
+
+  const dnsPublicOk = await validateRemoteImageUrl(
+    "https://cdn.example.com/public.png",
+    async () => [{ address: "93.184.216.34", family: 4 }],
+  );
+  assert.equal(dnsPublicOk, null);
+
+  const res = await handleMcpRequest(
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "remove_background_url",
+        arguments: {
+          imageUrl: "http://127.0.0.1.nip.io/test.png",
+          outputPath: "/tmp/should-not-write.png",
+        },
       },
     },
-  });
+    () => new RemoveAcClient({ apiKey: "rac_live_unused" }),
+    { lookup: async () => [{ address: "127.0.0.1", family: 4 }] },
+  );
   assert.equal(res.result.isError, true);
+});
+
+test("MCP framing decoder handles split Content-Length headers, multi-headers, and byte caps", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  let outRaw = "";
+  stdout.setEncoding("utf8");
+  stdout.on("data", (c) => {
+    outRaw += c;
+  });
+
+  const srv = startStdioServer(() => new RemoveAcClient(), { stdin, stdout, stderr });
+
+  const msg1 = JSON.stringify({ jsonrpc: "2.0", id: 101, method: "ping" });
+  const msg2 = JSON.stringify({ jsonrpc: "2.0", id: 102, method: "tools/list" });
+
+  // 1) Split header across tiny chunks ("Content-" then "Length: ...")
+  stdin.write("Content-");
+  stdin.write(`Length: ${Buffer.byteLength(msg1)}\r\n\r\n`);
+  stdin.write(msg1.slice(0, 10));
+  stdin.write(msg1.slice(10));
+
+  // 2) Standard LSP multi-header frame with Content-Type preceding Content-Length
+  stdin.write(
+    `Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(msg2)}\r\n\r\n${msg2}`,
+  );
+
+  // 3) Oversized Content-Length frame must be rejected cleanly without hanging
+  stdin.write(`Content-Length: ${MAX_MCP_MESSAGE_BYTES + 1024}\r\n\r\n{}`);
+  stdin.end();
+
+  await srv.waitForIdle();
+  await new Promise((r) => setTimeout(r, 20));
+
+  const decoded = [];
+  let cursor = outRaw;
+  while (cursor.includes("\r\n\r\n")) {
+    const idx = cursor.indexOf("\r\n\r\n");
+    const hdr = cursor.slice(0, idx);
+    const len = Number.parseInt(hdr.match(/Content-Length:\s*(\d+)/i)[1], 10);
+    const body = cursor.slice(idx + 4, idx + 4 + len);
+    decoded.push(JSON.parse(body));
+    cursor = cursor.slice(idx + 4 + len);
+  }
+
+  assert.equal(decoded.length, 3);
+  assert.equal(decoded[0].id, 101);
+  assert.deepEqual(decoded[0].result, {});
+  assert.equal(decoded[1].id, 102);
+  assert.equal(decoded[1].result.tools.length, 3);
+  assert.equal(decoded[2].error.code, -32600);
 });
 
 test("MCP stdio child process handles newline-delimited JSON-RPC end-to-end", async () => {
@@ -161,6 +300,7 @@ test("MCP stdio child process handles newline-delimited JSON-RPC end-to-end", as
   assert.equal(lines.length, 2);
   assert.equal(lines[0].id, 10);
   assert.equal(lines[0].result.serverInfo.name, "remove-ac-mcp");
+  assert.equal(lines[0].result.serverInfo.version, "1.1.1");
   assert.equal(lines[1].id, 11);
   assert.equal(lines[1].result.tools.length, 3);
 });
