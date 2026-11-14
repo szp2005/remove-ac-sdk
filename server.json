@@ -19,7 +19,7 @@
       "environmentVariables": [
         {
           "name": "REMOVE_AC_API_KEY",
-          "description": "remove.ac API key (rac_live_...). Claim 5 free trial credits on verified signup at https://remove.ac/api-info.",
+          "description": "remove.ac API key (rac_live_...). Claim 1 free welcome credit on verified signup at https://remove.ac/api-info.",
           "isRequired": true,
           "isSecret": true
         }

@@ -14,7 +14,7 @@ Zero-dependency official developer SDKs, hot-folder CLI, and Model Context Proto
 
 - **1:1 `remove.bg` v1.0 Field Compatibility:** Swap `https://api.remove.bg/v1.0/removebg` to `https://remove.ac/v1.0/removebg` using standard `X-Api-Key: rac_live_...` headers and form fields (`image_file`, `image_file_b64`, `image_url`, `size`, `format`, `channels`, `type`, `roi`, `crop`, `crop_margin`, `scale`, `position`, `bg_color`, `bg_image_url`, `add_shadow`, `shadow_type`, `shadow_opacity`, `semitransparency`).
 - **Up to 25 MB / 40 MP Zero-Disk Direct GPU Streaming:** Payloads above 4 MB automatically negotiate a short-lived HMAC ticket (`POST /v1.0/removebg/ticket`) and stream directly to ephemeral GPU RAM without disk or database blob persistence.
-- **Atomic Credit Holds (`Idempotency-Key`):** Upstream timeouts or errors automatically release held credits with zero charge. Every verified account starts with **5 free credits**; pay-as-you-go credit packs never expire.
+- **Atomic Credit Holds (`Idempotency-Key`):** Upstream timeouts or errors automatically release held credits with zero charge. Every verified account starts with **1 free credit**; pay-as-you-go credit packs never expire.
 - **Zero External Runtime Dependencies:** The Node.js 18+ SDK, CLI, MCP stdio server, and Python 3.8+ SDK run purely on standard library primitives (`fetch`/`crypto` in Node, `urllib` in Python).
 
 ---

@@ -7,7 +7,7 @@ startCommand:
     properties:
       removeAcApiKey:
         type: string
-        description: Your remove.ac API key (rac_live_... — claim 5 free trial credits at https://remove.ac/api-info)
+        description: Your remove.ac API key (rac_live_... — claim 1 free welcome credit at https://remove.ac/api-info)
       removeAcBaseUrl:
         type: string
         default: https://remove.ac
