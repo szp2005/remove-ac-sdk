@@ -26,7 +26,7 @@ inputs:
     required: false
     default: "false"
   size:
-    description: "Output resolution tier: auto, preview, small, regular, medium, hd, 4k, or full."
+    description: "Output resolution tier: auto, preview, small, regular, medium, hd, 4k, 25mp, 50mp, or full."
     required: false
     default: "full"
   format:

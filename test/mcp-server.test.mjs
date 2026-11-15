@@ -22,9 +22,16 @@ const mcpBinPath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../bin/remove-ac-mcp.mjs",
 );
+const serverJsonPath = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../server.json",
+);
+const tempRoot = fs.existsSync("/Volumes/Expansion/dev-tools/build-temp")
+  ? "/Volumes/Expansion/dev-tools/build-temp"
+  : os.tmpdir();
 
-test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.1.2", async () => {
-  assert.equal(SERVER_VERSION, "1.1.2");
+test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.2.0", async () => {
+  assert.equal(SERVER_VERSION, "1.2.0");
   const initRes = await handleMcpRequest({
     jsonrpc: "2.0",
     id: 1,
@@ -34,7 +41,7 @@ test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.1.
   assert.equal(initRes.id, 1);
   assert.equal(initRes.result.protocolVersion, "2024-11-05");
   assert.equal(initRes.result.serverInfo.name, SERVER_NAME);
-  assert.equal(initRes.result.serverInfo.version, "1.1.2");
+  assert.equal(initRes.result.serverInfo.version, "1.2.0");
 
   const notifRes = await handleMcpRequest({
     jsonrpc: "2.0",
@@ -93,7 +100,7 @@ test("MCP get_account_balance surfaces totalCredits cleanly for positive and zer
 });
 
 test("MCP remove_background_file writes cutout output and upgrades >4 MB files via ticket", async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "remove-ac-mcp-test-"));
+  const tmpDir = fs.mkdtempSync(path.join(tempRoot, "remove-ac-mcp-test-"));
   const inputPath = path.join(tmpDir, "large-input.png");
   fs.writeFileSync(inputPath, Buffer.alloc(4 * 1024 * 1024 + 128, 0x2a));
 
@@ -305,7 +312,79 @@ test("MCP stdio child process handles newline-delimited JSON-RPC end-to-end", as
   assert.equal(lines.length, 2);
   assert.equal(lines[0].id, 10);
   assert.equal(lines[0].result.serverInfo.name, "remove-ac-mcp");
-  assert.equal(lines[0].result.serverInfo.version, "1.1.2");
+  assert.equal(lines[0].result.serverInfo.version, "1.2.0");
   assert.equal(lines[1].id, 11);
   assert.equal(lines[1].result.tools.length, 3);
+  const fileTool = lines[1].result.tools.find((t) => t.name === "remove_background_file");
+  assert.ok(fileTool.inputSchema.properties.size.enum.includes("25mp"));
+  assert.ok(fileTool.inputSchema.properties.size.enum.includes("50mp"));
+});
+
+test("MF-02 & MF-03: server.json satisfies Official MCP Registry <=100-char limit and MCP runtime blocks format traversal, invalid enums, unknown args, and symlinks with 0 HTTP calls", async () => {
+  const srv = JSON.parse(fs.readFileSync(serverJsonPath, "utf8"));
+  assert.equal(srv.version, SERVER_VERSION);
+  assert.equal(srv.packages[0].version, SERVER_VERSION);
+  assert.ok(
+    typeof srv.description === "string" && srv.description.length > 0 && srv.description.length <= 100,
+    `Expected server.json description <= 100 chars, got ${srv.description?.length}`,
+  );
+
+  const sandbox = fs.mkdtempSync(path.join(tempRoot, "remove-ac-mcp-sec-"));
+  try {
+    const workDir = path.join(sandbox, "nested", "workspace");
+    fs.mkdirSync(workDir, { recursive: true });
+    const inputPath = path.join(workDir, "photo.png");
+    fs.writeFileSync(inputPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]));
+
+    const outsideSecret = path.join(sandbox, "victim.txt");
+    fs.writeFileSync(outsideSecret, "DO_NOT_OVERWRITE");
+    const liveSymlinkOut = path.join(workDir, "symlink-out.png");
+    fs.symlinkSync(outsideSecret, liveSymlinkOut);
+    const danglingSymlinkOut = path.join(workDir, "dangling-out.png");
+    fs.symlinkSync(path.join(sandbox, "nonexistent-target.png"), danglingSymlinkOut);
+    const symlinkDir = path.join(workDir, "symdir");
+    fs.symlinkSync(sandbox, symlinkDir);
+
+    let httpHits = 0;
+    const neverCalledClient = () => ({
+      removeBackground: async () => {
+        httpHits += 1;
+        return { buffer: Buffer.from("PWNED"), width: 10, height: 10, creditsCharged: 1, mediaType: "image/png" };
+      },
+      getAccount: async () => {
+        httpHits += 1;
+        return {};
+      },
+    });
+
+    const badCalls = [
+      { inputPath, format: "/../../../escaped_via_format.bin" },
+      { inputPath, size: "999mp_invalid_tier" },
+      { inputPath, type: "alien_entity" },
+      { inputPath, shadowType: "laser_beam" },
+      { inputPath, unknownExtraKey: "blocked" },
+      { inputPath, outputPath: liveSymlinkOut, overwrite: true },
+      { inputPath, outputPath: danglingSymlinkOut, overwrite: true },
+      { inputPath, outputPath: path.join(symlinkDir, "escaped.png"), overwrite: true },
+    ];
+
+    for (const badArgs of badCalls) {
+      const res = await handleMcpRequest(
+        {
+          jsonrpc: "2.0",
+          id: 99,
+          method: "tools/call",
+          params: { name: "remove_background_file", arguments: badArgs },
+        },
+        neverCalledClient,
+      );
+      assert.equal(res.result.isError, true, `Expected error for args=${JSON.stringify(badArgs)}`);
+    }
+
+    assert.equal(httpHits, 0, "Invalid arguments or symlink targets must make 0 HTTP calls");
+    assert.equal(fs.existsSync(path.join(sandbox, "escaped_via_format.bin")), false);
+    assert.equal(fs.readFileSync(outsideSecret, "utf8"), "DO_NOT_OVERWRITE");
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
 });

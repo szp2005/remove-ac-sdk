@@ -327,4 +327,28 @@ test("MF-3 & MF-4: GitHub Action protects GITHUB_STATE, uncreated runner files u
     });
     assert.equal(res.processed_count, "1");
   }
+
+  for (const validSize of ["25mp", "50mp", "full"]) {
+    const res = await runGithubAction({
+      env: {
+        GITHUB_WORKSPACE: ws,
+        INPUT_API_KEY: "rac_live_test",
+        INPUT_INPUT_PATH: "item.png",
+        INPUT_OUTPUT_PATH: `item-size-${validSize}.png`,
+        INPUT_SIZE: validSize,
+        INPUT_BASE_URL: "http://127.0.0.1:8787",
+      },
+      cwd: ws,
+      stdout: { write() {} },
+      allowLoopbackBaseUrlForTest: true,
+      fetchImpl: async (_url, init) => {
+        assert.equal(init.body.get("size"), validSize);
+        return new Response(TINY_PNG, {
+          status: 200,
+          headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+        });
+      },
+    });
+    assert.equal(res.processed_count, "1");
+  }
 });

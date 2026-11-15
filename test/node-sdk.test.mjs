@@ -11,11 +11,18 @@ import {
   RemoveAcClient,
   RemoveAcError,
   removeBackgroundFromImageUrl,
+  SDK_VERSION,
+  USER_AGENT,
+  VALID_SIZES,
 } from "../node/index.mjs";
 import {
+  CLI_VERSION,
   deriveSubIdempotencyKey as deriveCliSubKey,
   parseArgs as parseCliArgs,
   processImageBuffer,
+  runBatchPool,
+  USER_AGENT as CLI_USER_AGENT,
+  VALID_SIZES as CLI_VALID_SIZES,
 } from "../bin/remove-ac-cli.mjs";
 
 const cliBinPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../bin/remove-ac-cli.mjs");
@@ -315,4 +322,211 @@ test("MF-1 & MF-2: Node SDK and CLI block 3xx redirects without leaking X-Api-Ke
     assert.equal(cliRes.status, 502);
     assert.equal(cliCalls.length, 1);
   }
+});
+
+test("v1.2.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight, CLI --flag=value/--concurrency/--version, and ticket hold release", async () => {
+  assert.equal(SDK_VERSION, "1.2.0");
+  assert.equal(USER_AGENT, "remove-ac-node-sdk/1.2.0");
+  assert.equal(CLI_VERSION, "1.2.0");
+  assert.equal(CLI_USER_AGENT, "remove-ac-cli/1.2.0");
+  assert.ok(VALID_SIZES.includes("25mp") && VALID_SIZES.includes("50mp"));
+  assert.deepEqual(VALID_SIZES, CLI_VALID_SIZES);
+
+  // CLI --version / -v
+  const verRun = spawnSync(process.execPath, [cliBinPath, "--version"], { encoding: "utf8" });
+  assert.equal(verRun.status, 0);
+  assert.equal(verRun.stdout.trim(), "1.2.0");
+
+  // Exact README Section 3 invocations parse cleanly
+  const readmeBatch = parseCliArgs([
+    "./input-photos",
+    "--output-dir",
+    "./output-pngs",
+    "--concurrency=4",
+    "--size=50mp",
+  ]);
+  assert.deepEqual(readmeBatch.inputs, ["./input-photos"]);
+  assert.equal(readmeBatch.outputDir, "./output-pngs");
+  assert.equal(readmeBatch.concurrency, 4);
+  assert.equal(readmeBatch.size, "50mp");
+
+  const readmeWatch = parseCliArgs([
+    "./incoming",
+    "--output-dir",
+    "./cutouts",
+    "--watch",
+    "--format=webp",
+    "--crop",
+  ]);
+  assert.deepEqual(readmeWatch.inputs, ["./incoming"]);
+  assert.equal(readmeWatch.outputDir, "./cutouts");
+  assert.equal(readmeWatch.watch, true);
+  assert.equal(readmeWatch.format, "webp");
+  assert.equal(readmeWatch.crop, true);
+
+  // Upfront enum validation in CLI and Node SDK (0 HTTP calls)
+  assert.throws(() => parseCliArgs(["a.png", "--size=999mp"]), /Unsupported --size/);
+  assert.throws(() => parseCliArgs(["a.png", "--format=../bad"]), /Unsupported --format/);
+  assert.throws(() => parseCliArgs(["a.png", "--concurrency=0"]), /--concurrency must be an integer/);
+  assert.throws(() => parseCliArgs(["a.png", "--concurrency=99"]), /--concurrency must be an integer/);
+
+  let invalidHits = 0;
+  const guardClient = new RemoveAcClient({
+    apiKey: "rac_live_test",
+    fetch: async () => {
+      invalidHits += 1;
+      return new Response("unexpected");
+    },
+  });
+  for (const badOpts of [
+    { size: "999mp" },
+    { format: "bmp" },
+    { channels: "cmyk" },
+    { type: "spaceship" },
+    { shadowType: "neon" },
+  ]) {
+    await assert.rejects(
+      () => guardClient.removeBackground(Buffer.from([1, 2, 3]), badOpts),
+      (err) => err instanceof RemoveAcError && err.statusCode === 400,
+    );
+  }
+  assert.equal(invalidHits, 0);
+
+  // 20 MP PNG (5000x4000) with crop: true -> stays direct on 4k (<= 10 MP), upgrades to ticket on 25mp & 50mp
+  const png20Mp = Buffer.alloc(64);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]).copy(png20Mp, 0);
+  png20Mp.write("IHDR", 12, "ascii");
+  png20Mp.writeUInt32BE(5000, 16);
+  png20Mp.writeUInt32BE(4000, 20);
+
+  const traceTier = async (sizeTier) => {
+    const sdkTrace = [];
+    const cliTrace = [];
+    const mockHandler = (bucket) => async (url, init) => {
+      bucket.push({ url: String(url), ua: init.headers["User-Agent"] });
+      if (String(url).endsWith("/v1.0/removebg/ticket")) {
+        return Response.json({
+          data: {
+            ticket: `tkt_${sizeTier}`,
+            directEndpoint: "https://gpu.example.invalid/v1.0/direct-cutout",
+          },
+        });
+      }
+      return new Response(Buffer.from("PNG_OK"), {
+        status: 200,
+        headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+      });
+    };
+
+    const c = new RemoveAcClient({
+      apiKey: "rac_live_test",
+      lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      fetch: mockHandler(sdkTrace),
+    });
+    await c.removeBackground(png20Mp, { size: sizeTier, crop: true });
+
+    await processImageBuffer({
+      bytes: png20Mp,
+      fileName: "item.png",
+      mimeType: "image/png",
+      opts: parseCliArgs(["item.png", `--size=${sizeTier}`, "--crop", "--api-key=rac_live_test"]),
+      baseUrl: "https://remove.ac",
+      lookupFn: async () => [{ address: "93.184.216.34", family: 4 }],
+      fetchImpl: mockHandler(cliTrace),
+    });
+
+    for (const item of sdkTrace) assert.equal(item.ua, "remove-ac-node-sdk/1.2.0");
+    for (const item of cliTrace) assert.equal(item.ua, "remove-ac-cli/1.2.0");
+    return { sdkUrls: sdkTrace.map((x) => x.url), cliUrls: cliTrace.map((x) => x.url) };
+  };
+
+  const t4k = await traceTier("4k");
+  assert.deepEqual(t4k.sdkUrls, ["https://remove.ac/v1.0/removebg"]);
+  assert.deepEqual(t4k.cliUrls, ["https://remove.ac/v1.0/removebg"]);
+
+  for (const hiTier of ["25mp", "50mp"]) {
+    const tHi = await traceTier(hiTier);
+    assert.deepEqual(tHi.sdkUrls, [
+      "https://remove.ac/v1.0/removebg/ticket",
+      "https://gpu.example.invalid/v1.0/direct-cutout",
+    ]);
+    assert.deepEqual(tHi.cliUrls, [
+      "https://remove.ac/v1.0/removebg/ticket",
+      "https://gpu.example.invalid/v1.0/direct-cutout",
+    ]);
+  }
+
+  // Bounded worker pool concurrency check
+  let active = 0;
+  let maxObserved = 0;
+  const poolFailed = await runBatchPool([1, 2, 3, 4, 5, 6, 7], 3, async (item) => {
+    active += 1;
+    if (active > maxObserved) maxObserved = active;
+    await new Promise((r) => setTimeout(r, 15));
+    active -= 1;
+    return item !== 5;
+  });
+  assert.equal(poolFailed, 1);
+  assert.ok(maxObserved <= 3 && maxObserved >= 2, `Expected concurrency 2..3, got ${maxObserved}`);
+
+  // MF-06: Best-effort POST /v1.0/removebg/ticket/release on directEndpoint validation or upload failure
+  const releasePayloads = [];
+  const failClient = new RemoveAcClient({
+    apiKey: "rac_live_hold_test",
+    lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    fetch: async (url, init) => {
+      const u = String(url);
+      if (u.endsWith("/v1.0/removebg/ticket")) {
+        return Response.json({
+          data: {
+            ticket: "tkt_hold_1",
+            directEndpoint: "https://gpu.example.invalid/v1.0/direct-cutout",
+            holdId: "hold_node_1",
+            releaseToken: "rel_node_secret_1",
+          },
+        });
+      }
+      if (u.endsWith("/v1.0/removebg/ticket/release")) {
+        releasePayloads.push(JSON.parse(init.body));
+        return Response.json({ ok: true });
+      }
+      throw new Error("simulated network reset during 25MB upload");
+    },
+  });
+  await assert.rejects(
+    () => failClient.removeBackground(Buffer.from("bytes"), { direct: true }),
+    /simulated network reset/,
+  );
+  assert.deepEqual(releasePayloads, [{ holdId: "hold_node_1", releaseToken: "rel_node_secret_1" }]);
+
+  const cliReleasePayloads = [];
+  const cliFailOut = await processImageBuffer({
+    bytes: Buffer.from("bytes"),
+    fileName: "x.png",
+    mimeType: "image/png",
+    opts: parseCliArgs(["x.png", "--direct", "--api-key=rac_live_hold_test"]),
+    baseUrl: "https://remove.ac",
+    lookupFn: async () => [{ address: "10.0.0.9", family: 4 }],
+    fetchImpl: async (url, init) => {
+      const u = String(url);
+      if (u.endsWith("/v1.0/removebg/ticket")) {
+        return Response.json({
+          data: {
+            ticket: "tkt_cli_hold",
+            directEndpoint: "https://rebind.example.com/v1.0/direct-cutout",
+            holdId: "hold_cli_1",
+            releaseToken: "rel_cli_secret_1",
+          },
+        });
+      }
+      if (u.endsWith("/v1.0/removebg/ticket/release")) {
+        cliReleasePayloads.push(JSON.parse(init.body));
+        return Response.json({ ok: true });
+      }
+      return new Response("unexpected", { status: 500 });
+    },
+  });
+  assert.equal(cliFailOut.ok, false);
+  assert.equal(cliFailOut.status, 502);
+  assert.deepEqual(cliReleasePayloads, [{ holdId: "hold_cli_1", releaseToken: "rel_cli_secret_1" }]);
 });

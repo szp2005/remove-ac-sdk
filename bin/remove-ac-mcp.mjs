@@ -13,6 +13,7 @@
  *   REMOVE_AC_BASE_URL — optional override (defaults to https://remove.ac)
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,7 +37,7 @@ export {
 };
 
 export const SERVER_NAME = "remove-ac-mcp";
-export const SERVER_VERSION = "1.1.2";
+export const SERVER_VERSION = "1.2.0";
 export const MAX_MCP_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_MCP_HEADER_BYTES = 16 * 1024;
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
@@ -46,15 +47,52 @@ const SUPPORTED_PROTOCOLS = new Set([
   "2025-06-18",
 ]);
 
+const MCP_SIZE_ENUM = [
+  "auto",
+  "preview",
+  "small",
+  "regular",
+  "medium",
+  "hd",
+  "4k",
+  "25mp",
+  "50mp",
+  "full",
+];
+const MCP_FORMAT_ENUM = ["png", "jpg", "webp", "zip"];
+const MCP_TYPE_ENUM = [
+  "auto",
+  "person",
+  "product",
+  "car",
+  "animal",
+  "graphic",
+  "transportation",
+];
+const MCP_SHADOW_ENUM = [
+  "auto",
+  "car",
+  "drop",
+  "soft",
+  "contact",
+  "reflection",
+  "none",
+];
+
+const ALLOWED_MCP_SIZES = new Set(MCP_SIZE_ENUM);
+const ALLOWED_MCP_FORMATS = new Set(MCP_FORMAT_ENUM);
+const ALLOWED_MCP_TYPES = new Set(MCP_TYPE_ENUM);
+const ALLOWED_MCP_SHADOWS = new Set(MCP_SHADOW_ENUM);
+
 const SHARED_CUTOUT_PROPERTIES = {
   size: {
     type: "string",
-    enum: ["auto", "preview", "small", "regular", "medium", "hd", "4k", "full"],
+    enum: MCP_SIZE_ENUM,
     description: "Output resolution tier. Defaults to 'full'.",
   },
   format: {
     type: "string",
-    enum: ["png", "jpg", "webp", "zip"],
+    enum: MCP_FORMAT_ENUM,
     description: "Output file format. Defaults to 'png'.",
   },
   bgColor: {
@@ -67,7 +105,7 @@ const SHARED_CUTOUT_PROPERTIES = {
   },
   type: {
     type: "string",
-    enum: ["auto", "person", "product", "car", "animal", "graphic", "transportation"],
+    enum: MCP_TYPE_ENUM,
     description: "Optional foreground category hint.",
   },
   addShadow: {
@@ -76,7 +114,7 @@ const SHARED_CUTOUT_PROPERTIES = {
   },
   shadowType: {
     type: "string",
-    enum: ["auto", "car", "drop", "soft", "contact", "reflection", "none"],
+    enum: MCP_SHADOW_ENUM,
     description: "Shadow preset when addShadow is enabled.",
   },
 };
@@ -85,7 +123,7 @@ export const MCP_TOOLS = [
   {
     name: "remove_background_file",
     description:
-      "Remove the background from a local image file (.png, .jpg, .jpeg, .webp) via the stateless remove.ac Cloud GPU API (/v1.0/removebg). Files above 4 MB (up to 25 MB / 40 MP) automatically stream via zero-disk /v1.0/removebg/ticket.",
+      "Remove the background from a local image file (.png, .jpg, .jpeg, .webp) via the stateless remove.ac Cloud GPU API (/v1.0/removebg). Files above 4 MB (up to 25 MB / 50 MP) automatically stream via zero-disk /v1.0/removebg/ticket.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -145,37 +183,232 @@ export const MCP_TOOLS = [
   },
 ];
 
-function resolveDefaultOutputPath(inputPath, format = "png") {
-  const parsed = path.parse(inputPath);
-  const ext = format === "auto" ? ".png" : `.${format}`;
-  return path.join(parsed.dir, `${parsed.name}-nobg${ext}`);
+const TOOL_SCHEMA_MAP = new Map(MCP_TOOLS.map((t) => [t.name, t.inputSchema]));
+
+function validateNoSymlinkPathChain(resolvedPath, label) {
+  const root = path.parse(resolvedPath).root;
+  // Always check the leaf path itself with lstatSync (catches both live and dangling symlinks).
+  try {
+    const leafStat = fs.lstatSync(resolvedPath);
+    if (leafStat.isSymbolicLink()) {
+      throw new Error(`Refusing to operate on symbolic link ${label}: ${resolvedPath}`);
+    }
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") throw err;
+  }
+
+  // Walk ancestor directories up to (but excluding) OS root-level FHS links like macOS /var or /tmp.
+  let cur = path.dirname(resolvedPath);
+  while (cur && cur !== root && path.dirname(cur) !== root) {
+    try {
+      const st = fs.lstatSync(cur);
+      if (st.isSymbolicLink()) {
+        throw new Error(`Refusing to traverse symbolic link ancestor in ${label}: ${cur}`);
+      }
+    } catch (err) {
+      if (!err || err.code !== "ENOENT") throw err;
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
 }
 
-function ensureSafeWriteTarget(targetPath, overwrite = false, sourcePath = null) {
+function resolveDefaultOutputPath(inputPath, format = "png") {
+  if (!ALLOWED_MCP_FORMATS.has(format)) {
+    throw new Error(`Unsupported format '${format}'. Expected one of: ${MCP_FORMAT_ENUM.join(", ")}`);
+  }
+  const parsed = path.parse(inputPath);
+  return path.join(parsed.dir, `${parsed.name}-nobg.${format}`);
+}
+
+export function ensureSafeWriteTarget(targetPath, overwrite = false, sourcePath = null) {
+  if (!targetPath || typeof targetPath !== "string" || targetPath.includes("\0")) {
+    throw new Error("Invalid outputPath");
+  }
   const resolvedTarget = path.resolve(targetPath);
+  validateNoSymlinkPathChain(resolvedTarget, "outputPath");
+
   if (sourcePath && path.resolve(sourcePath) === resolvedTarget && !overwrite) {
     throw new Error(
       "outputPath resolves to inputPath; specify a separate outputPath or set overwrite: true",
     );
   }
-  if (!overwrite && fs.existsSync(resolvedTarget)) {
-    throw new Error(
-      `Destination file already exists: ${resolvedTarget} (pass overwrite: true to replace)`,
-    );
+
+  let existingStat = null;
+  try {
+    existingStat = fs.lstatSync(resolvedTarget);
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") throw err;
   }
-  fs.mkdirSync(path.dirname(resolvedTarget), { recursive: true });
+
+  if (existingStat) {
+    if (existingStat.isSymbolicLink()) {
+      throw new Error(`Refusing to overwrite symbolic link outputPath: ${resolvedTarget}`);
+    }
+    if (existingStat.isDirectory()) {
+      throw new Error(`outputPath points to an existing directory: ${resolvedTarget}`);
+    }
+    if (!overwrite) {
+      throw new Error(
+        `Destination file already exists: ${resolvedTarget} (pass overwrite: true to replace)`,
+      );
+    }
+  }
+
   return resolvedTarget;
 }
 
-function mapToolCutoutOptions(args = {}) {
+function writeBufferAtomically(resolvedTarget, buffer, overwrite = false, sourcePath = null) {
+  ensureSafeWriteTarget(resolvedTarget, overwrite, sourcePath);
+  const parentDir = path.dirname(resolvedTarget);
+  fs.mkdirSync(parentDir, { recursive: true });
+  validateNoSymlinkPathChain(resolvedTarget, "outputPath");
+
+  const tmpPath = path.join(
+    parentDir,
+    `.remove-ac-mcp-${process.pid}-${crypto.randomBytes(8).toString("hex")}.tmp`,
+  );
+  try {
+    fs.writeFileSync(tmpPath, buffer, { flag: "wx", mode: 0o644 });
+    if (!overwrite) {
+      try {
+        fs.linkSync(tmpPath, resolvedTarget);
+        fs.unlinkSync(tmpPath);
+        return;
+      } catch (linkErr) {
+        if (linkErr && linkErr.code === "EEXIST") {
+          throw new Error(
+            `Destination file already exists: ${resolvedTarget} (pass overwrite: true to replace)`,
+          );
+        }
+        // Fallback when filesystem does not support hardlinks
+        let raceStat = null;
+        try {
+          raceStat = fs.lstatSync(resolvedTarget);
+        } catch (stErr) {
+          if (!stErr || stErr.code !== "ENOENT") throw stErr;
+        }
+        if (raceStat) {
+          throw new Error(
+            `Destination file already exists: ${resolvedTarget} (pass overwrite: true to replace)`,
+          );
+        }
+      }
+    } else {
+      let existingStat = null;
+      try {
+        existingStat = fs.lstatSync(resolvedTarget);
+      } catch (stErr) {
+        if (!stErr || stErr.code !== "ENOENT") throw stErr;
+      }
+      if (existingStat && (existingStat.isSymbolicLink() || existingStat.isDirectory())) {
+        throw new Error(`Refusing to overwrite non-regular file: ${resolvedTarget}`);
+      }
+    }
+    fs.renameSync(tmpPath, resolvedTarget);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore temp cleanup failure
+    }
+    throw err;
+  }
+}
+
+function validateAllowedArguments(toolName, args) {
+  const schema = TOOL_SCHEMA_MAP.get(toolName);
+  if (!schema) return;
+  const allowedKeys = new Set(Object.keys(schema.properties || {}));
+  for (const key of Object.keys(args)) {
+    if (!allowedKeys.has(key)) {
+      throw new Error(`Unknown argument '${key}' for tool '${toolName}'`);
+    }
+  }
+  if (args.overwrite !== undefined && typeof args.overwrite !== "boolean") {
+    throw new Error("Invalid 'overwrite': expected boolean");
+  }
+  if (args.outputPath !== undefined && typeof args.outputPath !== "string") {
+    throw new Error("Invalid 'outputPath': expected string");
+  }
+}
+
+export function mapToolCutoutOptions(args = {}) {
+  let size = "full";
+  if (args.size !== undefined) {
+    if (typeof args.size !== "string") {
+      throw new Error("Invalid 'size': expected string");
+    }
+    size = args.size.trim().toLowerCase();
+    if (!ALLOWED_MCP_SIZES.has(size)) {
+      throw new Error(`Unsupported size '${args.size}'. Expected one of: ${MCP_SIZE_ENUM.join(", ")}`);
+    }
+  }
+
+  let format = "png";
+  if (args.format !== undefined) {
+    if (typeof args.format !== "string") {
+      throw new Error("Invalid 'format': expected string");
+    }
+    format = args.format.trim().toLowerCase();
+    if (!ALLOWED_MCP_FORMATS.has(format)) {
+      throw new Error(
+        `Unsupported format '${args.format}'. Expected one of: ${MCP_FORMAT_ENUM.join(", ")}`,
+      );
+    }
+  }
+
+  let fgType = "";
+  if (args.type !== undefined) {
+    if (typeof args.type !== "string") {
+      throw new Error("Invalid 'type': expected string");
+    }
+    fgType = args.type.trim().toLowerCase();
+    if (!ALLOWED_MCP_TYPES.has(fgType)) {
+      throw new Error(`Unsupported type '${args.type}'. Expected one of: ${MCP_TYPE_ENUM.join(", ")}`);
+    }
+  }
+
+  let shadowType = "";
+  if (args.shadowType !== undefined) {
+    if (typeof args.shadowType !== "string") {
+      throw new Error("Invalid 'shadowType': expected string");
+    }
+    shadowType = args.shadowType.trim().toLowerCase();
+    if (!ALLOWED_MCP_SHADOWS.has(shadowType)) {
+      throw new Error(
+        `Unsupported shadowType '${args.shadowType}'. Expected one of: ${MCP_SHADOW_ENUM.join(", ")}`,
+      );
+    }
+  }
+
+  if (args.crop !== undefined && typeof args.crop !== "boolean") {
+    throw new Error("Invalid 'crop': expected boolean");
+  }
+  if (args.addShadow !== undefined && typeof args.addShadow !== "boolean") {
+    throw new Error("Invalid 'addShadow': expected boolean");
+  }
+
+  let bgColor = "";
+  if (args.bgColor !== undefined) {
+    if (typeof args.bgColor !== "string") {
+      throw new Error("Invalid 'bgColor': expected string");
+    }
+    bgColor = args.bgColor.trim();
+    if (bgColor.length > 32 || /[\r\n\0]/.test(bgColor)) {
+      throw new Error("Invalid 'bgColor' value");
+    }
+  }
+
   return {
-    size: args.size || "full",
-    format: args.format || "png",
-    ...(args.bgColor ? { bgColor: String(args.bgColor) } : {}),
+    size,
+    format,
+    ...(bgColor ? { bgColor } : {}),
     ...(typeof args.crop === "boolean" ? { crop: args.crop } : {}),
-    ...(args.type ? { type: String(args.type) } : {}),
+    ...(fgType ? { type: fgType } : {}),
     ...(typeof args.addShadow === "boolean" ? { addShadow: args.addShadow } : {}),
-    ...(args.shadowType ? { shadowType: String(args.shadowType) } : {}),
+    ...(shadowType ? { shadowType } : {}),
   };
 }
 
@@ -246,12 +479,20 @@ export async function handleMcpRequest(
 
   if (method === "tools/call") {
     const toolName = params?.name;
-    const args = params?.arguments && typeof params.arguments === "object" ? params.arguments : {};
+    const rawArgs = params?.arguments;
+    if (rawArgs !== undefined && (rawArgs === null || typeof rawArgs !== "object" || Array.isArray(rawArgs))) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: toolFailure("Invalid tool arguments: expected JSON object"),
+      };
+    }
+    const args = rawArgs || {};
 
     try {
-      const client = effectiveClientFactory();
-
       if (toolName === "get_account_balance") {
+        validateAllowedArguments(toolName, args);
+        const client = effectiveClientFactory();
         const account = await client.getAccount();
         const creditsObj = account?.data?.attributes?.credits ?? account?.credits ?? null;
         return {
@@ -271,7 +512,9 @@ export async function handleMcpRequest(
       }
 
       if (toolName === "remove_background_file") {
-        if (!args.inputPath || typeof args.inputPath !== "string") {
+        validateAllowedArguments(toolName, args);
+        const cutoutOpts = mapToolCutoutOptions(args);
+        if (!args.inputPath || typeof args.inputPath !== "string" || args.inputPath.includes("\0")) {
           return {
             jsonrpc: "2.0",
             id,
@@ -279,25 +522,31 @@ export async function handleMcpRequest(
           };
         }
         const resolvedInput = path.resolve(args.inputPath);
-        if (!fs.existsSync(resolvedInput) || !fs.statSync(resolvedInput).isFile()) {
+        validateNoSymlinkPathChain(resolvedInput, "inputPath");
+        let inputStat = null;
+        try {
+          inputStat = fs.lstatSync(resolvedInput);
+        } catch (stErr) {
+          if (!stErr || stErr.code !== "ENOENT") throw stErr;
+        }
+        if (!inputStat || !inputStat.isFile()) {
           return {
             jsonrpc: "2.0",
             id,
             result: toolFailure(`Input image file not found: ${resolvedInput}`),
           };
         }
-        const cutoutOpts = mapToolCutoutOptions(args);
+
         const rawOut =
           typeof args.outputPath === "string" && args.outputPath.trim()
             ? args.outputPath
             : resolveDefaultOutputPath(resolvedInput, cutoutOpts.format);
-        const resolvedOutput = ensureSafeWriteTarget(
-          rawOut,
-          Boolean(args.overwrite),
-          resolvedInput,
-        );
+        const overwrite = Boolean(args.overwrite);
+        const resolvedOutput = ensureSafeWriteTarget(rawOut, overwrite, resolvedInput);
+
+        const client = effectiveClientFactory();
         const res = await client.removeBackground(resolvedInput, cutoutOpts);
-        fs.writeFileSync(resolvedOutput, res.buffer);
+        writeBufferAtomically(resolvedOutput, res.buffer, overwrite, resolvedInput);
         return {
           jsonrpc: "2.0",
           id,
@@ -315,6 +564,8 @@ export async function handleMcpRequest(
       }
 
       if (toolName === "remove_background_url") {
+        validateAllowedArguments(toolName, args);
+        const cutoutOpts = mapToolCutoutOptions(args);
         if (!args.imageUrl || typeof args.imageUrl !== "string") {
           return {
             jsonrpc: "2.0",
@@ -333,13 +584,12 @@ export async function handleMcpRequest(
         if (urlErr) {
           return { jsonrpc: "2.0", id, result: toolFailure(urlErr) };
         }
-        const resolvedOutput = ensureSafeWriteTarget(
-          args.outputPath,
-          Boolean(args.overwrite),
-        );
-        const cutoutOpts = mapToolCutoutOptions(args);
+        const overwrite = Boolean(args.overwrite);
+        const resolvedOutput = ensureSafeWriteTarget(args.outputPath, overwrite);
+
+        const client = effectiveClientFactory();
         const res = await client.removeBackground(args.imageUrl, cutoutOpts);
-        fs.writeFileSync(resolvedOutput, res.buffer);
+        writeBufferAtomically(resolvedOutput, res.buffer, overwrite);
         return {
           jsonrpc: "2.0",
           id,

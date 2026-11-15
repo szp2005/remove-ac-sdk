@@ -1,8 +1,47 @@
+export type RemoveBgSize =
+  | "preview"
+  | "small"
+  | "regular"
+  | "medium"
+  | "hd"
+  | "4k"
+  | "25mp"
+  | "50mp"
+  | "full"
+  | "auto";
+
+export type RemoveBgFormat = "auto" | "png" | "jpg" | "jpeg" | "webp" | "zip";
+export type RemoveBgChannels = "rgba" | "alpha";
+export type RemoveBgType =
+  | "auto"
+  | "person"
+  | "product"
+  | "car"
+  | "animal"
+  | "graphic"
+  | "transportation";
+export type RemoveBgShadowType =
+  | "auto"
+  | "car"
+  | "drop"
+  | "soft"
+  | "contact"
+  | "reflection"
+  | "none";
+
+export declare const SDK_VERSION: "1.2.0";
+export declare const USER_AGENT: string;
+export declare const VALID_SIZES: readonly RemoveBgSize[];
+export declare const VALID_FORMATS: readonly RemoveBgFormat[];
+export declare const VALID_CHANNELS: readonly RemoveBgChannels[];
+export declare const VALID_TYPES: readonly RemoveBgType[];
+export declare const VALID_SHADOW_TYPES: readonly RemoveBgShadowType[];
+
 export interface RemoveBackgroundOptions {
-  size?: "preview" | "small" | "regular" | "medium" | "hd" | "4k" | "full" | "auto";
-  format?: "auto" | "png" | "jpg" | "webp" | "zip";
-  channels?: "rgba" | "alpha";
-  type?: "auto" | "person" | "product" | "car" | "animal" | "graphic" | "transportation";
+  size?: RemoveBgSize;
+  format?: RemoveBgFormat;
+  channels?: RemoveBgChannels;
+  type?: RemoveBgType;
   typeLevel?: "none" | "1" | "2" | "latest";
   roi?: string;
   scale?: string;
@@ -12,7 +51,7 @@ export interface RemoveBackgroundOptions {
   crop?: boolean;
   cropMargin?: string;
   addShadow?: boolean;
-  shadowType?: "auto" | "car" | "drop" | "soft" | "contact" | "reflection" | "none";
+  shadowType?: RemoveBgShadowType;
   shadowOpacity?: number;
   semitransparency?: boolean;
   direct?: boolean;
@@ -39,7 +78,7 @@ export declare class RemoveAcError extends Error {
 }
 
 export declare class RemoveAcClient {
-  constructor(options?: { baseUrl?: string; apiKey?: string; fetch?: typeof fetch });
+  constructor(options?: { baseUrl?: string; apiKey?: string; fetch?: typeof fetch; lookup?: unknown });
   getAccount(): Promise<Record<string, unknown>>;
   removeBackground(
     input: string | Buffer | Uint8Array | ArrayBuffer,
@@ -54,6 +93,7 @@ export declare function removeBackgroundFromImageFile(
     baseUrl?: string;
     outputFile?: string;
     fetch?: typeof fetch;
+    lookup?: unknown;
   },
 ): Promise<RemoveBackgroundResult & { base64img: string }>;
 
@@ -64,6 +104,7 @@ export declare function removeBackgroundFromImageUrl(
     baseUrl?: string;
     outputFile?: string;
     fetch?: typeof fetch;
+    lookup?: unknown;
   },
 ): Promise<RemoveBackgroundResult & { base64img: string }>;
 
