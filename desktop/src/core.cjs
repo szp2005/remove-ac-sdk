@@ -436,6 +436,7 @@ function collectInputItems(inputPaths, options = {}) {
       inputPath: path.resolve(filePath),
       fileName: path.basename(filePath),
       byteLength: st.size,
+      rootDir: rootDir ? path.resolve(rootDir) : null,
       relSubdir,
     });
   };
@@ -469,6 +470,30 @@ function resolveOutputExtension(format) {
   return ".png";
 }
 
+function areSameOrCaseCollidingPaths(pathA, pathB) {
+  if (!pathA || !pathB) return false;
+  const resA = path.resolve(pathA);
+  const resB = path.resolve(pathB);
+  if (resA === resB || resA.toLowerCase() === resB.toLowerCase()) {
+    return true;
+  }
+  const realA = safeRealpath(resA);
+  const realB = safeRealpath(resB);
+  if (realA === realB || realA.toLowerCase() === realB.toLowerCase()) {
+    return true;
+  }
+  try {
+    const stA = fs.statSync(resA);
+    const stB = fs.statSync(resB);
+    if (stA.ino && stB.ino && stA.dev === stB.dev && stA.ino === stB.ino) {
+      return true;
+    }
+  } catch {
+    // One or both files do not exist yet
+  }
+  return false;
+}
+
 function resolveOutputTarget({
   item,
   outputDir,
@@ -476,10 +501,13 @@ function resolveOutputTarget({
   skipExisting = false,
   reservedPaths = new Set(),
 }) {
+  const resolvedInput = path.resolve(item.inputPath);
   const baseRoot =
     typeof outputDir === "string" && outputDir.trim()
       ? path.resolve(outputDir.trim())
-      : path.join(path.dirname(item.inputPath), "remove-ac-output");
+      : typeof item.rootDir === "string" && item.rootDir.trim()
+        ? path.join(path.resolve(item.rootDir), "remove-ac-output")
+        : path.join(path.dirname(resolvedInput), "remove-ac-output");
 
   let targetDir = baseRoot;
   if (item.relSubdir) {
@@ -490,25 +518,38 @@ function resolveOutputTarget({
   }
 
   const ext = resolveOutputExtension(format);
-  const rawStem = path.basename(item.inputPath, path.extname(item.inputPath)).trim() || "image";
+  const rawStem = path.basename(resolvedInput, path.extname(resolvedInput)).trim() || "image";
   const safeStem = rawStem.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_");
   const primaryCandidate = path.join(targetDir, `${safeStem}-nobg${ext}`);
   const normalizedPrimary = primaryCandidate.toLowerCase();
 
-  if (skipExisting && !reservedPaths.has(normalizedPrimary) && fs.existsSync(primaryCandidate)) {
-    return { skip: true, outputPath: primaryCandidate };
+  if (
+    skipExisting &&
+    !reservedPaths.has(normalizedPrimary) &&
+    fs.existsSync(primaryCandidate) &&
+    !areSameOrCaseCollidingPaths(primaryCandidate, resolvedInput)
+  ) {
+    reservedPaths.add(normalizedPrimary);
+    return { skip: true, outputPath: primaryCandidate, outputRootDir: baseRoot };
   }
 
   let chosen = primaryCandidate;
-  if (reservedPaths.has(normalizedPrimary) || primaryCandidate === item.inputPath) {
+  if (
+    reservedPaths.has(normalizedPrimary) ||
+    areSameOrCaseCollidingPaths(primaryCandidate, resolvedInput)
+  ) {
     let suffix = 1;
     do {
       chosen = path.join(targetDir, `${safeStem}-nobg-${suffix}${ext}`);
       suffix += 1;
-    } while (reservedPaths.has(chosen.toLowerCase()) || fs.existsSync(chosen));
+    } while (
+      reservedPaths.has(chosen.toLowerCase()) ||
+      fs.existsSync(chosen) ||
+      areSameOrCaseCollidingPaths(chosen, resolvedInput)
+    );
   }
   reservedPaths.add(chosen.toLowerCase());
-  return { skip: false, outputPath: chosen };
+  return { skip: false, outputPath: chosen, outputRootDir: baseRoot };
 }
 
 function writeFileAtomically(destPath, buffer) {
@@ -710,6 +751,26 @@ function isRetryableStatus(status) {
   return status === 429 || status === 502 || status === 503 || status === 504;
 }
 
+function parseRetryAfterMs(headers, maxMs = 65_000) {
+  if (!headers || typeof headers.get !== "function") return 0;
+  const raw = headers.get("Retry-After");
+  if (!raw || typeof raw !== "string") return 0;
+  const trimmed = raw.trim();
+  if (!trimmed) return 0;
+  const sec = Number.parseFloat(trimmed);
+  if (Number.isFinite(sec) && sec > 0) {
+    return Math.min(maxMs, Math.ceil(sec * 1000));
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (Number.isFinite(parsedDate)) {
+    const deltaMs = parsedDate - Date.now();
+    if (deltaMs > 0) {
+      return Math.min(maxMs, Math.ceil(deltaMs));
+    }
+  }
+  return 0;
+}
+
 class DesktopApiClient {
   constructor(options = {}) {
     const allowLoopback =
@@ -722,6 +783,9 @@ class DesktopApiClient {
     this.apiKey = String(options.apiKey || "").trim();
     this.fetchImpl = options.fetch || globalThis.fetch;
     this.maxRetries = Number.isFinite(options.maxRetries) ? options.maxRetries : 2;
+    this.maxRateLimitRetries = Number.isFinite(options.maxRateLimitRetries)
+      ? options.maxRateLimitRetries
+      : 6;
     this.retryBaseDelayMs = Number.isFinite(options.retryBaseDelayMs)
       ? options.retryBaseDelayMs
       : 650;
@@ -732,11 +796,55 @@ class DesktopApiClient {
     if (!headers.has("User-Agent")) {
       headers.set("User-Agent", "RemoveAcDesktop/1.0.0");
     }
-    return this.fetchImpl(url, {
-      ...init,
-      headers,
-      redirect: "error",
-    });
+    try {
+      return await this.fetchImpl(url, {
+        ...init,
+        headers,
+        redirect: "error",
+      });
+    } catch (err) {
+      const combinedMsg = [err?.message, err?.cause?.message, err?.cause?.code]
+        .filter(Boolean)
+        .join(" ");
+      if (/redirect/i.test(combinedMsg)) {
+        const redirErr = new DesktopAppError(
+          502,
+          "unexpected_redirect",
+          "Blocked unexpected HTTP redirect from API endpoint"
+        );
+        redirErr.nonRetryable = true;
+        throw redirErr;
+      }
+      throw err;
+    }
+  }
+
+  async _throwGatewayHttpError(res) {
+    const retryAfterMs = parseRetryAfterMs(res.headers);
+    const parsed = parseGatewayErrorMessage(res.status, await res.text());
+    const err = new DesktopAppError(res.status, parsed.code, parsed.message);
+    if (retryAfterMs > 0) {
+      err.retryAfterMs = retryAfterMs;
+    }
+    throw err;
+  }
+
+  async _releaseTicketHold(holdId, releaseToken) {
+    if (!holdId || !releaseToken || !this.apiKey) return false;
+    try {
+      const res = await this._fetchNoRedirect(`${this.baseUrl}/v1.0/remove/ticket/release`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Api-Key": this.apiKey,
+        },
+        body: JSON.stringify({ holdId, releaseToken }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return Boolean(res && res.ok);
+    } catch {
+      return false;
+    }
   }
 
   async getAccount(signal) {
@@ -749,8 +857,7 @@ class DesktopApiClient {
       signal,
     });
     if (!res.ok) {
-      const parsed = parseGatewayErrorMessage(res.status, await res.text());
-      throw new DesktopAppError(res.status, parsed.code, parsed.message);
+      await this._throwGatewayHttpError(res);
     }
     const json = await res.json();
     const attrs = json?.data?.attributes || {};
@@ -831,48 +938,63 @@ class DesktopApiClient {
         signal,
       });
       if (!tRes.ok) {
-        const parsed = parseGatewayErrorMessage(tRes.status, await tRes.text());
-        throw new DesktopAppError(tRes.status, parsed.code, parsed.message);
+        await this._throwGatewayHttpError(tRes);
       }
       const tJson = await tRes.json();
-      const ticketToken = tJson?.data?.ticket;
-      const rawDirectUrl = tJson?.data?.directEndpoint || tJson?.data?.directUrl;
-      if (
-        typeof ticketToken !== "string" ||
-        !ticketToken.trim() ||
-        typeof rawDirectUrl !== "string" ||
-        !rawDirectUrl.trim()
-      ) {
-        throw new DesktopAppError(
-          502,
-          "invalid_ticket_response",
-          "Missing ticket or directEndpoint in /v1.0/remove/ticket response"
-        );
-      }
-      const safeDirectEndpoint = validateServiceEndpointUrl(rawDirectUrl, {
-        kind: "direct",
-        allowLoopback: this.allowLoopback,
-      });
+      const ticketData = tJson?.data || tJson || {};
+      const ticketToken = ticketData.ticket;
+      const rawDirectUrl =
+        ticketData.directEndpoint || ticketData.directUrl || ticketData.direct_url;
+      const rawHoldId = ticketData.holdId ?? ticketData.lock_id ?? ticketData.lockId;
+      const rawReleaseToken = ticketData.releaseToken ?? ticketData.release_token;
+      const holdId = typeof rawHoldId === "string" ? rawHoldId.trim() : "";
+      const releaseToken = typeof rawReleaseToken === "string" ? rawReleaseToken.trim() : "";
 
-      const fd = new FormData();
-      fd.set("image_file", new Blob([sourceBytes], { type: mimeType }), sourceName);
-      const dRes = await this._fetchNoRedirect(safeDirectEndpoint, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${ticketToken.trim()}` },
-        body: fd,
-        signal,
-      });
-      if (!dRes.ok) {
-        const parsed = parseGatewayErrorMessage(dRes.status, await dRes.text());
-        throw new DesktopAppError(dRes.status, parsed.code, parsed.message);
+      try {
+        if (
+          typeof ticketToken !== "string" ||
+          !ticketToken.trim() ||
+          typeof rawDirectUrl !== "string" ||
+          !rawDirectUrl.trim()
+        ) {
+          const invalidErr = new DesktopAppError(
+            502,
+            "invalid_ticket_response",
+            "Missing ticket or directEndpoint in /v1.0/remove/ticket response"
+          );
+          invalidErr.nonRetryable = true;
+          throw invalidErr;
+        }
+        const safeDirectEndpoint = validateServiceEndpointUrl(rawDirectUrl, {
+          kind: "direct",
+          allowLoopback: this.allowLoopback,
+        });
+        if (signal?.aborted) {
+          throw new DesktopAppError(499, "aborted", "Batch cancelled");
+        }
+
+        const fd = new FormData();
+        fd.set("image_file", new Blob([sourceBytes], { type: mimeType }), sourceName);
+        const dRes = await this._fetchNoRedirect(safeDirectEndpoint, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${ticketToken.trim()}` },
+          body: fd,
+          signal,
+        });
+        if (!dRes.ok) {
+          await this._throwGatewayHttpError(dRes);
+        }
+        return {
+          buffer: Buffer.from(await dRes.arrayBuffer()),
+          width: Number.parseInt(dRes.headers.get("X-Width") || "0", 10),
+          height: Number.parseInt(dRes.headers.get("X-Height") || "0", 10),
+          creditsCharged: Number.parseFloat(dRes.headers.get("X-Credits-Charged") || "0"),
+          mediaType: dRes.headers.get("Content-Type") || "image/png",
+        };
+      } catch (directErr) {
+        await this._releaseTicketHold(holdId, releaseToken);
+        throw directErr;
       }
-      return {
-        buffer: Buffer.from(await dRes.arrayBuffer()),
-        width: Number.parseInt(dRes.headers.get("X-Width") || "0", 10),
-        height: Number.parseInt(dRes.headers.get("X-Height") || "0", 10),
-        creditsCharged: Number.parseFloat(dRes.headers.get("X-Credits-Charged") || "0"),
-        mediaType: dRes.headers.get("Content-Type") || "image/png",
-      };
     };
 
     const useDirectTicket =
@@ -880,13 +1002,18 @@ class DesktopApiClient {
       shouldPreFlightViaTicket(sourceBytes, size, format, settings.crop);
 
     let activeIdemKey = baseIdemKey;
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+    let transientAttempts = 0;
+    let rateLimitAttempts = 0;
+    let requestSeq = 0;
+
+    while (true) {
       if (signal?.aborted) {
         throw new DesktopAppError(499, "aborted", "Batch cancelled");
       }
+      const currentSeq = requestSeq++;
       try {
         if (useDirectTicket) {
-          return await executeViaTicket(`direct-${attempt}`);
+          return await executeViaTicket(`direct-${currentSeq}`);
         }
 
         const buildForm = () => {
@@ -937,20 +1064,11 @@ class DesktopApiClient {
         }
 
         if (res.status === 413) {
-          return await executeViaTicket(`fallback413-${attempt}`);
+          return await executeViaTicket(`fallback413-${currentSeq}`);
         }
 
         if (!res.ok) {
-          const retryAfterHeader = res.headers.get("Retry-After");
-          const parsed = parseGatewayErrorMessage(res.status, await res.text());
-          const err = new DesktopAppError(res.status, parsed.code, parsed.message);
-          if (retryAfterHeader) {
-            const sec = Number.parseFloat(retryAfterHeader);
-            if (Number.isFinite(sec) && sec > 0) {
-              err.retryAfterMs = Math.min(15_000, Math.ceil(sec * 1000));
-            }
-          }
-          throw err;
+          await this._throwGatewayHttpError(res);
         }
 
         return {
@@ -967,13 +1085,30 @@ class DesktopApiClient {
         const status = typeof err?.statusCode === "number" ? err.statusCode : 0;
         const isTransientNetworkError =
           status === 0 && !(err instanceof DesktopAppError);
-        if (attempt < this.maxRetries && (isRetryableStatus(status) || isTransientNetworkError)) {
+
+        if (!err?.nonRetryable && status === 429 && rateLimitAttempts < this.maxRateLimitRetries) {
+          rateLimitAttempts += 1;
+          const baseWait =
+            err?.retryAfterMs ||
+            Math.min(15_000, this.retryBaseDelayMs * Math.pow(2, rateLimitAttempts - 1));
+          const jitterMs = 50 + Math.floor(Math.random() * 350);
+          await sleepWithAbort(baseWait + jitterMs, signal);
+          continue;
+        }
+
+        if (
+          !err?.nonRetryable &&
+          transientAttempts < this.maxRetries &&
+          ((status !== 429 && isRetryableStatus(status)) || isTransientNetworkError)
+        ) {
+          transientAttempts += 1;
           const delayMs =
             err?.retryAfterMs ||
-            Math.min(8_000, this.retryBaseDelayMs * Math.pow(2, attempt));
+            Math.min(8_000, this.retryBaseDelayMs * Math.pow(2, transientAttempts - 1));
           await sleepWithAbort(delayMs, signal);
           continue;
         }
+
         if (err instanceof DesktopAppError) throw err;
         throw new DesktopAppError(
           503,
@@ -982,7 +1117,6 @@ class DesktopApiClient {
         );
       }
     }
-    throw new DesktopAppError(503, "max_retries_exceeded", "Request failed after retries");
   }
 
   async removeBackgroundFile(filePath, settings = {}, runtimeOpts = {}) {
@@ -1053,6 +1187,7 @@ async function runBatchQueue(items, workerFn, options = {}) {
             id: item.id,
             status: "skipped",
             outputPath: result.outputPath,
+            outputRootDir: result.outputRootDir || "",
           });
         } else {
           summary.completed += 1;
@@ -1062,6 +1197,7 @@ async function runBatchQueue(items, workerFn, options = {}) {
             id: item.id,
             status: "done",
             outputPath: result.outputPath,
+            outputRootDir: result.outputRootDir || "",
             width: result.width || 0,
             height: result.height || 0,
             creditsCharged: credits,
@@ -1105,6 +1241,8 @@ module.exports = {
   parseImageDimensions,
   validateServiceEndpointUrl,
   deriveSubIdempotencyKey,
+  parseRetryAfterMs,
+  areSameOrCaseCollidingPaths,
   collectInputItems,
   resolveOutputTarget,
   writeFileAtomically,

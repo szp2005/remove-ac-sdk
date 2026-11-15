@@ -7,7 +7,12 @@
     en: {
       toggleLangLabel: "简体中文",
       creditsUnconnected: "API Key Required",
+      creditsChecking: "Verifying Key…",
+      creditsInvalidKey: "Invalid API Key",
+      creditsOffline: "Connection Error",
+      creditsVerifyFailed: "Failed to verify API Key",
       creditsBalance: (n) => `${n} Credits`,
+      refreshCreditsAria: "Refresh credit balance",
       buyCredits: "Get Credits",
       dropTitle: "Drag & drop images or entire folders here",
       dropSub: "PNG, JPG, WebP up to 25 MB & 40 MP per image · Zero disk storage on Cloud GPU",
@@ -32,6 +37,7 @@
       replaceKey: "Change",
       clearKey: "Clear",
       saveVerifyKey: "Save & Verify",
+      cancelEditKey: "Cancel",
       apiKeyHint: "Encrypted locally via Windows DPAPI / macOS Keychain.",
       apiKeySessionOnly: "Session-only memory mode (OS keyring unavailable).",
       apiKeyVerified: (c) => `Connected · ${c} credits available`,
@@ -44,8 +50,10 @@
       bgCustom: "Custom Solid Color",
       bgZip: "4-File Editable Layer Pack (.zip)",
       customColorLabel: "Background Hex",
+      customColorHexAria: "Custom background hex color",
       formatLabel: "Format",
       resolutionLabel: "Resolution",
+      sizeAuto: "Auto (up to 25 MP)",
       sizeFull: "Full (up to 25 MP)",
       sizePreview: "Preview (0.25 MP)",
       size4k: "4K (up to 10 MP)",
@@ -69,6 +77,7 @@
       skipExistingLabel: "Skip images that already have cutouts",
       previewCutout: "Cutout Result",
       previewOriginal: "Original",
+      closeModalAria: "Close preview",
       revealInFolder: "Show in Folder",
       badgeQueued: "Queued",
       badgeProcessing: "Processing…",
@@ -84,7 +93,12 @@
     "zh-CN": {
       toggleLangLabel: "English",
       creditsUnconnected: "未配置 API 密钥",
+      creditsChecking: "校验密钥中…",
+      creditsInvalidKey: "API 密钥无效",
+      creditsOffline: "连接校验失败",
+      creditsVerifyFailed: "无法校验 API 密钥",
       creditsBalance: (n) => `余额 ${n} 积分`,
+      refreshCreditsAria: "刷新积分余额",
       buyCredits: "充值 / 获取积分",
       dropTitle: "拖拽图片或整个文件夹到此处",
       dropSub: "支持 PNG、JPG、WebP（单张最高 25 MB / 4000 万像素）· 云端 GPU 内存流式零落盘",
@@ -108,6 +122,7 @@
       replaceKey: "更换",
       clearKey: "清除",
       saveVerifyKey: "保存并验证",
+      cancelEditKey: "取消",
       apiKeyHint: "使用系统级加密（Windows DPAPI / macOS 钥匙串）安全存储于本机。",
       apiKeySessionOnly: "当前系统密钥环不可用，密钥仅保存在本次内存会话中。",
       apiKeyVerified: (c) => `已连接 · 当前可用 ${c} 积分`,
@@ -120,8 +135,10 @@
       bgCustom: "自定义纯色背景",
       bgZip: "4 文件可编辑图层包 (.zip)",
       customColorLabel: "背景色号",
+      customColorHexAria: "自定义背景十六进制色号",
       formatLabel: "导出格式",
       resolutionLabel: "输出分辨率",
+      sizeAuto: "智能自动 (最高 25MP)",
       sizeFull: "原图全高清 (最高 25MP)",
       sizePreview: "预览尺寸 (0.25MP · 0.25积分)",
       size4k: "4K 超清 (最高 10MP)",
@@ -145,6 +162,7 @@
       skipExistingLabel: "跳过已存在抠图结果的图片",
       previewCutout: "抠图结果",
       previewOriginal: "原图对比",
+      closeModalAria: "关闭预览弹窗",
       revealInFolder: "在文件夹中显示",
       badgeQueued: "排队中",
       badgeProcessing: "抠图中…",
@@ -159,13 +177,25 @@
     },
   };
 
+  const STATUS_KEY_MAP = {
+    queued: "badgeQueued",
+    processing: "badgeProcessing",
+    done: "badgeDone",
+    skipped: "badgeSkipped",
+    cancelled: "badgeCancelled",
+    error: "badgeError",
+  };
+
   const state = {
     lang: "en",
     hasApiKey: false,
+    editingApiKey: false,
     maskedKey: "",
     encryptionAvailable: true,
     persistedKey: false,
     credits: null,
+    accountError: "",
+    accountErrorStatus: 0,
     creditsUsedLastRun: 0,
     isRunning: false,
     settings: {
@@ -187,7 +217,11 @@
     lastOutputDir: "",
     previewItem: null,
     previewMode: "after",
+    lastPreviewTriggerEl: null,
   };
+
+  const queueItemById = new Map();
+  const rowDomById = new Map();
 
   const el = (id) => document.getElementById(id);
 
@@ -219,6 +253,13 @@
         node.textContent = t(key);
       }
     }
+    const ariaNodes = document.querySelectorAll("[data-i18n-aria]");
+    for (const node of ariaNodes) {
+      const key = node.getAttribute("data-i18n-aria");
+      if (key) {
+        node.setAttribute("aria-label", t(key));
+      }
+    }
     if (!state.isRunning) {
       el("creditsUsedText").textContent = t("creditsUsed", state.creditsUsedLastRun);
     }
@@ -236,26 +277,39 @@
       label.textContent = t("creditsUnconnected");
       return;
     }
+    if (state.accountError) {
+      const isAuthErr =
+        state.accountErrorStatus === 401 || state.accountErrorStatus === 403;
+      label.textContent = isAuthErr ? t("creditsInvalidKey") : t("creditsOffline");
+      dot.classList.add(isAuthErr ? "error" : "low");
+      return;
+    }
     if (state.credits !== null && Number.isFinite(state.credits)) {
       label.textContent = t("creditsBalance", state.credits);
       dot.classList.add(state.credits > 0 ? "connected" : "low");
     } else {
-      label.textContent = state.maskedKey || "Connected";
-      dot.classList.add("connected");
+      label.textContent = t("creditsChecking");
     }
   }
 
   function renderKeySection() {
     const savedBox = el("savedKeyBox");
     const editorBox = el("keyEditorBox");
+    const cancelBtn = el("cancelEditKeyBtn");
     const badge = el("keyStorageBadge");
     const note = el("apiKeyFeedback");
-    if (!note.classList.contains("error") && !note.classList.contains("ok")) {
+
+    if (state.accountError) {
+      note.className = "panel-note error";
+      note.textContent = state.accountError;
+    } else if (!note.classList.contains("error") && !note.classList.contains("ok")) {
       note.textContent = state.encryptionAvailable ? t("apiKeyHint") : t("apiKeySessionOnly");
     }
-    if (state.hasApiKey) {
+
+    if (state.hasApiKey && !state.editingApiKey) {
       savedBox.hidden = false;
       editorBox.hidden = true;
+      cancelBtn.hidden = true;
       el("maskedKeyText").textContent = state.maskedKey;
       badge.textContent = state.encryptionAvailable
         ? t("keyBadgeEncrypted")
@@ -263,6 +317,7 @@
     } else {
       savedBox.hidden = true;
       editorBox.hidden = false;
+      cancelBtn.hidden = !state.hasApiKey;
     }
   }
 
@@ -313,11 +368,112 @@
   }
 
   function updateRunButtons() {
-    const actionableCount = state.queue.filter(
-      (item) => item.status === "queued" || item.status === "error" || item.status === "cancelled"
-    ).length;
+    let actionableCount = 0;
+    for (const item of state.queue) {
+      if (item.status === "queued" || item.status === "error" || item.status === "cancelled") {
+        actionableCount += 1;
+      }
+    }
     el("startBatchBtn").disabled = state.isRunning || actionableCount === 0;
     el("cancelBatchBtn").hidden = !state.isRunning;
+  }
+
+  function syncQueueRowDynamicParts(item, domRefs) {
+    if (!domRefs) return;
+    const { subDiv, badge, actionsDiv } = domRefs;
+
+    subDiv.className = "item-sub";
+    if (item.status === "error" && item.errorMessage) {
+      subDiv.classList.add("error-text");
+      subDiv.textContent = `${formatBytes(item.byteLength)} · ${item.errorMessage}`;
+    } else if (item.status === "done") {
+      const dimPart = item.width && item.height ? ` · ${item.width}×${item.height}` : "";
+      const timePart = item.elapsedMs ? ` · ${(item.elapsedMs / 1000).toFixed(1)}s` : "";
+      subDiv.textContent = `${formatBytes(item.byteLength)}${dimPart}${timePart}`;
+    } else {
+      subDiv.textContent = formatBytes(item.byteLength);
+    }
+
+    badge.className = `status-badge ${item.status}`;
+    badge.textContent = t(STATUS_KEY_MAP[item.status] || "badgeQueued");
+
+    actionsDiv.replaceChildren();
+    if (
+      (item.status === "done" || item.status === "skipped") &&
+      item.outputPath &&
+      !item.outputPath.toLowerCase().endsWith(".zip")
+    ) {
+      const previewBtn = document.createElement("button");
+      previewBtn.type = "button";
+      previewBtn.className = "text-btn";
+      previewBtn.textContent = t("btnPreview");
+      previewBtn.addEventListener("click", (ev) => openPreviewModal(item, ev.currentTarget));
+      actionsDiv.appendChild(previewBtn);
+    }
+
+    if (item.outputPath && (item.status === "done" || item.status === "skipped")) {
+      const revealBtn = document.createElement("button");
+      revealBtn.type = "button";
+      revealBtn.className = "text-btn";
+      revealBtn.textContent = t("btnReveal");
+      revealBtn.addEventListener("click", () => bridge.revealFile(item.outputPath));
+      actionsDiv.appendChild(revealBtn);
+    }
+
+    if (!state.isRunning) {
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "text-btn danger";
+      removeBtn.textContent = t("btnRemove");
+      removeBtn.setAttribute("aria-label", `${t("clearKey")} ${item.fileName}`);
+      removeBtn.addEventListener("click", () => {
+        state.queue = state.queue.filter((q) => q.id !== item.id);
+        queueItemById.delete(item.id);
+        rowDomById.delete(item.id);
+        renderQueue();
+      });
+      actionsDiv.appendChild(removeBtn);
+    }
+  }
+
+  function createQueueRow(item) {
+    const row = document.createElement("div");
+    row.className = "queue-row";
+    row.setAttribute("role", "listitem");
+    row.dataset.id = item.id;
+
+    const mainDiv = document.createElement("div");
+    mainDiv.className = "item-main";
+
+    const nameLine = document.createElement("div");
+    nameLine.className = "item-name-line";
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "item-name";
+    nameSpan.textContent = item.relSubdir
+      ? `${item.relSubdir}/${item.fileName}`
+      : item.fileName;
+    nameSpan.title = item.inputPath;
+    nameLine.appendChild(nameSpan);
+    mainDiv.appendChild(nameLine);
+
+    const subDiv = document.createElement("div");
+    subDiv.className = "item-sub";
+    mainDiv.appendChild(subDiv);
+
+    const badge = document.createElement("span");
+    badge.className = "status-badge queued";
+
+    const actionsDiv = document.createElement("div");
+    actionsDiv.className = "item-actions";
+
+    row.appendChild(mainDiv);
+    row.appendChild(badge);
+    row.appendChild(actionsDiv);
+
+    const domRefs = { row, subDiv, badge, actionsDiv };
+    rowDomById.set(item.id, domRefs);
+    syncQueueRowDynamicParts(item, domRefs);
+    return row;
   }
 
   function renderQueue() {
@@ -325,6 +481,8 @@
     const emptyEl = el("queueEmptyState");
     const listEl = el("queueList");
     listEl.replaceChildren();
+    rowDomById.clear();
+    queueItemById.clear();
 
     if (state.queue.length === 0) {
       emptyEl.hidden = false;
@@ -335,91 +493,8 @@
 
     const fragment = document.createDocumentFragment();
     for (const item of state.queue) {
-      const row = document.createElement("div");
-      row.className = "queue-row";
-      row.dataset.id = item.id;
-
-      const mainDiv = document.createElement("div");
-      mainDiv.className = "item-main";
-
-      const nameLine = document.createElement("div");
-      nameLine.className = "item-name-line";
-      const nameSpan = document.createElement("span");
-      nameSpan.className = "item-name";
-      nameSpan.textContent = item.relSubdir
-        ? `${item.relSubdir}/${item.fileName}`
-        : item.fileName;
-      nameSpan.title = item.inputPath;
-      nameLine.appendChild(nameSpan);
-      mainDiv.appendChild(nameLine);
-
-      const subDiv = document.createElement("div");
-      subDiv.className = "item-sub";
-      if (item.status === "error" && item.errorMessage) {
-        subDiv.classList.add("error-text");
-        subDiv.textContent = `${formatBytes(item.byteLength)} · ${item.errorMessage}`;
-      } else if (item.status === "done") {
-        const dimPart = item.width && item.height ? ` · ${item.width}×${item.height}` : "";
-        const timePart = item.elapsedMs ? ` · ${(item.elapsedMs / 1000).toFixed(1)}s` : "";
-        subDiv.textContent = `${formatBytes(item.byteLength)}${dimPart}${timePart}`;
-      } else {
-        subDiv.textContent = formatBytes(item.byteLength);
-      }
-      mainDiv.appendChild(subDiv);
-
-      const badge = document.createElement("span");
-      badge.className = `status-badge ${item.status}`;
-      const statusMap = {
-        queued: "badgeQueued",
-        processing: "badgeProcessing",
-        done: "badgeDone",
-        skipped: "badgeSkipped",
-        cancelled: "badgeCancelled",
-        error: "badgeError",
-      };
-      badge.textContent = t(statusMap[item.status] || "badgeQueued");
-
-      const actionsDiv = document.createElement("div");
-      actionsDiv.className = "item-actions";
-
-      if (
-        (item.status === "done" || item.status === "skipped") &&
-        item.outputPath &&
-        !item.outputPath.toLowerCase().endsWith(".zip")
-      ) {
-        const previewBtn = document.createElement("button");
-        previewBtn.type = "button";
-        previewBtn.className = "text-btn";
-        previewBtn.textContent = t("btnPreview");
-        previewBtn.addEventListener("click", () => openPreviewModal(item));
-        actionsDiv.appendChild(previewBtn);
-      }
-
-      if (item.outputPath && (item.status === "done" || item.status === "skipped")) {
-        const revealBtn = document.createElement("button");
-        revealBtn.type = "button";
-        revealBtn.className = "text-btn";
-        revealBtn.textContent = t("btnReveal");
-        revealBtn.addEventListener("click", () => bridge.revealFile(item.outputPath));
-        actionsDiv.appendChild(revealBtn);
-      }
-
-      if (!state.isRunning) {
-        const removeBtn = document.createElement("button");
-        removeBtn.type = "button";
-        removeBtn.className = "text-btn danger";
-        removeBtn.textContent = t("btnRemove");
-        removeBtn.addEventListener("click", () => {
-          state.queue = state.queue.filter((q) => q.id !== item.id);
-          renderQueue();
-        });
-        actionsDiv.appendChild(removeBtn);
-      }
-
-      row.appendChild(mainDiv);
-      row.appendChild(badge);
-      row.appendChild(actionsDiv);
-      fragment.appendChild(row);
+      queueItemById.set(item.id, item);
+      fragment.appendChild(createQueueRow(item));
     }
 
     listEl.appendChild(fragment);
@@ -436,6 +511,7 @@
         ...raw,
         status: "queued",
         outputPath: "",
+        outputRootDir: "",
         width: 0,
         height: 0,
         creditsCharged: 0,
@@ -455,13 +531,25 @@
     renderSettingsControls();
   }
 
-  async function openPreviewModal(item) {
+  async function openPreviewModal(item, triggerEl = null) {
     state.previewItem = item;
     state.previewMode = "after";
+    state.lastPreviewTriggerEl = triggerEl instanceof HTMLElement ? triggerEl : null;
     el("previewModalTitle").textContent = item.fileName;
     el("previewMetaText").textContent = item.outputPath || "";
     el("previewModal").hidden = false;
+    el("closePreviewModalBtn").focus();
     await refreshPreviewStage();
+  }
+
+  function closePreviewModal() {
+    if (el("previewModal").hidden) return;
+    el("previewModal").hidden = true;
+    state.previewItem = null;
+    if (state.lastPreviewTriggerEl && state.lastPreviewTriggerEl.isConnected) {
+      state.lastPreviewTriggerEl.focus();
+    }
+    state.lastPreviewTriggerEl = null;
   }
 
   async function refreshPreviewStage() {
@@ -478,6 +566,25 @@
     }
   }
 
+  async function syncRemoteAccount() {
+    if (!state.hasApiKey) return;
+    const res = await bridge.fetchAccount();
+    if (res?.ok && res.account) {
+      state.credits = res.account.totalCredits;
+      state.accountError = "";
+      state.accountErrorStatus = 0;
+      const note = el("apiKeyFeedback");
+      note.className = "panel-note ok";
+      note.textContent = t("apiKeyVerified", state.credits);
+    } else if (res && !res.ok) {
+      state.credits = null;
+      state.accountError = res.message || t("creditsVerifyFailed");
+      state.accountErrorStatus = res.statusCode || 500;
+    }
+    renderHeaderCredits();
+    renderKeySection();
+  }
+
   function wireEvents() {
     el("langToggleBtn").addEventListener("click", async () => {
       state.lang = state.lang === "zh-CN" ? "en" : "zh-CN";
@@ -489,11 +596,7 @@
     el("getApiKeyLinkBtn").addEventListener("click", () => bridge.openExternalLink("dashboard"));
 
     el("refreshAccountBtn").addEventListener("click", async () => {
-      const res = await bridge.fetchAccount();
-      if (res?.ok && res.account) {
-        state.credits = res.account.totalCredits;
-        renderHeaderCredits();
-      }
+      await syncRemoteAccount();
     });
 
     el("saveApiKeyBtn").addEventListener("click", async () => {
@@ -506,14 +609,17 @@
         const res = await bridge.setApiKey(raw);
         if (!res?.ok) {
           note.classList.add("error");
-          note.textContent = res?.message || "Verification failed";
+          note.textContent = res?.message || t("creditsVerifyFailed");
           return;
         }
         el("apiKeyInput").value = "";
+        state.editingApiKey = false;
         state.hasApiKey = res.keyStatus.hasApiKey;
         state.maskedKey = res.keyStatus.maskedKey;
         state.encryptionAvailable = res.keyStatus.encryptionAvailable;
         state.credits = res.account ? res.account.totalCredits : null;
+        state.accountError = "";
+        state.accountErrorStatus = 0;
         note.classList.add("ok");
         note.textContent = t("apiKeyVerified", state.credits ?? 0);
         renderHeaderCredits();
@@ -524,17 +630,31 @@
     });
 
     el("changeKeyBtn").addEventListener("click", () => {
-      el("savedKeyBox").hidden = true;
-      el("keyEditorBox").hidden = false;
+      state.editingApiKey = true;
+      renderKeySection();
       el("apiKeyInput").focus();
+    });
+
+    el("cancelEditKeyBtn").addEventListener("click", () => {
+      state.editingApiKey = false;
+      el("apiKeyInput").value = "";
+      const note = el("apiKeyFeedback");
+      if (!state.accountError) {
+        note.className = "panel-note";
+        note.textContent = state.encryptionAvailable ? t("apiKeyHint") : t("apiKeySessionOnly");
+      }
+      renderKeySection();
     });
 
     el("removeKeyBtn").addEventListener("click", async () => {
       const res = await bridge.clearApiKey();
       if (res?.ok) {
+        state.editingApiKey = false;
         state.hasApiKey = false;
         state.maskedKey = "";
         state.credits = null;
+        state.accountError = "";
+        state.accountErrorStatus = 0;
         el("apiKeyFeedback").className = "panel-note";
         el("apiKeyFeedback").textContent = t("apiKeyHint");
         renderHeaderCredits();
@@ -567,13 +687,11 @@
       e.preventDefault();
       dz.classList.remove("drag-over");
       const files = e.dataTransfer ? e.dataTransfer.files : null;
-      const droppedPaths = bridge.extractDroppedPaths(files);
-      if (droppedPaths.length > 0) {
-        const res = await bridge.scanPaths(droppedPaths, {
-          recursive: state.settings.recursive,
-        });
-        if (res?.ok) appendScannedItems(res.items);
-      }
+      if (!files || files.length === 0) return;
+      const res = await bridge.scanDroppedFiles(files, {
+        recursive: state.settings.recursive,
+      });
+      if (res?.ok) appendScannedItems(res.items);
     });
 
     // Settings controls
@@ -688,7 +806,6 @@
           toRun.push({
             id: item.id,
             inputPath: item.inputPath,
-            relSubdir: item.relSubdir,
           });
         }
       }
@@ -719,6 +836,8 @@
         el("creditsUsedText").textContent = t("creditsUsed", s.creditsUsed);
         if (res.account) {
           state.credits = res.account.totalCredits;
+          state.accountError = "";
+          state.accountErrorStatus = 0;
           renderHeaderCredits();
         }
       } else if (res && !res.ok) {
@@ -732,15 +851,20 @@
       bridge.cancelBatch();
     });
 
-    // Live batch events
+    // Live batch events: O(1) per-item DOM patch so active batches never destroy/rebuild sibling rows
     bridge.onBatchEvent((evt) => {
       if (!evt) return;
       if (evt.type === "item" && evt.item) {
-        const target = state.queue.find((q) => q.id === evt.item.id);
+        const target = queueItemById.get(evt.item.id);
         if (target) {
           target.status = evt.item.status;
           if (evt.item.outputPath) {
             target.outputPath = evt.item.outputPath;
+          }
+          if (evt.item.outputRootDir) {
+            target.outputRootDir = evt.item.outputRootDir;
+            state.lastOutputDir = evt.item.outputRootDir;
+          } else if (evt.item.outputPath) {
             const sepIdx = Math.max(
               evt.item.outputPath.lastIndexOf("/"),
               evt.item.outputPath.lastIndexOf("\\")
@@ -753,7 +877,10 @@
           if (evt.item.height) target.height = evt.item.height;
           if (evt.item.elapsedMs) target.elapsedMs = evt.item.elapsedMs;
           if (evt.item.errorMessage) target.errorMessage = evt.item.errorMessage;
-          renderQueue();
+          syncQueueRowDynamicParts(target, rowDomById.get(target.id));
+          if (!state.settings.outputDir && state.lastOutputDir) {
+            el("openOutputFolderBtn").hidden = false;
+          }
         }
       } else if (evt.type === "progress" && evt.progress) {
         const p = evt.progress;
@@ -765,15 +892,19 @@
       }
     });
 
-    // Preview Modal events
+    // Preview Modal events + Escape dismissal
     el("closePreviewModalBtn").addEventListener("click", () => {
-      el("previewModal").hidden = true;
-      state.previewItem = null;
+      closePreviewModal();
     });
     el("previewModal").addEventListener("click", (e) => {
       if (e.target === el("previewModal")) {
-        el("previewModal").hidden = true;
-        state.previewItem = null;
+        closePreviewModal();
+      }
+    });
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !el("previewModal").hidden) {
+        e.preventDefault();
+        closePreviewModal();
       }
     });
     el("previewTabAfter").addEventListener("click", () => {
@@ -808,11 +939,7 @@
     applyTranslations();
 
     if (state.hasApiKey) {
-      const acc = await bridge.fetchAccount();
-      if (acc?.ok && acc.account) {
-        state.credits = acc.account.totalCredits;
-        renderHeaderCredits();
-      }
+      await syncRemoteAccount();
     }
   }
 

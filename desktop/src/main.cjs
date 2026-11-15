@@ -20,6 +20,7 @@ const {
   DesktopApiClient,
   DesktopAppError,
   collectInputItems,
+  isPlausibleApiKey,
   resolveOutputTarget,
   runBatchQueue,
   sanitizeSettings,
@@ -59,12 +60,24 @@ let credentialManager = null;
 let activeBatchController = null;
 
 // Session allowlists so renderer IPC can only preview/reveal user-selected or app-generated paths.
-const allowedFilePaths = new Set();
+// Maps resolved file path -> trusted { rootDir, relSubdir } recorded at scan/selection time.
+const allowedFilePaths = new Map();
 const allowedDirectoryPaths = new Set();
 
-function registerAllowedFile(filePath) {
+function registerAllowedFile(filePath, meta = null) {
   if (typeof filePath !== "string" || !filePath.trim()) return;
-  allowedFilePaths.add(path.resolve(filePath));
+  const resolved = path.resolve(filePath);
+  if (meta && typeof meta === "object") {
+    allowedFilePaths.set(resolved, {
+      rootDir:
+        typeof meta.rootDir === "string" && meta.rootDir.trim()
+          ? path.resolve(meta.rootDir)
+          : null,
+      relSubdir: typeof meta.relSubdir === "string" ? meta.relSubdir : "",
+    });
+  } else if (!allowedFilePaths.has(resolved)) {
+    allowedFilePaths.set(resolved, { rootDir: null, relSubdir: "" });
+  }
 }
 
 function registerAllowedDirectory(dirPath) {
@@ -138,15 +151,25 @@ function setupIpcHandlers() {
   ipcMain.handle("desktop:set-api-key", async (event, rawKey) => {
     assertTrustedSender(event);
     try {
-      const keyStatus = await credentialManager.setApiKey(rawKey);
-      if (!keyStatus.hasApiKey) {
+      const trimmed = typeof rawKey === "string" ? rawKey.trim() : "";
+      if (!trimmed) {
+        const keyStatus = await credentialManager.clearApiKey();
         return { ok: true, keyStatus, account: null };
       }
+      if (!isPlausibleApiKey(trimmed)) {
+        throw new DesktopAppError(
+          400,
+          "invalid_api_key_format",
+          "API Key must start with 'rac_live_'"
+        );
+      }
+      // Verify against /v1.0/account BEFORE persisting so an invalid/typo key never clobbers a saved valid key.
       const client = new DesktopApiClient({
-        apiKey: await credentialManager.getApiKey(),
+        apiKey: trimmed,
         fetch: getElectronFetch(),
       });
       const account = await client.getAccount();
+      const keyStatus = await credentialManager.setApiKey(trimmed);
       return { ok: true, keyStatus, account };
     } catch (err) {
       return serializeError(err);
@@ -216,7 +239,10 @@ function setupIpcHandlers() {
       outputDir: settings.outputDir,
     });
     for (const item of scanned.items) {
-      registerAllowedFile(item.inputPath);
+      registerAllowedFile(item.inputPath, {
+        rootDir: item.rootDir,
+        relSubdir: item.relSubdir,
+      });
     }
     return { ok: true, canceled: false, ...scanned };
   });
@@ -247,7 +273,10 @@ function setupIpcHandlers() {
       outputDir: saved.outputDir,
     });
     for (const item of scanned.items) {
-      registerAllowedFile(item.inputPath);
+      registerAllowedFile(item.inputPath, {
+        rootDir: item.rootDir,
+        relSubdir: item.relSubdir,
+      });
     }
     return { ok: true, ...scanned };
   });
@@ -277,12 +306,14 @@ function setupIpcHandlers() {
     for (const raw of rawItems) {
       if (!raw || typeof raw.inputPath !== "string") continue;
       const resolvedInput = path.resolve(raw.inputPath);
-      if (!allowedFilePaths.has(resolvedInput)) continue;
+      const trustedMeta = allowedFilePaths.get(resolvedInput);
+      if (!trustedMeta) continue;
       verifiedItems.push({
         id: String(raw.id || ""),
         inputPath: resolvedInput,
         fileName: path.basename(resolvedInput),
-        relSubdir: typeof raw.relSubdir === "string" ? raw.relSubdir : "",
+        rootDir: trustedMeta.rootDir,
+        relSubdir: trustedMeta.relSubdir,
       });
     }
 
@@ -321,10 +352,15 @@ function setupIpcHandlers() {
             skipExisting: settings.skipExisting,
             reservedPaths,
           });
+          registerAllowedDirectory(target.outputRootDir);
           registerAllowedDirectory(path.dirname(target.outputPath));
           if (target.skip) {
             registerAllowedFile(target.outputPath);
-            return { skipped: true, outputPath: target.outputPath };
+            return {
+              skipped: true,
+              outputPath: target.outputPath,
+              outputRootDir: target.outputRootDir,
+            };
           }
           const out = await client.removeBackgroundFile(item.inputPath, settings, {
             signal,
@@ -335,6 +371,7 @@ function setupIpcHandlers() {
           return {
             skipped: false,
             outputPath: target.outputPath,
+            outputRootDir: target.outputRootDir,
             width: out.width,
             height: out.height,
             creditsCharged: out.creditsCharged,

@@ -2,26 +2,27 @@
 
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
-function extractDroppedPaths(fileList) {
-  if (!fileList) return [];
+/**
+ * Extracts real filesystem paths strictly from native Chromium File objects via Electron's
+ * C++-backed `webUtils.getPathForFile(file)`. Plain JS objects with spoofed `.path` properties
+ * are rejected, and raw string-array scan IPC is never exposed to the renderer world.
+ */
+function extractTrustedDroppedPaths(fileList) {
+  if (!fileList || !webUtils || typeof webUtils.getPathForFile !== "function") {
+    return [];
+  }
   const out = [];
   const length = typeof fileList.length === "number" ? fileList.length : 0;
   for (let i = 0; i < length; i++) {
     const file = fileList[i];
-    if (!file) continue;
-    let resolved = "";
-    if (webUtils && typeof webUtils.getPathForFile === "function") {
-      try {
-        resolved = webUtils.getPathForFile(file) || "";
-      } catch {
-        resolved = "";
+    if (!file || typeof file !== "object") continue;
+    try {
+      const resolved = webUtils.getPathForFile(file);
+      if (typeof resolved === "string" && resolved.trim()) {
+        out.push(resolved.trim());
       }
-    }
-    if (!resolved && typeof file.path === "string") {
-      resolved = file.path;
-    }
-    if (resolved) {
-      out.push(resolved);
+    } catch {
+      // Reject non-native File objects
     }
   }
   return out;
@@ -33,14 +34,19 @@ contextBridge.exposeInMainWorld("removeAcDesktop", {
   clearApiKey: () => ipcRenderer.invoke("desktop:clear-api-key"),
   fetchAccount: () => ipcRenderer.invoke("desktop:fetch-account"),
   saveSettings: (partial) => ipcRenderer.invoke("desktop:save-settings", partial || {}),
-  pickInputs: (mode) => ipcRenderer.invoke("desktop:pick-inputs", mode === "folders" ? "folders" : "files"),
+  pickInputs: (mode) =>
+    ipcRenderer.invoke("desktop:pick-inputs", mode === "folders" ? "folders" : "files"),
   pickOutputDir: () => ipcRenderer.invoke("desktop:pick-output-dir"),
-  scanPaths: (paths, options) =>
-    ipcRenderer.invoke("desktop:scan-paths", {
-      paths: Array.isArray(paths) ? paths : [],
+  scanDroppedFiles: async (fileList, options) => {
+    const paths = extractTrustedDroppedPaths(fileList);
+    if (paths.length === 0) {
+      return { ok: true, items: [], skippedUnsupported: 0 };
+    }
+    return ipcRenderer.invoke("desktop:scan-paths", {
+      paths,
       options: options || {},
-    }),
-  extractDroppedPaths,
+    });
+  },
   startBatch: (payload) => ipcRenderer.invoke("desktop:start-batch", payload || {}),
   cancelBatch: () => ipcRenderer.invoke("desktop:cancel-batch"),
   readPreviewDataUrl: (filePath) =>

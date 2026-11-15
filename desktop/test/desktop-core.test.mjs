@@ -11,10 +11,12 @@ const require = createRequire(import.meta.url);
 const {
   CredentialManager,
   DesktopApiClient,
+  areSameOrCaseCollidingPaths,
   collectInputItems,
   isPlausibleApiKey,
   maskApiKey,
   parseImageDimensions,
+  parseRetryAfterMs,
   resolveOutputTarget,
   runBatchQueue,
   sanitizeSettings,
@@ -228,16 +230,51 @@ test("collectInputItems & resolveOutputTarget preserve subfolders, skip output f
       path.join(outDir, "shoes", "sneakers", "runner-nobg.webp")
     );
 
-    // Skip existing check
+    // Skip existing check + colliding stem across extensions (hero.png skipped, hero.webp MUST NOT be skipped!)
     writeFileAtomically(t1.outputPath, png);
+    const skipReserved = new Set();
     const skippedCheck = resolveOutputTarget({
-      item: scanned.items[0],
+      item: scanned.items[0], // hero.png
       outputDir: outDir,
       format: "png",
       skipExisting: true,
-      reservedPaths: new Set(),
+      reservedPaths: skipReserved,
     });
     assert.equal(skippedCheck.skip, true);
+    assert.equal(skippedCheck.outputPath, path.join(outDir, "hero-nobg.png"));
+
+    const collidingDifferentExt = resolveOutputTarget({
+      item: scanned.items[1], // hero.webp (brand-new file!)
+      outputDir: outDir,
+      format: "png",
+      skipExisting: true,
+      reservedPaths: skipReserved,
+    });
+    assert.equal(collidingDifferentExt.skip, false);
+    assert.equal(collidingDifferentExt.outputPath, path.join(outDir, "hero-nobg-1.png"));
+
+    // Default outputDir ("") on nested folder scan must place remove-ac-output at rootDir, never duplicating subfolders
+    const defaultNestedTarget = resolveOutputTarget({
+      item: scanned.items[2], // <tmpDir>/shoes/sneakers/runner.jpg
+      outputDir: "",
+      format: "png",
+      skipExisting: false,
+      reservedPaths: new Set(),
+    });
+    assert.equal(defaultNestedTarget.outputRootDir, path.join(tmpDir, "remove-ac-output"));
+    assert.equal(
+      defaultNestedTarget.outputPath,
+      path.join(tmpDir, "remove-ac-output", "shoes", "sneakers", "runner-nobg.png")
+    );
+
+    // Case-insensitive self-overwrite detection
+    assert.equal(
+      areSameOrCaseCollidingPaths(
+        path.join(tmpDir, "HERO.PNG"),
+        path.join(tmpDir, "hero.png")
+      ),
+      true
+    );
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -430,4 +467,231 @@ test("runBatchQueue supports parallel workers and clean mid-flight AbortControll
   assert.ok(summary.completed >= 2);
   assert.ok(summary.cancelled >= 1);
   assert.equal(summary.completed + summary.cancelled + summary.failed + summary.skipped, 8);
+});
+
+test("DesktopApiClient releases ticket holds on transport failure/abort, honors >15s 429 Retry-After & rejects HTTP redirects without retrying", async () => {
+  const pngOut = makeTinyPng(6, 6);
+  let availableCredits = 1.0;
+  const holds = new Map();
+  let releaseCalls = 0;
+  let directAttempt = 0;
+  let rateLimitCalls = 0;
+  let redirectCalls = 0;
+
+  const server = http.createServer((req, res) => {
+    const host = req.headers.host;
+
+    if (req.method === "POST" && req.url === "/v1.0/remove/ticket") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        if (availableCredits < 1.0) {
+          res.writeHead(402, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              errors: [{ title: "Insufficient credits", code: "insufficient_credits" }],
+            })
+          );
+          return;
+        }
+        availableCredits -= 1.0;
+        const holdId = `hold_${holds.size + 1}`;
+        holds.set(holdId, { status: "held", credits: 1.0 });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            data: {
+              ticket: `tok_${holdId}`,
+              directEndpoint: `http://${host}/gpu-upload?hold=${holdId}`,
+              holdId,
+              releaseToken: `rel_${holdId}`,
+            },
+          })
+        );
+      });
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/v1.0/remove/ticket/release") {
+      releaseCalls += 1;
+      assert.equal(req.headers["x-api-key"], "rac_live_HoldTestKey123");
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        const parsed = JSON.parse(body);
+        const h = holds.get(parsed.holdId);
+        if (h && h.status === "held" && parsed.releaseToken === `rel_${parsed.holdId}`) {
+          h.status = "released";
+          availableCredits += h.credits;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, released: true }));
+      });
+      return;
+    }
+
+    if (req.method === "POST" && req.url.startsWith("/gpu-upload")) {
+      directAttempt += 1;
+      req.resume();
+      req.on("end", () => {
+        const holdId = new URL(req.url, `http://${host}`).searchParams.get("hold");
+        if (directAttempt === 1) {
+          req.socket.destroy();
+          return;
+        }
+        if (directAttempt === 3) {
+          // Hang briefly so AbortController cancels mid-upload
+          setTimeout(() => {
+            if (!res.writableEnded) {
+              res.writeHead(200, { "Content-Type": "image/png" });
+              res.end(pngOut);
+            }
+          }, 300);
+          return;
+        }
+        const h = holds.get(holdId);
+        if (h) h.status = "completed";
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "X-Width": "6",
+          "X-Height": "6",
+          "X-Credits-Charged": "1",
+        });
+        res.end(pngOut);
+      });
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/v1.0/remove") {
+      req.resume();
+      req.on("end", () => {
+        if (redirectCalls < 0) {
+          // unused branch placeholder
+        }
+        rateLimitCalls += 1;
+        if (rateLimitCalls === 1) {
+          res.writeHead(429, {
+            "Content-Type": "application/json",
+            "Retry-After": "50",
+          });
+          res.end(
+            JSON.stringify({
+              errors: [{ title: "Rate limit exceeded", code: "rate_limit_exceeded" }],
+            })
+          );
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "X-Width": "6",
+          "X-Height": "6",
+          "X-Credits-Charged": "1",
+        });
+        res.end(pngOut);
+      });
+      return;
+    }
+
+    if (req.method === "GET" && req.url === "/v1.0/account") {
+      redirectCalls += 1;
+      res.writeHead(302, { Location: "https://evil.example.invalid/phish" });
+      res.end();
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    assert.equal(parseRetryAfterMs(new Headers({ "Retry-After": "50" })), 50_000);
+    assert.equal(parseRetryAfterMs(new Headers({ "Retry-After": "120" })), 65_000);
+
+    const client = new DesktopApiClient({
+      baseUrl,
+      apiKey: "rac_live_HoldTestKey123",
+      allowLoopback: true,
+      retryBaseDelayMs: 10,
+    });
+
+    // 1. 1-credit user: 1st direct upload drops socket -> hold released -> 2nd attempt succeeds without 402!
+    const largeBytes = Buffer.concat([makeTinyPng(6, 6), Buffer.alloc(4 * 1024 * 1024 + 64, 0)]);
+    const res1 = await client.removeBackgroundBuffer(largeBytes, "large.png", {});
+    assert.equal(res1.buffer.length, pngOut.length);
+    assert.equal(releaseCalls, 1);
+    assert.equal(availableCredits, 0);
+
+    // 2. AbortController cancel during in-flight direct upload releases ticket hold immediately
+    availableCredits = 1.0;
+    const abortCtrl = new AbortController();
+    setTimeout(() => abortCtrl.abort(), 60);
+    await assert.rejects(
+      () =>
+        client.removeBackgroundBuffer(largeBytes, "cancel-me.png", {}, { signal: abortCtrl.signal }),
+      /Batch cancelled/
+    );
+    assert.equal(releaseCalls, 2);
+    assert.equal(availableCredits, 1.0);
+
+    // 3. 429 Retry-After: 50s waits >= 50,000ms (not capped at 15,000ms) and succeeds on retry
+    const recordedSleeps = [];
+    const origSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...args) => {
+      recordedSleeps.push(ms);
+      return origSetTimeout(fn, 1, ...args);
+    };
+    try {
+      const rlRes = await client.removeBackgroundBuffer(makeTinyPng(4, 4), "small.png", {});
+      assert.equal(rlRes.buffer.length, pngOut.length);
+    } finally {
+      global.setTimeout = origSetTimeout;
+    }
+    assert.ok(
+      recordedSleeps.some((ms) => ms >= 50_000 && ms <= 51_000),
+      `Expected >=50,000ms Retry-After backoff, saw ${JSON.stringify(recordedSleeps)}`
+    );
+
+    // 4. Unexpected HTTP 302 redirect fails immediately as 502 unexpected_redirect with zero retries
+    await assert.rejects(
+      () => client.getAccount(),
+      (err) => err.statusCode === 502 && err.code === "unexpected_redirect"
+    );
+    assert.equal(redirectCalls, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test("after-pack.cjs strips _CodeSignature on *-temp universal staging dirs and only signs final bundle", async () => {
+  const afterPack = require("../scripts/after-pack.cjs").default;
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rac-afterpack-"));
+  try {
+    const tempOutDir = path.join(tmpRoot, "mac-universal-arm64-temp");
+    const sigDir = path.join(
+      tempOutDir,
+      "Remove.ac.app",
+      "Contents",
+      "Frameworks",
+      "Electron Framework.framework",
+      "Versions",
+      "A",
+      "_CodeSignature"
+    );
+    fs.mkdirSync(sigDir, { recursive: true });
+    fs.writeFileSync(path.join(sigDir, "CodeResources"), "<plist/>");
+
+    await afterPack({
+      electronPlatformName: "darwin",
+      appOutDir: tempOutDir,
+      packager: { appInfo: { productFilename: "Remove.ac" } },
+    });
+
+    assert.equal(fs.existsSync(sigDir), false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });

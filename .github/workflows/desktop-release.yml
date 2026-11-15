@@ -103,20 +103,40 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist:mac
 
-      - name: Verify macOS Universal .dmg
+      - name: Verify macOS Universal .dmg & Mach-O slices
         shell: bash
         run: |
           set -euo pipefail
+          PKG_VER="$(node -p "require('./desktop/package.json').version")"
+          DMG_PATH="desktop/dist/remove-ac-for-macos-${PKG_VER}.dmg"
+          APP_PATH="desktop/dist/mac-universal/Remove.ac.app"
+          BIN_PATH="${APP_PATH}/Contents/MacOS/Remove.ac"
+
+          ARCHS="$(lipo -archs "$BIN_PATH")"
+          echo "Merged Remove.ac Mach-O architectures: $ARCHS"
+          echo "$ARCHS" | grep -q "x86_64"
+          echo "$ARCHS" | grep -q "arm64"
+          codesign --verify --deep --strict "$APP_PATH"
+
           node -e '
             const fs = require("node:fs");
-            const pkg = require("./desktop/package.json");
-            const f = `desktop/dist/remove-ac-for-macos-${pkg.version}.dmg`;
+            const f = process.argv[1];
             const st = fs.statSync(f);
             if (st.size < 80 * 1024 * 1024) {
               throw new Error(`${f} unexpectedly small: ${st.size} bytes`);
             }
-            console.log(`Verified ${f}: ${(st.size / (1024 * 1024)).toFixed(2)} MB`);
-          '
+            console.log(`Verified ${f}: ${(st.size / (1024 * 1024)).toFixed(2)} MB (${st.size} bytes)`);
+          ' "$DMG_PATH"
+
+          MOUNT_DIR="$(mktemp -d)"
+          hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
+          trap 'hdiutil detach "$MOUNT_DIR" -force || true' EXIT
+          DMG_ARCHS="$(lipo -archs "${MOUNT_DIR}/Remove.ac.app/Contents/MacOS/Remove.ac")"
+          echo "$DMG_ARCHS" | grep -q "x86_64"
+          echo "$DMG_ARCHS" | grep -q "arm64"
+          codesign --verify --deep --strict "${MOUNT_DIR}/Remove.ac.app"
+          hdiutil detach "$MOUNT_DIR"
+          trap - EXIT
 
       - uses: actions/upload-artifact@v4
         with:
@@ -227,6 +247,11 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#desktop-v}"
+          PKG_VER="$(node -p "require('./desktop/package.json').version")"
+          if [ "$VERSION" != "$PKG_VER" ]; then
+            echo "Tag version (${VERSION}) does not match desktop/package.json version (${PKG_VER})" >&2
+            exit 1
+          fi
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<EOF
           ## Remove.ac Desktop App v${VERSION}

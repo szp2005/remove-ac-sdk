@@ -5,16 +5,16 @@
   --border: #e2e8f0;
   --border-strong: #cbd5e1;
   --text-main: #0f172a;
-  --text-secondary: #475569;
-  --text-muted: #64748b;
-  --brand: #0b63ce;
-  --brand-hover: #084fa8;
+  --text-secondary: #334155;
+  --text-muted: #475569;
+  --brand: #0b5cab;
+  --brand-hover: #084482;
   --brand-soft: #eff6ff;
-  --success: #059669;
+  --success: #047857;
   --success-bg: #ecfdf5;
-  --warn: #d97706;
+  --warn: #92400e;
   --warn-bg: #fffbeb;
-  --danger: #dc2626;
+  --danger: #b91c1c;
   --danger-bg: #fef2f2;
   --radius-lg: 14px;
   --radius-md: 10px;
@@ -91,7 +91,7 @@ body {
   font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.04em;
-  color: #94a3b8;
+  color: #475569;
 }
 
 .brand-badge {
@@ -135,6 +135,10 @@ body {
 
 .credit-dot.low {
   background: var(--warn);
+}
+
+.credit-dot.error {
+  background: var(--danger);
 }
 
 .icon-link-btn {
@@ -235,7 +239,7 @@ body {
 }
 
 .muted-sep {
-  color: #cbd5e1;
+  color: #475569;
 }
 
 .queue-toolbar-btns {
@@ -341,8 +345,8 @@ body {
 }
 
 .status-badge.cancelled {
-  background: #f1f5f9;
-  color: var(--text-muted);
+  background: #e2e8f0;
+  color: #334155;
 }
 
 .item-actions {
@@ -494,7 +498,8 @@ body {
   margin-bottom: 0;
 }
 
-.field-row label {
+.field-row label,
+.field-row .field-label {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
@@ -630,7 +635,7 @@ input[type="range"] {
   font-weight: 600;
   font-size: 13px;
   cursor: pointer;
-  transition: background-color 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
   height: 36px;
   padding: 0 14px;
   white-space: nowrap;
@@ -686,6 +691,7 @@ input[type="range"] {
   color: #ffffff;
   border: none;
   font-size: 13.5px;
+  transition: none;
 }
 
 .run-btn:hover:not(:disabled) {
@@ -693,7 +699,9 @@ input[type="range"] {
 }
 
 .run-btn:disabled {
-  opacity: 0.48;
+  background: #64748b;
+  color: #ffffff;
+  opacity: 1;
   cursor: not-allowed;
 }
 

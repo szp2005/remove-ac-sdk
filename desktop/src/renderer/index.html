@@ -38,7 +38,14 @@
           <div class="credit-pill" id="creditPill" title="">
             <span class="credit-dot" id="creditDot"></span>
             <span id="creditLabel" data-i18n="creditsUnconnected">API Key Required</span>
-            <button type="button" class="icon-link-btn" id="refreshAccountBtn" title="Refresh">↻</button>
+            <button
+              type="button"
+              class="icon-link-btn"
+              id="refreshAccountBtn"
+              title="Refresh"
+              aria-label="Refresh credit balance"
+              data-i18n-aria="refreshCreditsAria"
+            >↻</button>
           </div>
           <button type="button" class="ghost-btn" id="buyCreditsBtn" data-i18n="buyCredits">
             Get Credits
@@ -49,7 +56,7 @@
 
       <main class="workspace">
         <section class="queue-column">
-          <div class="dropzone" id="dropzone" tabindex="0">
+          <div class="dropzone" id="dropzone">
             <div class="dropzone-icon" aria-hidden="true">
               <svg viewBox="0 0 48 48" width="42" height="42" fill="none">
                 <rect x="6" y="10" width="36" height="28" rx="7" stroke="#0B63CE" stroke-width="2.4" stroke-dasharray="5 4" fill="#EFF6FF" />
@@ -76,7 +83,7 @@
             <div class="queue-toolbar">
               <div class="queue-stats">
                 <strong id="queueCountText">0 images</strong>
-                <span class="muted-sep">·</span>
+                <span class="muted-sep" aria-hidden="true">·</span>
                 <span id="queueHintText" data-i18n="queueReadyHint">Ready for batch processing</span>
               </div>
               <div class="queue-toolbar-btns">
@@ -149,9 +156,14 @@
                 class="text-input"
                 placeholder="rac_live_..."
                 autocomplete="off"
+                aria-label="Cloud GPU API Key"
+                data-i18n-aria="apiKeyHeading"
               />
               <button type="button" class="primary-btn small" id="saveApiKeyBtn" data-i18n="saveVerifyKey">
                 Save &amp; Verify
+              </button>
+              <button type="button" class="secondary-btn small" id="cancelEditKeyBtn" hidden data-i18n="cancelEditKey">
+                Cancel
               </button>
             </div>
             <p class="panel-note" id="apiKeyFeedback" data-i18n="apiKeyHint">
@@ -176,7 +188,15 @@
               <label for="bgColorPicker" data-i18n="customColorLabel">Background Hex</label>
               <div class="color-picker-group">
                 <input type="color" id="bgColorPicker" value="#ffffff" />
-                <input type="text" id="bgColorHexInput" class="text-input mono" maxlength="7" value="#FFFFFF" />
+                <input
+                  type="text"
+                  id="bgColorHexInput"
+                  class="text-input mono"
+                  maxlength="7"
+                  value="#FFFFFF"
+                  aria-label="Custom background hex color"
+                  data-i18n-aria="customColorHexAria"
+                />
               </div>
             </div>
 
@@ -194,6 +214,7 @@
               <div class="field-row">
                 <label for="sizeSelect" data-i18n="resolutionLabel">Resolution</label>
                 <select id="sizeSelect" class="select-input">
+                  <option value="auto" data-i18n="sizeAuto">Auto (up to 25 MP)</option>
                   <option value="full" data-i18n="sizeFull">Full (up to 25 MP)</option>
                   <option value="preview" data-i18n="sizePreview">Preview (0.25 MP)</option>
                   <option value="4k" data-i18n="size4k">4K (up to 10 MP)</option>
@@ -238,7 +259,7 @@
             <h3 data-i18n="workflowHeading">Output Folder &amp; Concurrency</h3>
 
             <div class="field-row">
-              <label data-i18n="outputFolderLabel">Destination Folder</label>
+              <span class="field-label" data-i18n="outputFolderLabel">Destination Folder</span>
               <div class="folder-picker-box">
                 <span class="folder-path" id="outputDirLabel" data-i18n="defaultOutputDir">
                   Auto (remove-ac-output next to source)
@@ -278,7 +299,7 @@
     </div>
 
     <div class="modal-backdrop" id="previewModal" hidden>
-      <div class="modal-dialog" role="dialog" aria-modal="true">
+      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="previewModalTitle">
         <div class="modal-header">
           <strong id="previewModalTitle">Preview</strong>
           <div class="modal-tabs">
@@ -289,7 +310,13 @@
               Original
             </button>
           </div>
-          <button type="button" class="icon-close-btn" id="closePreviewModalBtn" aria-label="Close">✕</button>
+          <button
+            type="button"
+            class="icon-close-btn"
+            id="closePreviewModalBtn"
+            aria-label="Close preview"
+            data-i18n-aria="closeModalAria"
+          >✕</button>
         </div>
         <div class="modal-stage checkerboard" id="previewStage">
           <img id="previewImageEl" alt="Preview" />
