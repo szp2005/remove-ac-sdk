@@ -106,6 +106,8 @@ function shouldPreFlightViaTicket(bytes, size, format, channels, crop) {
   else if (size === "medium") effectivePixels = Math.min(inputPixels, 1_500_000);
   else if (size === "hd") effectivePixels = Math.min(inputPixels, 4_000_000);
   else if (size === "4k") effectivePixels = Math.min(inputPixels, 10_000_000);
+  else if (size === "25mp") effectivePixels = Math.min(inputPixels, 25_000_000);
+  else if (size === "50mp") effectivePixels = Math.min(inputPixels, 50_000_000);
   return effectivePixels > (crop ? DIRECT_CROPPED_RGBA_PNG_PIXELS : DIRECT_RGBA_PNG_PIXELS);
 }
 

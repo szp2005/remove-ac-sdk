@@ -120,6 +120,8 @@ function shouldPreFlightViaTicket(bytes, size, format, channels, crop) {
   else if (size === "medium") effectivePixels = Math.min(inputPixels, 1_500_000);
   else if (size === "hd") effectivePixels = Math.min(inputPixels, 4_000_000);
   else if (size === "4k") effectivePixels = Math.min(inputPixels, 10_000_000);
+  else if (size === "25mp") effectivePixels = Math.min(inputPixels, 25_000_000);
+  else if (size === "50mp") effectivePixels = Math.min(inputPixels, 50_000_000);
   return effectivePixels > (crop ? DIRECT_CROPPED_RGBA_PNG_PIXELS : DIRECT_RGBA_PNG_PIXELS);
 }
 
@@ -137,7 +139,7 @@ Options:
   --output-dir <dir>       Output directory for single, batch, or watched files
   --watch                  Continuously watch input directory(ies) for new/updated images
   --poll-ms <ms>           Watch polling interval in milliseconds (default: 2000)
-  --size <value>           preview | small | regular | medium | hd | 4k | full | auto (default: auto)
+  --size <value>           preview | small | regular | medium | hd | 4k | 25mp | 50mp | full | auto (default: auto)
   --format <value>         auto | png | jpg | webp | zip (default: png)
   --channels <value>       rgba | alpha (default: rgba)
   --type <value>           auto | person | product | car | animal | graphic | transportation

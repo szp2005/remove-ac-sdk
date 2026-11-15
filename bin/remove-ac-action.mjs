@@ -13,7 +13,7 @@ import { RemoveAcClient } from "../node/index.mjs";
 import { validateRemoteImageUrl } from "../node/net-safety.mjs";
 
 const SUPPORTED_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
-const ALLOWED_SIZES = new Set(["auto", "preview", "small", "regular", "medium", "hd", "4k", "full"]);
+const ALLOWED_SIZES = new Set(["auto", "preview", "small", "regular", "medium", "hd", "4k", "25mp", "50mp", "full"]);
 const ALLOWED_FORMATS = new Set(["png", "jpg", "webp", "zip"]);
 const ALLOWED_TYPES = new Set(["auto", "person", "product", "car", "animal", "graphic", "transportation"]);
 const ALLOWED_SHADOW_TYPES = new Set(["auto", "car", "drop", "soft", "contact", "reflection", "none"]);

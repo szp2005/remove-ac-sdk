@@ -96,6 +96,10 @@ def _should_preflight_via_ticket(
         eff = min(input_px, 4_000_000)
     elif size == "4k":
         eff = min(input_px, 10_000_000)
+    elif size == "25mp":
+        eff = min(input_px, 25_000_000)
+    elif size == "50mp":
+        eff = min(input_px, 50_000_000)
     else:
         eff = input_px
     return eff > (DIRECT_CROPPED_RGBA_PNG_PIXELS if crop else DIRECT_RGBA_PNG_PIXELS)

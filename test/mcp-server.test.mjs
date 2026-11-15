@@ -23,8 +23,8 @@ const mcpBinPath = path.resolve(
   "../bin/remove-ac-mcp.mjs",
 );
 
-test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.1.2", async () => {
-  assert.equal(SERVER_VERSION, "1.1.2");
+test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.2.0", async () => {
+  assert.equal(SERVER_VERSION, "1.2.0");
   const initRes = await handleMcpRequest({
     jsonrpc: "2.0",
     id: 1,
@@ -34,7 +34,7 @@ test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.1.
   assert.equal(initRes.id, 1);
   assert.equal(initRes.result.protocolVersion, "2024-11-05");
   assert.equal(initRes.result.serverInfo.name, SERVER_NAME);
-  assert.equal(initRes.result.serverInfo.version, "1.1.2");
+  assert.equal(initRes.result.serverInfo.version, "1.2.0");
 
   const notifRes = await handleMcpRequest({
     jsonrpc: "2.0",
@@ -305,7 +305,10 @@ test("MCP stdio child process handles newline-delimited JSON-RPC end-to-end", as
   assert.equal(lines.length, 2);
   assert.equal(lines[0].id, 10);
   assert.equal(lines[0].result.serverInfo.name, "remove-ac-mcp");
-  assert.equal(lines[0].result.serverInfo.version, "1.1.2");
+  assert.equal(lines[0].result.serverInfo.version, "1.2.0");
   assert.equal(lines[1].id, 11);
   assert.equal(lines[1].result.tools.length, 3);
+  const fileTool = lines[1].result.tools.find((t) => t.name === "remove_background_file");
+  assert.ok(fileTool.inputSchema.properties.size.enum.includes("25mp"));
+  assert.ok(fileTool.inputSchema.properties.size.enum.includes("50mp"));
 });

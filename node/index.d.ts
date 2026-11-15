@@ -1,5 +1,5 @@
 export interface RemoveBackgroundOptions {
-  size?: "preview" | "small" | "regular" | "medium" | "hd" | "4k" | "full" | "auto";
+  size?: "preview" | "small" | "regular" | "medium" | "hd" | "4k" | "25mp" | "50mp" | "full" | "auto";
   format?: "auto" | "png" | "jpg" | "webp" | "zip";
   channels?: "rgba" | "alpha";
   type?: "auto" | "person" | "product" | "car" | "animal" | "graphic" | "transportation";

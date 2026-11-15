@@ -1,0 +1,93 @@
+name: Publish SDKs to GitHub Packages, npm & PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  publish-github-packages:
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'desktop-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@szp2005"
+
+      - name: Run Node SDK, MCP & GitHub Action tests
+        run: npm test
+
+      - name: Stage scoped @szp2005/remove-ac package and publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          STAGE_DIR="$(mktemp -d)"
+          cp -R node bin action.yml smithery.yaml glama.json server.json LICENSE README.md package.json "$STAGE_DIR/"
+          node -e '
+            const fs = require("node:fs");
+            const p = process.argv[1];
+            const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
+            pkg.name = "@szp2005/remove-ac";
+            pkg.publishConfig = { registry: "https://npm.pkg.github.com" };
+            fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
+          ' "$STAGE_DIR/package.json"
+          cd "$STAGE_DIR"
+          npm publish --registry=https://npm.pkg.github.com || echo "Version already published on GitHub Packages"
+
+  publish-npm:
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'desktop-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish remove-ac to npmjs.org (when NPM_TOKEN is configured)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "Skipping npmjs.org publish: secrets.NPM_TOKEN is not configured yet."
+            exit 0
+          fi
+          npm publish --provenance --access public
+
+  publish-pypi:
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'desktop-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Python SDK tests and build sdist/wheel
+        run: |
+          python -m unittest discover -s tests -v
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: Publish remove-ac to PyPI (when PYPI_API_TOKEN is configured)
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "${TWINE_PASSWORD:-}" ]; then
+            echo "Skipping PyPI publish: secrets.PYPI_API_TOKEN is not configured yet."
+            exit 0
+          fi
+          python -m twine upload dist/*

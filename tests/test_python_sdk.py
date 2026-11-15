@@ -223,6 +223,49 @@ class PythonSdkTest(unittest.TestCase):
             self.assertEqual(err_ctx.exception.status_code, 502)
             self.assertEqual(len(calls), 1)
 
+    def test_25mp_and_50mp_preflight_ticket_routing(self):
+        import struct
+
+        # 30 MP PNG header (6000x5000, tiny 64-byte stub): both 25mp and 50mp exceed 5 MP RGBA PNG cap -> ticket mode
+        png_30mp = (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">I", 13)
+            + b"IHDR"
+            + struct.pack(">II", 6000, 5000)
+            + b"\x08\x06\x00\x00\x00"
+            + b"\x00" * 32
+        )
+        seen_sizes = []
+
+        def mock_transport(method, url, headers, body, timeout):
+            if url.endswith("/v1.0/removebg/ticket"):
+                payload = json.loads(body.decode("utf-8"))
+                seen_sizes.append(payload["size"])
+                return (
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps(
+                        {
+                            "data": {
+                                "ticket": "tkt_50mp",
+                                "directEndpoint": "http://127.0.0.1:8787/v1.0/direct-cutout",
+                            }
+                        }
+                    ).encode("utf-8"),
+                )
+            return 200, {"content-type": "image/png", "x-credits-charged": "1"}, b"PNG_OUT"
+
+        c = RemoveAcClient(
+            api_key="rac_live_test",
+            base_url="http://127.0.0.1:8787",
+            transport=mock_transport,
+        )
+        out25 = c.remove_background(png_30mp, size="25mp")
+        out50 = c.remove_background(png_30mp, size="50mp")
+        self.assertEqual(out25, b"PNG_OUT")
+        self.assertEqual(out50, b"PNG_OUT")
+        self.assertEqual(seen_sizes, ["25mp", "50mp"])
+
 
 if __name__ == "__main__":
     unittest.main()

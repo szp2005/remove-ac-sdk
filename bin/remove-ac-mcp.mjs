@@ -36,7 +36,7 @@ export {
 };
 
 export const SERVER_NAME = "remove-ac-mcp";
-export const SERVER_VERSION = "1.1.2";
+export const SERVER_VERSION = "1.2.0";
 export const MAX_MCP_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_MCP_HEADER_BYTES = 16 * 1024;
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
@@ -49,7 +49,7 @@ const SUPPORTED_PROTOCOLS = new Set([
 const SHARED_CUTOUT_PROPERTIES = {
   size: {
     type: "string",
-    enum: ["auto", "preview", "small", "regular", "medium", "hd", "4k", "full"],
+    enum: ["auto", "preview", "small", "regular", "medium", "hd", "4k", "25mp", "50mp", "full"],
     description: "Output resolution tier. Defaults to 'full'.",
   },
   format: {
@@ -85,7 +85,7 @@ export const MCP_TOOLS = [
   {
     name: "remove_background_file",
     description:
-      "Remove the background from a local image file (.png, .jpg, .jpeg, .webp) via the stateless remove.ac Cloud GPU API (/v1.0/removebg). Files above 4 MB (up to 25 MB / 40 MP) automatically stream via zero-disk /v1.0/removebg/ticket.",
+      "Remove the background from a local image file (.png, .jpg, .jpeg, .webp) via the stateless remove.ac Cloud GPU API (/v1.0/removebg). Files above 4 MB (up to 25 MB / 50 MP) automatically stream via zero-disk /v1.0/removebg/ticket.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
