@@ -1,0 +1,284 @@
+name: Desktop App Build & Release
+
+on:
+  push:
+    tags:
+      - "desktop-v*"
+    branches:
+      - "antigravity/desktop-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows (.exe NSIS + Portable)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Run desktop core tests & Electron IPC smoke test
+        working-directory: desktop
+        run: |
+          npm test
+          npm run smoke
+
+      - name: Build Windows NSIS installer & Portable .exe
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:win
+
+      - name: Verify Windows PE binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const pkg = require("./desktop/package.json");
+            const files = [
+              `desktop/dist/remove-ac-for-windows-${pkg.version}.exe`,
+              `desktop/dist/remove-ac-portable-${pkg.version}.exe`,
+            ];
+            for (const f of files) {
+              const st = fs.statSync(f);
+              if (st.size < 50 * 1024 * 1024) {
+                throw new Error(`${f} unexpectedly small: ${st.size} bytes`);
+              }
+              const fd = fs.openSync(f, "r");
+              const hdr = Buffer.alloc(2);
+              fs.readSync(fd, hdr, 0, 2, 0);
+              fs.closeSync(fd);
+              if (hdr.toString("ascii") !== "MZ") {
+                throw new Error(`${f} missing MZ PE header`);
+              }
+              console.log(`Verified ${f}: ${(st.size / (1024 * 1024)).toFixed(2)} MB`);
+            }
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-win
+          if-no-files-found: error
+          path: |
+            desktop/dist/remove-ac-for-windows-*.exe
+            desktop/dist/remove-ac-portable-*.exe
+
+  build-macos:
+    name: Build macOS Universal (.dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Run desktop core tests & Electron IPC smoke test
+        working-directory: desktop
+        run: |
+          npm test
+          npm run smoke
+
+      - name: Build macOS Universal .dmg
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:mac
+
+      - name: Verify macOS Universal .dmg & Mach-O slices
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG_VER="$(node -p "require('./desktop/package.json').version")"
+          DMG_PATH="desktop/dist/remove-ac-for-macos-${PKG_VER}.dmg"
+          APP_PATH="desktop/dist/mac-universal/Remove.ac.app"
+          BIN_PATH="${APP_PATH}/Contents/MacOS/Remove.ac"
+
+          ARCHS="$(lipo -archs "$BIN_PATH")"
+          echo "Merged Remove.ac Mach-O architectures: $ARCHS"
+          echo "$ARCHS" | grep -q "x86_64"
+          echo "$ARCHS" | grep -q "arm64"
+          codesign --verify --deep --strict "$APP_PATH"
+
+          node -e '
+            const fs = require("node:fs");
+            const f = process.argv[1];
+            const st = fs.statSync(f);
+            if (st.size < 80 * 1024 * 1024) {
+              throw new Error(`${f} unexpectedly small: ${st.size} bytes`);
+            }
+            console.log(`Verified ${f}: ${(st.size / (1024 * 1024)).toFixed(2)} MB (${st.size} bytes)`);
+          ' "$DMG_PATH"
+
+          MOUNT_DIR="$(mktemp -d)"
+          hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
+          trap 'hdiutil detach "$MOUNT_DIR" -force || true' EXIT
+          DMG_ARCHS="$(lipo -archs "${MOUNT_DIR}/Remove.ac.app/Contents/MacOS/Remove.ac")"
+          echo "$DMG_ARCHS" | grep -q "x86_64"
+          echo "$DMG_ARCHS" | grep -q "arm64"
+          codesign --verify --deep --strict "${MOUNT_DIR}/Remove.ac.app"
+          hdiutil detach "$MOUNT_DIR"
+          trap - EXIT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-mac
+          if-no-files-found: error
+          path: desktop/dist/remove-ac-for-macos-*.dmg
+
+  build-linux:
+    name: Build Linux x64 (.AppImage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xvfb for headless smoke test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Run desktop core tests & headless Electron IPC smoke test
+        working-directory: desktop
+        run: |
+          npm test
+          node scripts/generate-icons.mjs
+          xvfb-run -a npx electron . --no-sandbox --smoke-test
+
+      - name: Build Linux x64 .AppImage
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: npm run dist:linux
+
+      - name: Verify Linux .AppImage binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const pkg = require("./desktop/package.json");
+            const f = `desktop/dist/remove-ac-for-linux-${pkg.version}.AppImage`;
+            const st = fs.statSync(f);
+            if (st.size < 50 * 1024 * 1024) {
+              throw new Error(`${f} unexpectedly small: ${st.size} bytes`);
+            }
+            const fd = fs.openSync(f, "r");
+            const hdr = Buffer.alloc(4);
+            fs.readSync(fd, hdr, 0, 4, 0);
+            fs.closeSync(fd);
+            if (hdr[0] !== 0x7f || hdr.slice(1).toString("ascii") !== "ELF") {
+              throw new Error(`${f} missing ELF header`);
+            }
+            console.log(`Verified ${f}: ${(st.size / (1024 * 1024)).toFixed(2)} MB`);
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-linux
+          if-no-files-found: error
+          path: desktop/dist/remove-ac-for-linux-*.AppImage
+
+  release:
+    name: Generate Checksums & Publish Release
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt & print exact binary manifest
+        run: |
+          set -euo pipefail
+          cd release-assets
+          chmod +x remove-ac-for-linux-*.AppImage
+          sha256sum remove-ac-* | sort -k2 > SHA256SUMS.txt
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
+          echo "=== Exact Byte & MB Sizes ==="
+          ls -lh remove-ac-* SHA256SUMS.txt
+          stat -c "%n %s" remove-ac-* SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remove-ac-desktop-release-bundle
+          if-no-files-found: error
+          path: release-assets/*
+
+      - name: Publish GitHub Release on desktop-v* tag
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#desktop-v}"
+          PKG_VER="$(node -p "require('./desktop/package.json').version")"
+          if [ "$VERSION" != "$PKG_VER" ]; then
+            echo "Tag version (${VERSION}) does not match desktop/package.json version (${PKG_VER})" >&2
+            exit 1
+          fi
+          NOTES_FILE="$(mktemp)"
+          cat > "$NOTES_FILE" <<EOF
+          ## Remove.ac Desktop App v${VERSION}
+
+          Standalone native Electron desktop application for bulk AI background removal — zero Node.js or Python installation required.
+
+          ### Downloads
+          - **Windows 10/11 (64-bit Installer):** \`remove-ac-for-windows-${VERSION}.exe\`
+          - **Windows 10/11 (Zero-Install Portable):** \`remove-ac-portable-${VERSION}.exe\`
+          - **macOS Universal (Apple Silicon + Intel):** \`remove-ac-for-macos-${VERSION}.dmg\`
+          - **Linux (x86_64 AppImage):** \`remove-ac-for-linux-${VERSION}.AppImage\`
+
+          ### SHA-256 Checksums
+          \`\`\`text
+          $(cat release-assets/SHA256SUMS.txt)
+          \`\`\`
+
+          > **First-Launch Notes:**
+          > - **Windows SmartScreen:** Click **More info → Run anyway** if prompted on first launch.
+          > - **macOS Gatekeeper:** Drag \`Remove.ac.app\` to \`/Applications\`, then right-click → **Open** on first launch.
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+            gh release edit "$TAG" --title "Remove.ac Desktop v${VERSION}" --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "Remove.ac Desktop v${VERSION}" \
+              --notes-file "$NOTES_FILE"
+          fi

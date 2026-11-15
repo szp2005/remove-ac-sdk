@@ -168,6 +168,15 @@ In self-hosted or desktop n8n, open **Settings → Community Nodes → Install**
 
 ---
 
+## 8. Standalone Desktop App (`Windows .exe` · `macOS Universal .dmg` · `Linux .AppImage`)
+
+[`desktop/`](./desktop) contains the official standalone Electron desktop application (`Remove.ac`) for bulk folder and multi-thousand-photo background removal — requiring zero Node.js or Python installation on end-user machines:
+
+- **Direct Downloads:** https://remove.ac/plugins/desktop (or [GitHub Releases](https://github.com/szp2005/remove-ac-sdk/releases))
+- **Installers:** `remove-ac-for-windows-1.0.0.exe` (NSIS x64), `remove-ac-portable-1.0.0.exe` (zero-install portable x64), `remove-ac-for-macos-1.0.0.dmg` (Universal Apple Silicon + Intel), and `remove-ac-for-linux-1.0.0.AppImage` (x64)
+
+---
+
 ## License
 
 MIT © [remove.ac](https://remove.ac)

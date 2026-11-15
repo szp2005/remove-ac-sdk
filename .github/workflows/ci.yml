@@ -24,5 +24,7 @@ jobs:
         run: node ./bin/remove-ac-mcp.mjs --help
       - name: Run GitHub Action --help smoke check
         run: node ./bin/remove-ac-action.mjs --help
+      - name: Run Desktop App core unit & SSRF tests
+        run: node --test desktop/test/desktop-core.test.mjs
       - name: Run Python SDK tests
         run: python3 -m unittest discover -s tests -v
