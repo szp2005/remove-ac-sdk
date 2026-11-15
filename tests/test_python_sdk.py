@@ -3,9 +3,14 @@ import json
 import unittest
 
 from remove_ac import (
+    SDK_VERSION,
+    USER_AGENT,
+    VALID_SIZES,
     RemoveAcClient,
     RemoveAcError,
     RemoveBg,
+    SizeLiteral,
+    __version__,
     derive_sub_idempotency_key,
     parse_image_dimensions,
 )
@@ -265,6 +270,101 @@ class PythonSdkTest(unittest.TestCase):
         self.assertEqual(out25, b"PNG_OUT")
         self.assertEqual(out50, b"PNG_OUT")
         self.assertEqual(seen_sizes, ["25mp", "50mp"])
+
+    def test_v120_user_agent_enum_validation_and_ticket_hold_release(self):
+        import http.server
+        import threading
+
+        self.assertEqual(__version__, "1.2.0")
+        self.assertEqual(SDK_VERSION, "1.2.0")
+        self.assertEqual(USER_AGENT, "remove-ac-python-sdk/1.2.0")
+        self.assertIn("25mp", VALID_SIZES)
+        self.assertIn("50mp", VALID_SIZES)
+        self.assertIsNotNone(SizeLiteral)
+
+        # Verify real urllib _default_transport sends remove-ac-python-sdk/1.2.0 User-Agent (not Python-urllib)
+        captured_uas = []
+
+        class UaHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                captured_uas.append(self.headers.get("User-Agent"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"data":{"attributes":{"credits":{"total":5}}}}')
+
+            def log_message(self, *args):
+                pass
+
+        ua_srv = http.server.HTTPServer(("127.0.0.1", 0), UaHandler)
+        t = threading.Thread(target=ua_srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            real_client = RemoveAcClient(
+                api_key="rac_live_ua_check",
+                base_url=f"http://127.0.0.1:{ua_srv.server_port}",
+            )
+            acct = real_client.get_account(timeout=5)
+            self.assertEqual(acct["data"]["attributes"]["credits"]["total"], 5)
+            self.assertEqual(captured_uas, ["remove-ac-python-sdk/1.2.0"])
+        finally:
+            ua_srv.shutdown()
+            ua_srv.server_close()
+
+        # Client-side enum validation rejects invalid values with 0 HTTP calls
+        calls = []
+        guard_client = RemoveAcClient(
+            api_key="rac_live_guard",
+            transport=lambda m, u, h, b, to: calls.append(u) or (200, {}, b"OK"),
+        )
+        for bad_kwargs in (
+            {"size": "999mp"},
+            {"format": "bmp"},
+            {"channels": "cmyk"},
+            {"type": "ufo"},
+            {"shadow_type": "laser"},
+        ):
+            with self.assertRaises(RemoveAcError) as ctx:
+                guard_client.remove_background(b"abc", **bad_kwargs)
+            self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(len(calls), 0)
+
+        # MF-06: Best-effort POST /v1.0/removebg/ticket/release on directEndpoint failure
+        released_bodies = []
+
+        def hold_release_transport(method, url, headers, body, timeout):
+            self.assertEqual(headers.get("User-Agent"), "remove-ac-python-sdk/1.2.0")
+            if url.endswith("/v1.0/removebg/ticket"):
+                return (
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps(
+                        {
+                            "data": {
+                                "ticket": "tkt_py_hold",
+                                "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                                "holdId": "hold_py_1",
+                                "releaseToken": "rel_py_secret_1",
+                            }
+                        }
+                    ).encode("utf-8"),
+                )
+            if url.endswith("/v1.0/removebg/ticket/release"):
+                released_bodies.append(json.loads(body.decode("utf-8")))
+                return 200, {"content-type": "application/json"}, b'{"ok":true}'
+            raise ConnectionResetError("simulated 50MP upload reset")
+
+        hold_client = RemoveAcClient(
+            api_key="rac_live_hold",
+            transport=hold_release_transport,
+            resolver=lambda _host: ["93.184.216.34"],
+        )
+        with self.assertRaises(ConnectionResetError):
+            hold_client.remove_background(b"abc", direct=True)
+        self.assertEqual(
+            released_bodies,
+            [{"holdId": "hold_py_1", "releaseToken": "rel_py_secret_1"}],
+        )
 
 
 if __name__ == "__main__":

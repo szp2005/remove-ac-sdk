@@ -12,12 +12,62 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+
+__version__ = "1.2.0"
+SDK_VERSION = __version__
+USER_AGENT = f"remove-ac-python-sdk/{SDK_VERSION}"
 
 DEFAULT_BASE_URL = "https://remove.ac"
 DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024
 DIRECT_RGBA_PNG_PIXELS = 5_000_000
 DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000
+
+VALID_SIZES: Tuple[str, ...] = (
+    "auto",
+    "preview",
+    "small",
+    "regular",
+    "medium",
+    "hd",
+    "4k",
+    "25mp",
+    "50mp",
+    "full",
+)
+VALID_FORMATS: Tuple[str, ...] = ("auto", "png", "jpg", "jpeg", "webp", "zip")
+VALID_CHANNELS: Tuple[str, ...] = ("rgba", "alpha")
+VALID_TYPES: Tuple[str, ...] = (
+    "auto",
+    "person",
+    "product",
+    "car",
+    "animal",
+    "graphic",
+    "transportation",
+)
+VALID_SHADOW_TYPES: Tuple[str, ...] = (
+    "auto",
+    "car",
+    "drop",
+    "soft",
+    "contact",
+    "reflection",
+    "none",
+)
+
+SizeLiteral = Literal[
+    "auto",
+    "preview",
+    "small",
+    "regular",
+    "medium",
+    "hd",
+    "4k",
+    "25mp",
+    "50mp",
+    "full",
+]
 
 
 def parse_image_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
@@ -293,6 +343,13 @@ def validate_https_endpoint_url(
     return None
 
 
+def _ensure_user_agent(headers: Dict[str, str]) -> Dict[str, str]:
+    merged = dict(headers or {})
+    if not any(k.lower() == "user-agent" for k in merged):
+        merged["User-Agent"] = USER_AGENT
+    return merged
+
+
 def _default_transport(
     method: str,
     url: str,
@@ -300,7 +357,12 @@ def _default_transport(
     body: Optional[bytes],
     timeout: int,
 ) -> Tuple[int, Dict[str, str], bytes]:
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers=_ensure_user_agent(headers),
+        method=method,
+    )
     try:
         with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
@@ -333,13 +395,35 @@ class RemoveAcClient:
         self._transport = transport or _default_transport
         self._resolver = resolver
 
+    def _release_ticket_hold(
+        self, hold_id: Optional[str], release_token: Optional[str]
+    ) -> bool:
+        if not hold_id or not release_token or not self.api_key:
+            return False
+        try:
+            r_status, _, _ = self._transport(
+                "POST",
+                f"{self.base_url}/v1.0/removebg/ticket/release",
+                _ensure_user_agent(
+                    {
+                        "Content-Type": "application/json",
+                        "X-Api-Key": self.api_key,
+                    }
+                ),
+                json.dumps({"holdId": hold_id, "releaseToken": release_token}).encode("utf-8"),
+                5,
+            )
+            return 200 <= r_status < 300
+        except Exception:
+            return False
+
     def get_account(self, timeout: int = 15) -> Dict[str, Any]:
         if not self.api_key:
             raise RemoveAcError(403, "Missing remove.ac API key")
         status, _, body = self._transport(
             "GET",
             f"{self.base_url}/v1.0/account",
-            {"X-Api-Key": self.api_key},
+            _ensure_user_agent({"X-Api-Key": self.api_key}),
             None,
             timeout,
         )
@@ -351,7 +435,7 @@ class RemoveAcClient:
         self,
         image: Union[str, bytes],
         *,
-        size: str = "auto",
+        size: Union[SizeLiteral, str] = "auto",
         format: str = "png",
         channels: str = "rgba",
         type: str = "auto",
@@ -373,6 +457,36 @@ class RemoveAcClient:
     ) -> bytes:
         if not self.api_key:
             raise RemoveAcError(403, "Missing remove.ac API key")
+
+        norm_size = str(size or "auto").strip().lower()
+        if norm_size not in VALID_SIZES:
+            raise RemoveAcError(
+                400, f"Unsupported size '{size}'. Expected one of: {', '.join(VALID_SIZES)}"
+            )
+        norm_format = str(format or "png").strip().lower()
+        if norm_format not in VALID_FORMATS:
+            raise RemoveAcError(
+                400, f"Unsupported format '{format}'. Expected one of: {', '.join(VALID_FORMATS)}"
+            )
+        norm_channels = str(channels or "rgba").strip().lower()
+        if norm_channels not in VALID_CHANNELS:
+            raise RemoveAcError(
+                400, f"Unsupported channels '{channels}'. Expected one of: {', '.join(VALID_CHANNELS)}"
+            )
+        norm_type = str(type or "auto").strip().lower()
+        if norm_type not in VALID_TYPES:
+            raise RemoveAcError(
+                400, f"Unsupported type '{type}'. Expected one of: {', '.join(VALID_TYPES)}"
+            )
+        norm_shadow_type: Optional[str] = None
+        if shadow_type is not None and str(shadow_type).strip() != "":
+            norm_shadow_type = str(shadow_type).strip().lower()
+            if norm_shadow_type not in VALID_SHADOW_TYPES:
+                raise RemoveAcError(
+                    400,
+                    f"Unsupported shadow_type '{shadow_type}'. Expected one of: {', '.join(VALID_SHADOW_TYPES)}",
+                )
+
         if idempotency_key is not None:
             trimmed_idem = idempotency_key.strip()
             if not trimmed_idem or len(trimmed_idem) > 255:
@@ -380,6 +494,7 @@ class RemoveAcClient:
             idem = trimmed_idem
         else:
             idem = f"pysdk-{uuid.uuid4()}"
+
         img_bytes: Optional[bytes] = None
         img_name = "image.png"
         img_url: Optional[str] = None
@@ -401,13 +516,13 @@ class RemoveAcClient:
             payload: Dict[str, Any] = {
                 "foregroundSha256": hashlib.sha256(img_bytes).hexdigest(),
                 "foregroundByteLength": len(img_bytes),
-                "size": size,
-                "format": format,
-                "channels": channels,
+                "size": norm_size,
+                "format": norm_format,
+                "channels": norm_channels,
                 "semitransparency": semitransparency,
             }
-            if type and type != "auto":
-                payload["type"] = type
+            if norm_type and norm_type != "auto":
+                payload["type"] = norm_type
             if type_level:
                 payload["type_level"] = type_level
             if roi:
@@ -426,19 +541,21 @@ class RemoveAcClient:
                 payload["crop_margin"] = crop_margin
             if add_shadow:
                 payload["add_shadow"] = True
-            if shadow_type:
-                payload["shadow_type"] = shadow_type
+            if norm_shadow_type:
+                payload["shadow_type"] = norm_shadow_type
             if shadow_opacity is not None:
                 payload["shadow_opacity"] = shadow_opacity
 
             t_status, _, t_body = self._transport(
                 "POST",
                 f"{self.base_url}/v1.0/removebg/ticket",
-                {
-                    "Content-Type": "application/json",
-                    "X-Api-Key": self.api_key,
-                    "Idempotency-Key": derive_sub_idempotency_key(idem, suffix),
-                },
+                _ensure_user_agent(
+                    {
+                        "Content-Type": "application/json",
+                        "X-Api-Key": self.api_key,
+                        "Idempotency-Key": derive_sub_idempotency_key(idem, suffix),
+                    }
+                ),
                 json.dumps(payload).encode("utf-8"),
                 30,
             )
@@ -451,12 +568,28 @@ class RemoveAcClient:
             t_data = parsed_ticket.get("data") if isinstance(parsed_ticket, dict) else None
             ticket_tok = t_data.get("ticket") if isinstance(t_data, dict) else None
             direct_ep = t_data.get("directEndpoint") if isinstance(t_data, dict) else None
+            raw_hold_id = (
+                (t_data.get("holdId") or t_data.get("lock_id")) if isinstance(t_data, dict) else None
+            )
+            raw_release_tok = (
+                (t_data.get("releaseToken") or t_data.get("release_token"))
+                if isinstance(t_data, dict)
+                else None
+            )
+            hold_id = raw_hold_id.strip() if isinstance(raw_hold_id, str) and raw_hold_id.strip() else None
+            release_tok = (
+                raw_release_tok.strip()
+                if isinstance(raw_release_tok, str) and raw_release_tok.strip()
+                else None
+            )
+
             if (
                 not isinstance(ticket_tok, str)
                 or not ticket_tok.strip()
                 or not isinstance(direct_ep, str)
                 or not direct_ep.strip()
             ):
+                self._release_ticket_hold(hold_id, release_tok)
                 raise RemoveAcError(502, "Missing ticket or directEndpoint in /v1.0/removebg/ticket response")
             ep_err = validate_https_endpoint_url(
                 direct_ep,
@@ -465,39 +598,48 @@ class RemoveAcClient:
                 label="directEndpoint",
             )
             if ep_err:
+                self._release_ticket_hold(hold_id, release_tok)
                 raise RemoveAcError(502, ep_err)
             mp_body, mp_ct = _encode_multipart({}, ("image_file", img_name, img_bytes))
-            d_status, _, d_body = self._transport(
-                "POST",
-                direct_ep,
-                {
-                    "Authorization": f"Bearer {ticket_tok}",
-                    "Content-Type": mp_ct,
-                },
-                mp_body,
-                timeout,
-            )
+            try:
+                d_status, _, d_body = self._transport(
+                    "POST",
+                    direct_ep,
+                    _ensure_user_agent(
+                        {
+                            "Authorization": f"Bearer {ticket_tok}",
+                            "Content-Type": mp_ct,
+                        }
+                    ),
+                    mp_body,
+                    timeout,
+                )
+            except Exception:
+                self._release_ticket_hold(hold_id, release_tok)
+                raise
             if d_status < 200 or d_status >= 300:
+                if (300 <= d_status < 400) or d_status in (502, 503, 504):
+                    self._release_ticket_hold(hold_id, release_tok)
                 raise RemoveAcError(d_status, d_body.decode("utf-8", errors="replace"))
             return d_body
 
         if img_bytes is not None and (
             direct
             or len(img_bytes) > DIRECT_THRESHOLD_BYTES
-            or _should_preflight_via_ticket(img_bytes, size, format, channels, crop)
+            or _should_preflight_via_ticket(img_bytes, norm_size, norm_format, norm_channels, crop)
         ):
             return _via_ticket("direct")
 
         fields: Dict[str, str] = {
-            "size": size,
-            "format": format,
-            "channels": channels,
+            "size": norm_size,
+            "format": norm_format,
+            "channels": norm_channels,
             "semitransparency": str(semitransparency).lower(),
         }
         if img_url:
             fields["image_url"] = img_url
-        if type and type != "auto":
-            fields["type"] = type
+        if norm_type and norm_type != "auto":
+            fields["type"] = norm_type
         if type_level:
             fields["type_level"] = type_level
         if roi:
@@ -516,8 +658,8 @@ class RemoveAcClient:
             fields["crop_margin"] = crop_margin
         if add_shadow:
             fields["add_shadow"] = "true"
-        if shadow_type:
-            fields["shadow_type"] = shadow_type
+        if norm_shadow_type:
+            fields["shadow_type"] = norm_shadow_type
         if shadow_opacity is not None:
             fields["shadow_opacity"] = str(shadow_opacity)
 
@@ -526,11 +668,13 @@ class RemoveAcClient:
         status, _, body = self._transport(
             "POST",
             f"{self.base_url}/v1.0/removebg",
-            {
-                "X-Api-Key": self.api_key,
-                "Idempotency-Key": idem,
-                "Content-Type": mp_ct,
-            },
+            _ensure_user_agent(
+                {
+                    "X-Api-Key": self.api_key,
+                    "Idempotency-Key": idem,
+                    "Content-Type": mp_ct,
+                }
+            ),
             mp_body,
             timeout,
         )
@@ -542,11 +686,13 @@ class RemoveAcClient:
             status, _, body = self._transport(
                 "POST",
                 f"{self.base_url}/v1.0/removebg",
-                {
-                    "X-Api-Key": self.api_key,
-                    "Idempotency-Key": f"pysdk-{uuid.uuid4()}",
-                    "Content-Type": mp_ct,
-                },
+                _ensure_user_agent(
+                    {
+                        "X-Api-Key": self.api_key,
+                        "Idempotency-Key": f"pysdk-{uuid.uuid4()}",
+                        "Content-Type": mp_ct,
+                    }
+                ),
                 mp_body,
                 timeout,
             )

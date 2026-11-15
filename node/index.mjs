@@ -8,6 +8,48 @@ import {
   validateHttpsEndpointUrl,
 } from "./net-safety.mjs";
 
+export const SDK_VERSION = "1.2.0";
+export const USER_AGENT = `remove-ac-node-sdk/${SDK_VERSION}`;
+
+export const VALID_SIZES = Object.freeze([
+  "auto",
+  "preview",
+  "small",
+  "regular",
+  "medium",
+  "hd",
+  "4k",
+  "25mp",
+  "50mp",
+  "full",
+]);
+export const VALID_FORMATS = Object.freeze(["auto", "png", "jpg", "jpeg", "webp", "zip"]);
+export const VALID_CHANNELS = Object.freeze(["rgba", "alpha"]);
+export const VALID_TYPES = Object.freeze([
+  "auto",
+  "person",
+  "product",
+  "car",
+  "animal",
+  "graphic",
+  "transportation",
+]);
+export const VALID_SHADOW_TYPES = Object.freeze([
+  "auto",
+  "car",
+  "drop",
+  "soft",
+  "contact",
+  "reflection",
+  "none",
+]);
+
+const VALID_SIZE_SET = new Set(VALID_SIZES);
+const VALID_FORMAT_SET = new Set(VALID_FORMATS);
+const VALID_CHANNEL_SET = new Set(VALID_CHANNELS);
+const VALID_TYPE_SET = new Set(VALID_TYPES);
+const VALID_SHADOW_SET = new Set(VALID_SHADOW_TYPES);
+
 const DEFAULT_BASE_URL = "https://remove.ac";
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
@@ -123,6 +165,26 @@ function sha256Hex(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
+function mergeWithUserAgent(rawHeaders, defaultUa) {
+  const out = {};
+  if (rawHeaders instanceof Headers) {
+    for (const [k, v] of rawHeaders.entries()) {
+      out[k] = v;
+    }
+  } else if (Array.isArray(rawHeaders)) {
+    for (const entry of rawHeaders) {
+      if (Array.isArray(entry) && entry.length >= 2) out[entry[0]] = entry[1];
+    }
+  } else if (rawHeaders && typeof rawHeaders === "object") {
+    Object.assign(out, rawHeaders);
+  }
+  const hasUa = Object.keys(out).some((k) => k.toLowerCase() === "user-agent");
+  if (!hasUa) {
+    out["User-Agent"] = defaultUa;
+  }
+  return out;
+}
+
 export function deriveSubIdempotencyKey(idem, suffix) {
   const trimmed = String(idem || "").trim();
   if (!trimmed || trimmed.length > 255) {
@@ -143,13 +205,35 @@ export class RemoveAcClient {
   }
 
   async _request(url, init = {}) {
+    const mergedInit = {
+      ...init,
+      headers: mergeWithUserAgent(init.headers, USER_AGENT),
+    };
     try {
-      return await fetchWithoutRedirects(this.fetchImpl, url, init);
+      return await fetchWithoutRedirects(this.fetchImpl, url, mergedInit);
     } catch (err) {
       if (err && typeof err.statusCode === "number") {
         throw new RemoveAcError(err.statusCode, err.message);
       }
       throw err;
+    }
+  }
+
+  async _releaseTicketHold(holdId, releaseToken) {
+    if (!holdId || !releaseToken || !this.apiKey) return false;
+    try {
+      const res = await this._request(`${this.baseUrl}/v1.0/removebg/ticket/release`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Api-Key": this.apiKey,
+        },
+        body: JSON.stringify({ holdId, releaseToken }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return Boolean(res && res.ok);
+    } catch {
+      return false;
     }
   }
 
@@ -164,6 +248,45 @@ export class RemoveAcClient {
 
   async removeBackground(input, options = {}) {
     if (!this.apiKey) throw new RemoveAcError(403, "Missing remove.ac API key");
+
+    const size = String(options.size || "auto").trim().toLowerCase();
+    if (!VALID_SIZE_SET.has(size)) {
+      throw new RemoveAcError(400, `Unsupported size '${options.size}'. Expected one of: ${VALID_SIZES.join(", ")}`);
+    }
+    const format = String(options.format || "png").trim().toLowerCase();
+    if (!VALID_FORMAT_SET.has(format)) {
+      throw new RemoveAcError(400, `Unsupported format '${options.format}'. Expected one of: ${VALID_FORMATS.join(", ")}`);
+    }
+    const channels = String(options.channels || "rgba").trim().toLowerCase();
+    if (!VALID_CHANNEL_SET.has(channels)) {
+      throw new RemoveAcError(400, `Unsupported channels '${options.channels}'. Expected one of: ${VALID_CHANNELS.join(", ")}`);
+    }
+    let fgType = "";
+    if (options.type !== undefined && options.type !== null && String(options.type).trim() !== "") {
+      fgType = String(options.type).trim().toLowerCase();
+      if (!VALID_TYPE_SET.has(fgType)) {
+        throw new RemoveAcError(400, `Unsupported type '${options.type}'. Expected one of: ${VALID_TYPES.join(", ")}`);
+      }
+    }
+    let shadowType = "";
+    if (options.shadowType !== undefined && options.shadowType !== null && String(options.shadowType).trim() !== "") {
+      shadowType = String(options.shadowType).trim().toLowerCase();
+      if (!VALID_SHADOW_SET.has(shadowType)) {
+        throw new RemoveAcError(
+          400,
+          `Unsupported shadowType '${options.shadowType}'. Expected one of: ${VALID_SHADOW_TYPES.join(", ")}`,
+        );
+      }
+    }
+
+    if (options.idempotencyKey !== undefined) {
+      const trimmedIdem = String(options.idempotencyKey).trim();
+      if (!trimmedIdem || trimmedIdem.length > 255) {
+        throw new RemoveAcError(400, "idempotencyKey must be between 1 and 255 characters");
+      }
+    }
+    const idem = options.idempotencyKey ? String(options.idempotencyKey).trim() : `sdk-${crypto.randomUUID()}`;
+
     let sourceBytes = null;
     let sourceName = "image.png";
     let sourceUrl = null;
@@ -183,17 +306,6 @@ export class RemoveAcClient {
       throw new RemoveAcError(400, "Unsupported input source");
     }
 
-    const size = options.size || "auto";
-    const format = options.format || "png";
-    const channels = options.channels || "rgba";
-    if (options.idempotencyKey !== undefined) {
-      const trimmedIdem = String(options.idempotencyKey).trim();
-      if (!trimmedIdem || trimmedIdem.length > 255) {
-        throw new RemoveAcError(400, "idempotencyKey must be between 1 and 255 characters");
-      }
-    }
-    const idem = options.idempotencyKey ? String(options.idempotencyKey).trim() : `sdk-${crypto.randomUUID()}`;
-
     const runViaTicket = async (suffix) => {
       if (!sourceBytes) throw new RemoveAcError(413, "Ticket mode requires binary input");
       const ticketPayload = {
@@ -202,7 +314,7 @@ export class RemoveAcClient {
         size,
         format,
         channels,
-        ...(options.type ? { type: options.type } : {}),
+        ...(fgType && fgType !== "auto" ? { type: fgType } : {}),
         ...(options.typeLevel ? { type_level: options.typeLevel } : {}),
         ...(options.roi ? { roi: options.roi } : {}),
         ...(options.scale ? { scale: options.scale } : {}),
@@ -212,7 +324,7 @@ export class RemoveAcClient {
         ...(options.crop !== undefined ? { crop: options.crop } : {}),
         ...(options.cropMargin ? { crop_margin: options.cropMargin } : {}),
         ...(options.addShadow !== undefined ? { add_shadow: options.addShadow } : {}),
-        ...(options.shadowType ? { shadow_type: options.shadowType } : {}),
+        ...(shadowType ? { shadow_type: shadowType } : {}),
         ...(options.shadowOpacity !== undefined ? { shadow_opacity: options.shadowOpacity } : {}),
         ...(options.semitransparency !== undefined ? { semitransparency: options.semitransparency } : {}),
       };
@@ -227,14 +339,21 @@ export class RemoveAcClient {
       });
       if (!tRes.ok) throw new RemoveAcError(tRes.status, await tRes.text());
       const tJson = await tRes.json();
-      const ticketToken = tJson?.data?.ticket;
-      const directEndpoint = tJson?.data?.directEndpoint;
+      const tData = tJson?.data;
+      const ticketToken = tData?.ticket;
+      const directEndpoint = tData?.directEndpoint;
+      const rawHoldId = tData?.holdId ?? tData?.lock_id;
+      const rawReleaseToken = tData?.releaseToken ?? tData?.release_token;
+      const holdId = typeof rawHoldId === "string" ? rawHoldId.trim() : "";
+      const releaseToken = typeof rawReleaseToken === "string" ? rawReleaseToken.trim() : "";
+
       if (
         typeof ticketToken !== "string" ||
         !ticketToken.trim() ||
         typeof directEndpoint !== "string" ||
         !directEndpoint.trim()
       ) {
+        await this._releaseTicketHold(holdId, releaseToken);
         throw new RemoveAcError(502, "Missing ticket or directEndpoint in /v1.0/removebg/ticket response");
       }
       const epErr = await validateHttpsEndpointUrl(directEndpoint, {
@@ -243,16 +362,28 @@ export class RemoveAcClient {
         label: "directEndpoint",
       });
       if (epErr) {
+        await this._releaseTicketHold(holdId, releaseToken);
         throw new RemoveAcError(502, epErr);
       }
       const fd = new FormData();
       fd.set("image_file", new Blob([sourceBytes]), sourceName);
-      const dRes = await this._request(directEndpoint, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${ticketToken}` },
-        body: fd,
-      });
-      if (!dRes.ok) throw new RemoveAcError(dRes.status, await dRes.text());
+      let dRes;
+      try {
+        dRes = await this._request(directEndpoint, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${ticketToken}` },
+          body: fd,
+        });
+      } catch (err) {
+        await this._releaseTicketHold(holdId, releaseToken);
+        throw err;
+      }
+      if (!dRes.ok) {
+        if (dRes.status >= 502 && dRes.status <= 504) {
+          await this._releaseTicketHold(holdId, releaseToken);
+        }
+        throw new RemoveAcError(dRes.status, await dRes.text());
+      }
       return {
         buffer: Buffer.from(await dRes.arrayBuffer()),
         width: Number.parseInt(dRes.headers.get("X-Width") || "0", 10),
@@ -278,7 +409,7 @@ export class RemoveAcClient {
       fd.set("size", size);
       fd.set("format", format);
       fd.set("channels", channels);
-      if (options.type) fd.set("type", options.type);
+      if (fgType && fgType !== "auto") fd.set("type", fgType);
       if (options.typeLevel) fd.set("type_level", options.typeLevel);
       if (options.roi) fd.set("roi", options.roi);
       if (options.scale) fd.set("scale", options.scale);
@@ -288,7 +419,7 @@ export class RemoveAcClient {
       if (options.crop !== undefined) fd.set("crop", String(options.crop));
       if (options.cropMargin) fd.set("crop_margin", options.cropMargin);
       if (options.addShadow !== undefined) fd.set("add_shadow", String(options.addShadow));
-      if (options.shadowType) fd.set("shadow_type", options.shadowType);
+      if (shadowType) fd.set("shadow_type", shadowType);
       if (options.shadowOpacity !== undefined) fd.set("shadow_opacity", String(options.shadowOpacity));
       if (options.semitransparency !== undefined) fd.set("semitransparency", String(options.semitransparency));
       return fd;

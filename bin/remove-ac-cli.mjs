@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * remove.ac Official Zero-Dependency CLI (Node.js >= 18)
+ * remove.ac Official Zero-Dependency CLI v1.2.0 (Node.js >= 18)
  * Compatible with POST https://remove.ac/v1.0/removebg, POST /v1.0/removebg/ticket, & GET /v1.0/account
  *
  * Usage:
  *   export REMOVE_AC_API_KEY="rac_live_..."
  *   node remove-ac-cli.mjs --account
  *   node remove-ac-cli.mjs photo.jpg --output photo-nobg.png
- *   node remove-ac-cli.mjs ./input-folder --output-dir ./cutouts --size auto --format png
- *   node remove-ac-cli.mjs ./hot-folder --output-dir ./cutouts --watch
+ *   node remove-ac-cli.mjs ./input-folder --output-dir ./cutouts --concurrency=4 --size=50mp
+ *   node remove-ac-cli.mjs ./hot-folder --output-dir ./cutouts --watch --format=webp --crop
  */
 import crypto from "node:crypto";
 import dns from "node:dns";
@@ -21,11 +21,53 @@ import {
   validateHttpsEndpointUrl,
 } from "../node/net-safety.mjs";
 
+export const CLI_VERSION = "1.2.0";
+export const USER_AGENT = `remove-ac-cli/${CLI_VERSION}`;
+export const VALID_SIZES = Object.freeze([
+  "auto",
+  "preview",
+  "small",
+  "regular",
+  "medium",
+  "hd",
+  "4k",
+  "25mp",
+  "50mp",
+  "full",
+]);
+export const VALID_FORMATS = Object.freeze(["auto", "png", "jpg", "jpeg", "webp", "zip"]);
+export const VALID_CHANNELS = Object.freeze(["rgba", "alpha"]);
+export const VALID_TYPES = Object.freeze([
+  "auto",
+  "person",
+  "product",
+  "car",
+  "animal",
+  "graphic",
+  "transportation",
+]);
+export const VALID_SHADOW_TYPES = Object.freeze([
+  "auto",
+  "car",
+  "drop",
+  "soft",
+  "contact",
+  "reflection",
+  "none",
+]);
+
+const VALID_SIZE_SET = new Set(VALID_SIZES);
+const VALID_FORMAT_SET = new Set(VALID_FORMATS);
+const VALID_CHANNEL_SET = new Set(VALID_CHANNELS);
+const VALID_TYPE_SET = new Set(VALID_TYPES);
+const VALID_SHADOW_SET = new Set(VALID_SHADOW_TYPES);
+
 const DEFAULT_BASE_URL = "https://remove.ac";
 const SUPPORTED_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const DIRECT_STREAM_THRESHOLD_BYTES = 4 * 1024 * 1024;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
+const MAX_CONCURRENCY = 8;
 
 export function parseImageDimensions(input) {
   const bytes =
@@ -125,18 +167,57 @@ function shouldPreFlightViaTicket(bytes, size, format, channels, crop) {
   return effectivePixels > (crop ? DIRECT_CROPPED_RGBA_PNG_PIXELS : DIRECT_RGBA_PNG_PIXELS);
 }
 
+function mergeWithUserAgent(rawHeaders) {
+  const out = { ...(rawHeaders || {}) };
+  if (!Object.keys(out).some((k) => k.toLowerCase() === "user-agent")) {
+    out["User-Agent"] = USER_AGENT;
+  }
+  return out;
+}
+
+function normalizeAndValidateCliEnums(opts) {
+  opts.size = String(opts.size || "auto").trim().toLowerCase();
+  if (!VALID_SIZE_SET.has(opts.size)) {
+    throw new Error(`Unsupported --size '${opts.size}'. Expected one of: ${VALID_SIZES.join(", ")}`);
+  }
+  opts.format = String(opts.format || "png").trim().toLowerCase();
+  if (!VALID_FORMAT_SET.has(opts.format)) {
+    throw new Error(`Unsupported --format '${opts.format}'. Expected one of: ${VALID_FORMATS.join(", ")}`);
+  }
+  opts.channels = String(opts.channels || "rgba").trim().toLowerCase();
+  if (!VALID_CHANNEL_SET.has(opts.channels)) {
+    throw new Error(`Unsupported --channels '${opts.channels}'. Expected one of: ${VALID_CHANNELS.join(", ")}`);
+  }
+  opts.type = String(opts.type || "auto").trim().toLowerCase();
+  if (!VALID_TYPE_SET.has(opts.type)) {
+    throw new Error(`Unsupported --type '${opts.type}'. Expected one of: ${VALID_TYPES.join(", ")}`);
+  }
+  if (opts.shadowType !== undefined && opts.shadowType !== null && String(opts.shadowType).trim() !== "") {
+    opts.shadowType = String(opts.shadowType).trim().toLowerCase();
+    if (!VALID_SHADOW_SET.has(opts.shadowType)) {
+      throw new Error(
+        `Unsupported --shadow-type '${opts.shadowType}'. Expected one of: ${VALID_SHADOW_TYPES.join(", ")}`,
+      );
+    }
+  } else {
+    opts.shadowType = "";
+  }
+}
+
 export function printHelp(out = console.log) {
-  out(`remove.ac CLI — Cloud GPU Background Removal (v1.0 + Zero-Disk Direct Stream)
+  out(`remove.ac CLI v${CLI_VERSION} — Cloud GPU Background Removal (up to 25 MB / 50 MP Zero-Disk Stream)
 
 Usage:
   node remove-ac-cli.mjs --account [--api-key <key>]
   node remove-ac-cli.mjs <file-or-dir...> [options]
+  node remove-ac-cli.mjs <dir> --output-dir <dir> --concurrency 4 --size 50mp
   node remove-ac-cli.mjs <dir> --output-dir <dir> --watch [options]
 
 Options:
   --api-key <key>          API key (defaults to REMOVE_AC_API_KEY or REMOVE_BG_API_KEY)
   --output, -o <path>      Output file path (single input file only)
   --output-dir <dir>       Output directory for single, batch, or watched files
+  --concurrency <1..8>     Parallel worker count for batch runs (default: 1)
   --watch                  Continuously watch input directory(ies) for new/updated images
   --poll-ms <ms>           Watch polling interval in milliseconds (default: 2000)
   --size <value>           preview | small | regular | medium | hd | 4k | 25mp | 50mp | full | auto (default: auto)
@@ -155,10 +236,11 @@ Options:
   --shadow-type <value>    auto | car | drop | soft | contact | reflection | none
   --shadow-opacity <0-100> Shadow opacity percentage (0..100)
   --no-semitransparency    Disable semitransparency preservation on glass/tulle
-  --direct                 Always stream via /v1.0/removebg/ticket -> GPU RAM (up to 25 MB)
+  --direct                 Always stream via /v1.0/removebg/ticket -> GPU RAM (up to 25 MB / 50 MP)
   --idempotency-key <key>  Explicit Idempotency-Key (defaults to unique per-invocation key)
   --endpoint <url>         API origin (default: ${DEFAULT_BASE_URL})
   --account                Inspect remaining credit balance and rate limit
+  --version, -v            Print CLI version (${CLI_VERSION}) and exit
   --help, -h               Show this help message
 `);
 }
@@ -169,6 +251,7 @@ export function parseArgs(argv) {
     apiKey: process.env.REMOVE_AC_API_KEY || process.env.REMOVE_BG_API_KEY || "",
     output: null,
     outputDir: null,
+    concurrency: 1,
     watch: false,
     pollMs: 2000,
     size: "auto",
@@ -190,49 +273,112 @@ export function parseArgs(argv) {
     direct: false,
     idempotencyKey: "",
     account: false,
+    version: false,
     help: false,
     endpoint: process.env.REMOVE_AC_BASE_URL || DEFAULT_BASE_URL,
   };
+
   for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (arg === "--help" || arg === "-h") opts.help = true;
-    else if (arg === "--account") opts.account = true;
-    else if (arg === "--watch") opts.watch = true;
-    else if (arg === "--poll-ms") opts.pollMs = Math.max(250, Number.parseInt(argv[++i] || "2000", 10) || 2000);
-    else if (arg === "--crop") opts.crop = true;
-    else if (arg === "--crop-margin") opts.cropMargin = argv[++i] || "";
-    else if (arg === "--shadow" || arg === "--add-shadow") opts.shadow = true;
-    else if (arg === "--shadow-type") opts.shadowType = argv[++i] || "";
-    else if (arg === "--shadow-opacity") opts.shadowOpacity = argv[++i] || "";
-    else if (arg === "--no-semitransparency") opts.semitransparency = false;
-    else if (arg === "--direct") opts.direct = true;
-    else if (arg === "--idempotency-key") {
-      const next = argv[++i];
-      if (!next || next.startsWith("-")) {
+    const rawArg = argv[i];
+    if (!rawArg.startsWith("-")) {
+      opts.inputs.push(rawArg);
+      continue;
+    }
+
+    const eqIdx = rawArg.indexOf("=");
+    const hasInline = eqIdx !== -1;
+    const arg = hasInline ? rawArg.slice(0, eqIdx) : rawArg;
+    const inlineVal = hasInline ? rawArg.slice(eqIdx + 1) : undefined;
+
+    const assertNoInline = () => {
+      if (hasInline) {
+        throw new Error(`Boolean option ${arg} does not take a value.`);
+      }
+    };
+    const nextValue = () => (hasInline ? inlineVal : argv[++i]);
+
+    if (arg === "--help" || arg === "-h") {
+      assertNoInline();
+      opts.help = true;
+    } else if (arg === "--version" || arg === "-v") {
+      assertNoInline();
+      opts.version = true;
+    } else if (arg === "--account") {
+      assertNoInline();
+      opts.account = true;
+    } else if (arg === "--watch") {
+      assertNoInline();
+      opts.watch = true;
+    } else if (arg === "--poll-ms") {
+      opts.pollMs = Math.max(250, Number.parseInt(nextValue() || "2000", 10) || 2000);
+    } else if (arg === "--concurrency") {
+      const rawConc = String(nextValue() ?? "").trim();
+      const parsedConc = Number(rawConc);
+      if (!rawConc || !Number.isInteger(parsedConc) || parsedConc < 1 || parsedConc > MAX_CONCURRENCY) {
+        throw new Error(`--concurrency must be an integer between 1 and ${MAX_CONCURRENCY}.`);
+      }
+      opts.concurrency = parsedConc;
+    } else if (arg === "--crop") {
+      assertNoInline();
+      opts.crop = true;
+    } else if (arg === "--crop-margin") {
+      opts.cropMargin = nextValue() || "";
+    } else if (arg === "--shadow" || arg === "--add-shadow") {
+      assertNoInline();
+      opts.shadow = true;
+    } else if (arg === "--shadow-type") {
+      opts.shadowType = nextValue() || "";
+    } else if (arg === "--shadow-opacity") {
+      opts.shadowOpacity = nextValue() || "";
+    } else if (arg === "--no-semitransparency") {
+      assertNoInline();
+      opts.semitransparency = false;
+    } else if (arg === "--direct") {
+      assertNoInline();
+      opts.direct = true;
+    } else if (arg === "--idempotency-key") {
+      const next = nextValue();
+      if (!next || (!hasInline && next.startsWith("-"))) {
         throw new Error("--idempotency-key requires a non-empty key value.");
       }
       if (next.length > 255) {
         throw new Error("--idempotency-key must be 255 characters or fewer.");
       }
       opts.idempotencyKey = next;
+    } else if (arg === "--api-key") {
+      opts.apiKey = nextValue() || "";
+    } else if (arg === "--output" || arg === "-o") {
+      opts.output = nextValue() || null;
+    } else if (arg === "--output-dir") {
+      opts.outputDir = nextValue() || null;
+    } else if (arg === "--size") {
+      opts.size = nextValue() || "auto";
+    } else if (arg === "--format") {
+      opts.format = nextValue() || "png";
+    } else if (arg === "--channels") {
+      opts.channels = nextValue() || "rgba";
+    } else if (arg === "--type") {
+      opts.type = nextValue() || "auto";
+    } else if (arg === "--type-level") {
+      opts.typeLevel = nextValue() || "";
+    } else if (arg === "--roi") {
+      opts.roi = nextValue() || "";
+    } else if (arg === "--scale") {
+      opts.scale = nextValue() || "";
+    } else if (arg === "--position") {
+      opts.position = nextValue() || "";
+    } else if (arg === "--bg-color") {
+      opts.bgColor = nextValue() || "";
+    } else if (arg === "--bg-image") {
+      opts.bgImage = nextValue() || "";
+    } else if (arg === "--endpoint") {
+      opts.endpoint = nextValue() || DEFAULT_BASE_URL;
+    } else {
+      throw new Error(`Unknown option: ${rawArg}`);
     }
-    else if (arg === "--api-key") opts.apiKey = argv[++i] || "";
-    else if (arg === "--output" || arg === "-o") opts.output = argv[++i] || null;
-    else if (arg === "--output-dir") opts.outputDir = argv[++i] || null;
-    else if (arg === "--size") opts.size = argv[++i] || "auto";
-    else if (arg === "--format") opts.format = argv[++i] || "png";
-    else if (arg === "--channels") opts.channels = argv[++i] || "rgba";
-    else if (arg === "--type") opts.type = argv[++i] || "auto";
-    else if (arg === "--type-level") opts.typeLevel = argv[++i] || "";
-    else if (arg === "--roi") opts.roi = argv[++i] || "";
-    else if (arg === "--scale") opts.scale = argv[++i] || "";
-    else if (arg === "--position") opts.position = argv[++i] || "";
-    else if (arg === "--bg-color") opts.bgColor = argv[++i] || "";
-    else if (arg === "--bg-image") opts.bgImage = argv[++i] || "";
-    else if (arg === "--endpoint") opts.endpoint = argv[++i] || DEFAULT_BASE_URL;
-    else if (!arg.startsWith("-")) opts.inputs.push(arg);
-    else throw new Error(`Unknown option: ${arg}`);
   }
+
+  normalizeAndValidateCliEnums(opts);
   return opts;
 }
 
@@ -309,7 +455,33 @@ export async function processImageBuffer({
   fetchImpl = globalThis.fetch,
   lookupFn = dns.promises.lookup,
 }) {
-  const safeFetch = async (url, init = {}) => fetchWithoutRedirects(fetchImpl, url, init);
+  const validatedOpts = { ...opts };
+  normalizeAndValidateCliEnums(validatedOpts);
+
+  const safeFetch = async (url, init = {}) =>
+    fetchWithoutRedirects(fetchImpl, url, {
+      ...init,
+      headers: mergeWithUserAgent(init.headers),
+    });
+
+  const releaseTicketHold = async (holdId, releaseToken) => {
+    if (!holdId || !releaseToken || !validatedOpts.apiKey) return false;
+    try {
+      const rRes = await safeFetch(`${baseUrl}/v1.0/removebg/ticket/release`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Api-Key": validatedOpts.apiKey,
+        },
+        body: JSON.stringify({ holdId, releaseToken }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return Boolean(rRes && rRes.ok);
+    } catch {
+      return false;
+    }
+  };
+
   const fgSha = sha256Hex(bytes);
   const bgTag = bgInput
     ? bgInput.kind === "url"
@@ -320,55 +492,55 @@ export async function processImageBuffer({
     Buffer.from(
       JSON.stringify({
         fgSha,
-        size: opts.size,
-        format: opts.format,
-        channels: opts.channels,
-        type: opts.type,
-        roi: opts.roi,
-        scale: opts.scale,
-        position: opts.position,
-        bgColor: opts.bgColor,
+        size: validatedOpts.size,
+        format: validatedOpts.format,
+        channels: validatedOpts.channels,
+        type: validatedOpts.type,
+        roi: validatedOpts.roi,
+        scale: validatedOpts.scale,
+        position: validatedOpts.position,
+        bgColor: validatedOpts.bgColor,
         bgTag,
-        crop: opts.crop,
-        cropMargin: opts.cropMargin,
-        shadow: opts.shadow,
-        shadowType: opts.shadowType,
-        shadowOpacity: opts.shadowOpacity,
-        semitransparency: opts.semitransparency,
-        typeLevel: opts.typeLevel,
+        crop: validatedOpts.crop,
+        cropMargin: validatedOpts.cropMargin,
+        shadow: validatedOpts.shadow,
+        shadowType: validatedOpts.shadowType,
+        shadowOpacity: validatedOpts.shadowOpacity,
+        semitransparency: validatedOpts.semitransparency,
+        typeLevel: validatedOpts.typeLevel,
       }),
     ),
   ).slice(0, 16);
-  if (opts.idempotencyKey && opts.idempotencyKey.length > 255) {
+  if (validatedOpts.idempotencyKey && validatedOpts.idempotencyKey.length > 255) {
     throw new Error("Idempotency-Key must be between 1 and 255 characters.");
   }
-  const idemKey = opts.idempotencyKey || `cli:${paramFingerprint}:${crypto.randomUUID()}`;
+  const idemKey = validatedOpts.idempotencyKey || `cli:${paramFingerprint}:${crypto.randomUUID()}`;
 
   const runViaTicket = async (idemSuffix = "ticket") => {
     const ticketBody = {
       foregroundSha256: fgSha,
       foregroundByteLength: bytes.byteLength,
-      size: opts.size,
-      format: opts.format,
-      channels: opts.channels,
-      semitransparency: opts.semitransparency,
+      size: validatedOpts.size,
+      format: validatedOpts.format,
+      channels: validatedOpts.channels,
+      semitransparency: validatedOpts.semitransparency,
     };
-    if (opts.type && opts.type !== "auto") ticketBody.type = opts.type;
-    if (opts.typeLevel) ticketBody.type_level = opts.typeLevel;
-    if (opts.roi) ticketBody.roi = opts.roi;
-    if (opts.scale) ticketBody.scale = opts.scale;
-    if (opts.position) ticketBody.position = opts.position;
-    if (opts.bgColor) ticketBody.bg_color = opts.bgColor;
+    if (validatedOpts.type && validatedOpts.type !== "auto") ticketBody.type = validatedOpts.type;
+    if (validatedOpts.typeLevel) ticketBody.type_level = validatedOpts.typeLevel;
+    if (validatedOpts.roi) ticketBody.roi = validatedOpts.roi;
+    if (validatedOpts.scale) ticketBody.scale = validatedOpts.scale;
+    if (validatedOpts.position) ticketBody.position = validatedOpts.position;
+    if (validatedOpts.bgColor) ticketBody.bg_color = validatedOpts.bgColor;
     if (bgInput?.kind === "url") ticketBody.bg_image_url = bgInput.url;
     if (bgInput?.kind === "file") {
       ticketBody.bgImageSha256 = bgInput.sha256;
       ticketBody.bgImageByteLength = bgInput.bytes.byteLength;
     }
-    if (opts.crop) ticketBody.crop = true;
-    if (opts.cropMargin) ticketBody.crop_margin = opts.cropMargin;
-    if (opts.shadow) ticketBody.add_shadow = true;
-    if (opts.shadowType) ticketBody.shadow_type = opts.shadowType;
-    if (opts.shadowOpacity !== "") ticketBody.shadow_opacity = opts.shadowOpacity;
+    if (validatedOpts.crop) ticketBody.crop = true;
+    if (validatedOpts.cropMargin) ticketBody.crop_margin = validatedOpts.cropMargin;
+    if (validatedOpts.shadow) ticketBody.add_shadow = true;
+    if (validatedOpts.shadowType) ticketBody.shadow_type = validatedOpts.shadowType;
+    if (validatedOpts.shadowOpacity !== "") ticketBody.shadow_opacity = validatedOpts.shadowOpacity;
 
     let ticketRes;
     try {
@@ -376,7 +548,7 @@ export async function processImageBuffer({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Api-Key": opts.apiKey,
+          "X-Api-Key": validatedOpts.apiKey,
           "Idempotency-Key": deriveSubIdempotencyKey(idemKey, idemSuffix),
         },
         body: JSON.stringify(ticketBody),
@@ -391,14 +563,21 @@ export async function processImageBuffer({
       return { ok: false, status: ticketRes.status, errorText: await ticketRes.text() };
     }
     const ticketJson = await ticketRes.json();
-    const ticket = ticketJson?.data?.ticket;
-    const directEndpoint = ticketJson?.data?.directEndpoint;
+    const tData = ticketJson?.data;
+    const ticket = tData?.ticket;
+    const directEndpoint = tData?.directEndpoint;
+    const rawHoldId = tData?.holdId ?? tData?.lock_id;
+    const rawReleaseToken = tData?.releaseToken ?? tData?.release_token;
+    const holdId = typeof rawHoldId === "string" ? rawHoldId.trim() : "";
+    const releaseToken = typeof rawReleaseToken === "string" ? rawReleaseToken.trim() : "";
+
     if (
       typeof ticket !== "string" ||
       !ticket.trim() ||
       typeof directEndpoint !== "string" ||
       !directEndpoint.trim()
     ) {
+      await releaseTicketHold(holdId, releaseToken);
       return { ok: false, status: 502, errorText: "Missing ticket or directEndpoint in response" };
     }
     const epErr = await validateHttpsEndpointUrl(directEndpoint, {
@@ -407,6 +586,7 @@ export async function processImageBuffer({
       label: "directEndpoint",
     });
     if (epErr) {
+      await releaseTicketHold(holdId, releaseToken);
       return { ok: false, status: 502, errorText: epErr };
     }
 
@@ -429,12 +609,16 @@ export async function processImageBuffer({
         body: directForm,
       });
     } catch (err) {
+      await releaseTicketHold(holdId, releaseToken);
       if (err && typeof err.statusCode === "number") {
         return { ok: false, status: err.statusCode, errorText: err.message };
       }
       throw err;
     }
     if (!directRes.ok) {
+      if (directRes.status >= 502 && directRes.status <= 504) {
+        await releaseTicketHold(holdId, releaseToken);
+      }
       return { ok: false, status: directRes.status, errorText: await directRes.text() };
     }
     return {
@@ -442,16 +626,22 @@ export async function processImageBuffer({
       buffer: Buffer.from(await directRes.arrayBuffer()),
       charged:
         directRes.headers.get("x-credits-charged") ??
-        String(ticketJson?.data?.creditsHeld ?? ticketJson?.creditsHeld ?? "?"),
+        String(tData?.creditsHeld ?? ticketJson?.creditsHeld ?? "?"),
       via: "direct-stream",
     };
   };
 
   const needsDirect =
-    opts.direct ||
+    validatedOpts.direct ||
     bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES ||
     (bgInput?.kind === "file" && bgInput.bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES) ||
-    shouldPreFlightViaTicket(bytes, opts.size, opts.format, opts.channels, Boolean(opts.crop));
+    shouldPreFlightViaTicket(
+      bytes,
+      validatedOpts.size,
+      validatedOpts.format,
+      validatedOpts.channels,
+      Boolean(validatedOpts.crop),
+    );
 
   if (needsDirect) {
     return runViaTicket("direct");
@@ -460,25 +650,25 @@ export async function processImageBuffer({
   const buildFormData = () => {
     const form = new FormData();
     form.set("image_file", new Blob([bytes], { type: mimeType }), fileName);
-    form.set("size", opts.size);
-    form.set("format", opts.format);
-    form.set("channels", opts.channels);
-    if (opts.type && opts.type !== "auto") form.set("type", opts.type);
-    if (opts.typeLevel) form.set("type_level", opts.typeLevel);
-    if (opts.roi) form.set("roi", opts.roi);
-    if (opts.scale) form.set("scale", opts.scale);
-    if (opts.position) form.set("position", opts.position);
-    if (opts.bgColor) form.set("bg_color", opts.bgColor);
+    form.set("size", validatedOpts.size);
+    form.set("format", validatedOpts.format);
+    form.set("channels", validatedOpts.channels);
+    if (validatedOpts.type && validatedOpts.type !== "auto") form.set("type", validatedOpts.type);
+    if (validatedOpts.typeLevel) form.set("type_level", validatedOpts.typeLevel);
+    if (validatedOpts.roi) form.set("roi", validatedOpts.roi);
+    if (validatedOpts.scale) form.set("scale", validatedOpts.scale);
+    if (validatedOpts.position) form.set("position", validatedOpts.position);
+    if (validatedOpts.bgColor) form.set("bg_color", validatedOpts.bgColor);
     if (bgInput?.kind === "url") form.set("bg_image_url", bgInput.url);
     if (bgInput?.kind === "file") {
       form.set("bg_image_file", new Blob([bgInput.bytes], { type: bgInput.mime }), path.basename(bgInput.path));
     }
-    if (opts.crop) form.set("crop", "true");
-    if (opts.cropMargin) form.set("crop_margin", opts.cropMargin);
-    if (opts.shadow) form.set("add_shadow", "true");
-    if (opts.shadowType) form.set("shadow_type", opts.shadowType);
-    if (opts.shadowOpacity !== "") form.set("shadow_opacity", String(opts.shadowOpacity));
-    if (!opts.semitransparency) form.set("semitransparency", "false");
+    if (validatedOpts.crop) form.set("crop", "true");
+    if (validatedOpts.cropMargin) form.set("crop_margin", validatedOpts.cropMargin);
+    if (validatedOpts.shadow) form.set("add_shadow", "true");
+    if (validatedOpts.shadowType) form.set("shadow_type", validatedOpts.shadowType);
+    if (validatedOpts.shadowOpacity !== "") form.set("shadow_opacity", String(validatedOpts.shadowOpacity));
+    if (!validatedOpts.semitransparency) form.set("semitransparency", "false");
     return form;
   };
 
@@ -487,7 +677,7 @@ export async function processImageBuffer({
     res = await safeFetch(`${baseUrl}/v1.0/removebg`, {
       method: "POST",
       headers: {
-        "X-Api-Key": opts.apiKey,
+        "X-Api-Key": validatedOpts.apiKey,
         "Idempotency-Key": idemKey,
       },
       body: buildFormData(),
@@ -499,14 +689,14 @@ export async function processImageBuffer({
     throw err;
   }
 
-  if (res.status === 409 && !opts.idempotencyKey) {
+  if (res.status === 409 && !validatedOpts.idempotencyKey) {
     const errText = await res.text();
     if (errText.includes("idempotency_replay_unavailable")) {
       try {
         res = await safeFetch(`${baseUrl}/v1.0/removebg`, {
           method: "POST",
           headers: {
-            "X-Api-Key": opts.apiKey,
+            "X-Api-Key": validatedOpts.apiKey,
             "Idempotency-Key": `cli:${paramFingerprint}:${crypto.randomUUID()}`,
           },
           body: buildFormData(),
@@ -568,8 +758,28 @@ async function processSingleFile(filePath, opts, baseUrl, bgInput) {
   return true;
 }
 
+export async function runBatchPool(items, concurrency, workerFn) {
+  const limit = Math.max(1, Math.min(MAX_CONCURRENCY, Math.trunc(concurrency || 1)));
+  let cursor = 0;
+  let failed = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const idx = cursor;
+      cursor += 1;
+      const ok = await workerFn(items[idx], idx);
+      if (!ok) failed += 1;
+    }
+  });
+  await Promise.all(workers);
+  return failed;
+}
+
 export async function runCli(argv = process.argv.slice(2)) {
   const opts = parseArgs(argv);
+  if (opts.version) {
+    console.log(CLI_VERSION);
+    return;
+  }
   if (opts.help || (!opts.account && opts.inputs.length === 0)) {
     printHelp();
     process.exit(opts.help ? 0 : 1);
@@ -618,7 +828,7 @@ export async function runCli(argv = process.argv.slice(2)) {
 
   if (opts.account) {
     const res = await fetchWithoutRedirects(fetch, `${baseUrl}/v1.0/account`, {
-      headers: { "X-Api-Key": opts.apiKey },
+      headers: mergeWithUserAgent({ "X-Api-Key": opts.apiKey }),
     });
     const text = await res.text();
     if (!res.ok) {
@@ -677,11 +887,9 @@ export async function runCli(argv = process.argv.slice(2)) {
     fs.mkdirSync(path.resolve(opts.outputDir), { recursive: true });
   }
 
-  let failed = 0;
-  for (const filePath of files) {
-    const ok = await processSingleFile(filePath, opts, baseUrl, bgInput);
-    if (!ok) failed += 1;
-  }
+  const failed = await runBatchPool(files, opts.concurrency, (filePath) =>
+    processSingleFile(filePath, opts, baseUrl, bgInput),
+  );
 
   if (failed > 0) process.exit(1);
 }

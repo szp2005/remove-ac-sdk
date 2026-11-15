@@ -39,8 +39,8 @@ curl -X POST https://remove.ac/v1.0/removebg \
 
 ```bash
 npm install remove-ac
-# via GitHub Packages npm registry:
-npm install @szp2005/remove-ac --registry=https://npm.pkg.github.com
+# via GitHub Packages npm registry (aliased as "remove-ac" for drop-in imports; requires //npm.pkg.github.com/:_authToken=YOUR_GITHUB_PAT in .npmrc):
+npm install remove-ac@npm:@szp2005/remove-ac --@szp2005:registry=https://npm.pkg.github.com
 # or directly from GitHub:
 npm install github:szp2005/remove-ac-sdk
 ```
@@ -73,11 +73,11 @@ console.log(`Saved ${result.width}x${result.height} (${result.creditsCharged} cr
 ```bash
 export REMOVE_AC_API_KEY="rac_live_..."
 
-# Process an entire folder with 4 parallel workers
-npx -y -p remove-ac remove-ac ./input-photos ./output-pngs --concurrency=4 --size=full
+# Process an entire folder with 4 parallel workers (up to 50 MP)
+npx -y -p remove-ac remove-ac ./input-photos --output-dir ./output-pngs --concurrency=4 --size=50mp
 
 # Watch a hot folder continuously and output transparent WebP cutouts
-npx -y -p remove-ac remove-ac ./incoming ./cutouts --watch --format=webp --crop
+npx -y -p remove-ac remove-ac ./incoming --output-dir ./cutouts --watch --format=webp --crop
 ```
 
 ---

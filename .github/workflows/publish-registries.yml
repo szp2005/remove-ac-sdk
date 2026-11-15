@@ -11,8 +11,104 @@ permissions:
   id-token: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.gate.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify release tag and manifest version parity
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import { SERVER_VERSION } from "./bin/remove-ac-mcp.mjs";
+            import { CLI_VERSION } from "./bin/remove-ac-cli.mjs";
+            import { SDK_VERSION } from "./node/index.mjs";
+
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const srv = JSON.parse(fs.readFileSync("server.json", "utf8"));
+            const pyproject = fs.readFileSync("pyproject.toml", "utf8");
+            const pyMatch = pyproject.match(/^version\s*=\s*"([^"]+)"/m);
+            const pyVer = pyMatch ? pyMatch[1] : "";
+
+            const versions = {
+              "package.json": pkg.version,
+              "pyproject.toml": pyVer,
+              "server.json": srv.version,
+              "server.json.packages[0]": srv.packages?.[0]?.version,
+              "bin/remove-ac-mcp.mjs": SERVER_VERSION,
+              "bin/remove-ac-cli.mjs": CLI_VERSION,
+              "node/index.mjs": SDK_VERSION,
+            };
+            for (const [k, v] of Object.entries(versions)) {
+              if (v !== pkg.version) {
+                throw new Error(`Version mismatch: ${k}=${v} !== package.json=${pkg.version}`);
+              }
+            }
+            if (!srv.description || srv.description.length > 100) {
+              throw new Error(`server.json description length (${srv.description?.length}) exceeds 100 limit`);
+            }
+
+            const eventName = process.env.EVENT_NAME || "";
+            const releaseTag = (process.env.RELEASE_TAG || "").trim();
+            let shouldPublish = "true";
+
+            if (eventName === "release") {
+              if (releaseTag.startsWith("desktop-") || /^v\d+$/.test(releaseTag)) {
+                console.log(`Skipping SDK registry publish for non-semver/desktop tag: ${releaseTag}`);
+                shouldPublish = "false";
+              } else if (/^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(releaseTag)) {
+                const expectedTag = `v${pkg.version}`;
+                if (releaseTag !== expectedTag) {
+                  throw new Error(`Release tag ${releaseTag} does not match package.json version ${expectedTag}`);
+                }
+                shouldPublish = "true";
+              } else {
+                throw new Error(`Unsupported release tag format for SDK publish: ${releaseTag}`);
+              }
+            }
+
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `should_publish=${shouldPublish}\n`);
+          '
+          python -c '
+          import json
+          import remove_ac
+          pkg_ver = json.load(open("package.json", encoding="utf-8"))["version"]
+          assert remove_ac.__version__ == pkg_ver, f"Python __version__ {remove_ac.__version__} != {pkg_ver}"
+          assert remove_ac.SDK_VERSION == pkg_ver, f"Python SDK_VERSION {remove_ac.SDK_VERSION} != {pkg_ver}"
+          '
+
+      - name: Run Node SDK, MCP, GitHub Action & Desktop unit suites
+        if: steps.gate.outputs.should_publish == 'true'
+        run: |
+          npm test
+          node --test desktop/test/desktop-core.test.mjs
+
+      - name: Run Python SDK unit suite, build sdist/wheel, and verify package metadata
+        if: steps.gate.outputs.should_publish == 'true'
+        run: |
+          python -m unittest discover -s tests -v
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+
   publish-github-packages:
-    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'desktop-')
+    needs: [verify]
+    if: needs.verify.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,9 +118,6 @@ jobs:
           node-version: "22"
           registry-url: "https://npm.pkg.github.com"
           scope: "@szp2005"
-
-      - name: Run Node SDK, MCP & GitHub Action tests
-        run: npm test
 
       - name: Stage scoped @szp2005/remove-ac package and publish to GitHub Packages
         env:
@@ -42,10 +135,23 @@ jobs:
             fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
           ' "$STAGE_DIR/package.json"
           cd "$STAGE_DIR"
-          npm publish --registry=https://npm.pkg.github.com || echo "Version already published on GitHub Packages"
+          set +e
+          PUBLISH_OUT="$(npm publish --registry=https://npm.pkg.github.com 2>&1)"
+          PUBLISH_RC=$?
+          set -e
+          echo "$PUBLISH_OUT"
+          if [ "$PUBLISH_RC" -ne 0 ]; then
+            if echo "$PUBLISH_OUT" | grep -Eqi "EPUBLISHCONFLICT|409 Conflict|cannot publish over existing version|You cannot publish over the previously published versions"; then
+              echo "Version already published on GitHub Packages; treating as idempotent skip."
+              exit 0
+            fi
+            echo "::error::GitHub Packages npm publish failed with exit code ${PUBLISH_RC}"
+            exit "$PUBLISH_RC"
+          fi
 
   publish-npm:
-    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'desktop-')
+    needs: [verify]
+    if: needs.verify.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +172,8 @@ jobs:
           npm publish --provenance --access public
 
   publish-pypi:
-    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'desktop-')
+    needs: [verify]
+    if: needs.verify.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,13 +182,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run Python SDK tests and build sdist/wheel
-        run: |
-          python -m unittest discover -s tests -v
-          python -m pip install --upgrade build twine
-          python -m build
-
-      - name: Publish remove-ac to PyPI (when PYPI_API_TOKEN is configured)
+      - name: Build sdist/wheel and publish remove-ac to PyPI (when PYPI_API_TOKEN is configured)
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
@@ -90,4 +191,7 @@ jobs:
             echo "Skipping PyPI publish: secrets.PYPI_API_TOKEN is not configured yet."
             exit 0
           fi
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
           python -m twine upload dist/*
