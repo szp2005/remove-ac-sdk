@@ -1,0 +1,71 @@
+appId: ac.remove.desktop
+productName: Remove.ac
+copyright: Copyright © 2026 remove.ac
+asar: true
+compression: normal
+afterPack: scripts/after-pack.cjs
+
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - src/**/*
+  - package.json
+
+win:
+  icon: build/icon.ico
+  signAndEditExecutable: true
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+
+nsis:
+  artifactName: remove-ac-for-windows-${version}.${ext}
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Remove.ac
+  uninstallDisplayName: Remove.ac
+
+portable:
+  artifactName: remove-ac-portable-${version}.${ext}
+
+mac:
+  icon: build/icon.png
+  category: public.app-category.photography
+  identity: null
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  artifactName: remove-ac-for-macos-${version}.${ext}
+  target:
+    - target: dmg
+      arch:
+        - universal
+
+dmg:
+  artifactName: remove-ac-for-macos-${version}.${ext}
+  contents:
+    - x: 140
+      y: 200
+    - x: 400
+      y: 200
+      type: link
+      path: /Applications
+
+linux:
+  icon: build/icon.png
+  category: Graphics
+  synopsis: Bulk AI Background Remover for Desktop
+  artifactName: remove-ac-for-linux-${version}.${ext}
+  target:
+    - target: AppImage
+      arch:
+        - x64

@@ -1,0 +1,29 @@
+{
+  "name": "remove-ac-desktop",
+  "productName": "Remove.ac",
+  "version": "1.0.0",
+  "description": "Remove.ac Desktop Bulk Background Remover — Standalone App for Windows, macOS & Linux",
+  "author": "remove.ac <support@remove.ac>",
+  "homepage": "https://remove.ac/plugins/desktop",
+  "license": "MIT",
+  "private": true,
+  "main": "src/main.cjs",
+  "scripts": {
+    "icons": "node scripts/generate-icons.mjs",
+    "prestart": "node scripts/generate-icons.mjs",
+    "start": "electron .",
+    "presmoke": "node scripts/generate-icons.mjs",
+    "smoke": "electron . --smoke-test",
+    "test": "node --test test/desktop-core.test.mjs",
+    "dist:win": "node scripts/generate-icons.mjs && electron-builder --config electron-builder.yml --win nsis portable --x64 --publish never",
+    "dist:mac": "node scripts/generate-icons.mjs && electron-builder --config electron-builder.yml --mac dmg --universal --publish never",
+    "dist:linux": "node scripts/generate-icons.mjs && electron-builder --config electron-builder.yml --linux AppImage --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "45.3.2",
+    "electron-builder": "26.18.0"
+  },
+  "overrides": {
+    "minimatch": "^11.0.8"
+  }
+}

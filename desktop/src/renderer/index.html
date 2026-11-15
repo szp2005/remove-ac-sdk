@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Remove.ac — Desktop Bulk Background Remover</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-group">
+          <svg class="brand-mark" viewBox="0 0 40 40" width="32" height="32" aria-hidden="true">
+            <defs>
+              <linearGradient id="racBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#0B63CE" />
+                <stop offset="100%" stop-color="#082F76" />
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="36" height="36" rx="10" fill="url(#racBgGrad)" />
+            <rect x="15" y="15" width="16" height="16" rx="4.5" fill="#7DC2FF" fill-opacity="0.38" />
+            <rect x="9" y="9" width="17" height="17" rx="4.8" fill="#FFFFFF" />
+            <circle cx="17.5" cy="17.5" r="4.5" fill="#0B63CE" />
+          </svg>
+          <div class="brand-title-wrap">
+            <div class="brand-wordmark">
+              <span class="brand-main">remove</span><span class="brand-suffix">ac</span>
+            </div>
+            <span class="brand-badge" id="appVersionBadge">Desktop v1.0.0</span>
+          </div>
+        </div>
+
+        <div class="topbar-actions">
+          <div class="credit-pill" id="creditPill" title="">
+            <span class="credit-dot" id="creditDot"></span>
+            <span id="creditLabel" data-i18n="creditsUnconnected">API Key Required</span>
+            <button type="button" class="icon-link-btn" id="refreshAccountBtn" title="Refresh">↻</button>
+          </div>
+          <button type="button" class="ghost-btn" id="buyCreditsBtn" data-i18n="buyCredits">
+            Get Credits
+          </button>
+          <button type="button" class="lang-btn" id="langToggleBtn">简体中文</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="queue-column">
+          <div class="dropzone" id="dropzone" tabindex="0">
+            <div class="dropzone-icon" aria-hidden="true">
+              <svg viewBox="0 0 48 48" width="42" height="42" fill="none">
+                <rect x="6" y="10" width="36" height="28" rx="7" stroke="#0B63CE" stroke-width="2.4" stroke-dasharray="5 4" fill="#EFF6FF" />
+                <path d="M24 30V18M24 18L19 23M24 18L29 23" stroke="#0B63CE" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </div>
+            <h2 class="dropzone-title" data-i18n="dropTitle">
+              Drag &amp; drop images or entire folders here
+            </h2>
+            <p class="dropzone-sub" data-i18n="dropSub">
+              PNG, JPG, WebP up to 25 MB &amp; 40 MP per image · Zero disk storage on Cloud GPU
+            </p>
+            <div class="dropzone-btns">
+              <button type="button" class="primary-btn" id="pickFilesBtn" data-i18n="selectImages">
+                + Select Images
+              </button>
+              <button type="button" class="secondary-btn" id="pickFoldersBtn" data-i18n="selectFolder">
+                + Select Folder
+              </button>
+            </div>
+          </div>
+
+          <div class="queue-card">
+            <div class="queue-toolbar">
+              <div class="queue-stats">
+                <strong id="queueCountText">0 images</strong>
+                <span class="muted-sep">·</span>
+                <span id="queueHintText" data-i18n="queueReadyHint">Ready for batch processing</span>
+              </div>
+              <div class="queue-toolbar-btns">
+                <button type="button" class="text-btn" id="openOutputFolderBtn" hidden data-i18n="openOutputFolder">
+                  Open Output Folder
+                </button>
+                <button type="button" class="text-btn" id="clearDoneBtn" data-i18n="clearFinished">
+                  Clear Finished
+                </button>
+                <button type="button" class="text-btn danger" id="clearAllBtn" data-i18n="clearAll">
+                  Clear All
+                </button>
+              </div>
+            </div>
+
+            <div class="queue-empty" id="queueEmptyState">
+              <p data-i18n="emptyQueueDesc">
+                No images in queue yet. Drop product photos, portraits, or multi-level folders above to start.
+              </p>
+            </div>
+
+            <div class="queue-list" id="queueList" role="list"></div>
+
+            <footer class="batch-footer">
+              <div class="progress-wrap">
+                <div class="progress-track">
+                  <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="progress-meta">
+                  <span id="progressStatusText" data-i18n="statusIdle">Idle</span>
+                  <span id="creditsUsedText">0 credits used</span>
+                </div>
+              </div>
+              <div class="batch-cta-group">
+                <button type="button" class="danger-btn" id="cancelBatchBtn" hidden data-i18n="cancelBatch">
+                  Stop
+                </button>
+                <button type="button" class="run-btn" id="startBatchBtn" disabled data-i18n="startBatch">
+                  Start Batch Cutout
+                </button>
+              </div>
+            </footer>
+          </div>
+        </section>
+
+        <aside class="inspector-column">
+          <section class="panel-card">
+            <div class="panel-header">
+              <h3 data-i18n="apiKeyHeading">Cloud GPU API Key</h3>
+              <button type="button" class="link-btn" id="getApiKeyLinkBtn" data-i18n="getFreeKey">
+                Get Key (1 Free Credit) ↗
+              </button>
+            </div>
+
+            <div class="saved-key-box" id="savedKeyBox" hidden>
+              <div class="saved-key-info">
+                <span class="key-mask" id="maskedKeyText">rac_live_••••</span>
+                <span class="key-badge" id="keyStorageBadge">OS Keychain</span>
+              </div>
+              <div class="saved-key-btns">
+                <button type="button" class="text-btn" id="changeKeyBtn" data-i18n="replaceKey">Change</button>
+                <button type="button" class="text-btn danger" id="removeKeyBtn" data-i18n="clearKey">Clear</button>
+              </div>
+            </div>
+
+            <div class="key-editor" id="keyEditorBox">
+              <input
+                type="password"
+                id="apiKeyInput"
+                class="text-input"
+                placeholder="rac_live_..."
+                autocomplete="off"
+              />
+              <button type="button" class="primary-btn small" id="saveApiKeyBtn" data-i18n="saveVerifyKey">
+                Save &amp; Verify
+              </button>
+            </div>
+            <p class="panel-note" id="apiKeyFeedback" data-i18n="apiKeyHint">
+              Encrypted locally via Windows DPAPI / macOS Keychain.
+            </p>
+          </section>
+
+          <section class="panel-card">
+            <h3 data-i18n="outputSettingsHeading">Cutout &amp; Export Settings</h3>
+
+            <div class="field-row">
+              <label for="bgModeSelect" data-i18n="bgLabel">Background</label>
+              <select id="bgModeSelect" class="select-input">
+                <option value="transparent" data-i18n="bgTransparent">Transparent</option>
+                <option value="white" data-i18n="bgWhite">Pure White (#FFFFFF)</option>
+                <option value="color" data-i18n="bgCustom">Custom Solid Color</option>
+                <option value="zip" data-i18n="bgZip">4-File Editable Layer Pack (.zip)</option>
+              </select>
+            </div>
+
+            <div class="field-row" id="customColorRow" hidden>
+              <label for="bgColorPicker" data-i18n="customColorLabel">Background Hex</label>
+              <div class="color-picker-group">
+                <input type="color" id="bgColorPicker" value="#ffffff" />
+                <input type="text" id="bgColorHexInput" class="text-input mono" maxlength="7" value="#FFFFFF" />
+              </div>
+            </div>
+
+            <div class="field-grid-2">
+              <div class="field-row">
+                <label for="formatSelect" data-i18n="formatLabel">Format</label>
+                <select id="formatSelect" class="select-input">
+                  <option value="png">PNG</option>
+                  <option value="webp">WebP</option>
+                  <option value="jpg">JPG</option>
+                  <option value="zip">ZIP</option>
+                </select>
+              </div>
+
+              <div class="field-row">
+                <label for="sizeSelect" data-i18n="resolutionLabel">Resolution</label>
+                <select id="sizeSelect" class="select-input">
+                  <option value="full" data-i18n="sizeFull">Full (up to 25 MP)</option>
+                  <option value="preview" data-i18n="sizePreview">Preview (0.25 MP)</option>
+                  <option value="4k" data-i18n="size4k">4K (up to 10 MP)</option>
+                  <option value="hd" data-i18n="sizeHd">HD (up to 4 MP)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="toggle-group">
+              <label class="checkbox-row">
+                <input type="checkbox" id="cropCheckbox" />
+                <span data-i18n="autoCropLabel">Trim transparent bounds (Auto-Crop)</span>
+              </label>
+              <div class="sub-field" id="cropMarginRow" hidden>
+                <label for="cropMarginSelect" data-i18n="cropMarginLabel">Padding</label>
+                <select id="cropMarginSelect" class="select-input compact">
+                  <option value="0%">0%</option>
+                  <option value="5%">5%</option>
+                  <option value="10%">10%</option>
+                  <option value="15%">15%</option>
+                </select>
+              </div>
+
+              <label class="checkbox-row">
+                <input type="checkbox" id="shadowCheckbox" />
+                <span data-i18n="addShadowLabel">Add realistic ground/drop shadow</span>
+              </label>
+              <div class="sub-field" id="shadowTypeRow" hidden>
+                <label for="shadowTypeSelect" data-i18n="shadowStyleLabel">Style</label>
+                <select id="shadowTypeSelect" class="select-input compact">
+                  <option value="drop" data-i18n="shadowDrop">Drop</option>
+                  <option value="auto" data-i18n="shadowAuto">Auto</option>
+                  <option value="car" data-i18n="shadowCar">Car / Vehicle</option>
+                  <option value="soft" data-i18n="shadowSoft">Soft</option>
+                  <option value="contact" data-i18n="shadowContact">Contact</option>
+                </select>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel-card">
+            <h3 data-i18n="workflowHeading">Output Folder &amp; Concurrency</h3>
+
+            <div class="field-row">
+              <label data-i18n="outputFolderLabel">Destination Folder</label>
+              <div class="folder-picker-box">
+                <span class="folder-path" id="outputDirLabel" data-i18n="defaultOutputDir">
+                  Auto (remove-ac-output next to source)
+                </span>
+                <div class="folder-btns">
+                  <button type="button" class="secondary-btn small" id="chooseOutputDirBtn" data-i18n="chooseBtn">
+                    Choose…
+                  </button>
+                  <button type="button" class="text-btn" id="resetOutputDirBtn" hidden data-i18n="resetBtn">
+                    Reset
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="field-row">
+              <div class="slider-header">
+                <label for="concurrencyRange" data-i18n="concurrencyLabel">Parallel GPU Workers</label>
+                <strong id="concurrencyValue">3×</strong>
+              </div>
+              <input type="range" id="concurrencyRange" min="1" max="8" step="1" value="3" />
+            </div>
+
+            <div class="toggle-group">
+              <label class="checkbox-row">
+                <input type="checkbox" id="recursiveCheckbox" checked />
+                <span data-i18n="recursiveLabel">Scan subfolders &amp; preserve folder tree</span>
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" id="skipExistingCheckbox" />
+                <span data-i18n="skipExistingLabel">Skip images that already have cutouts</span>
+              </label>
+            </div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <div class="modal-backdrop" id="previewModal" hidden>
+      <div class="modal-dialog" role="dialog" aria-modal="true">
+        <div class="modal-header">
+          <strong id="previewModalTitle">Preview</strong>
+          <div class="modal-tabs">
+            <button type="button" class="tab-btn active" id="previewTabAfter" data-i18n="previewCutout">
+              Cutout Result
+            </button>
+            <button type="button" class="tab-btn" id="previewTabBefore" data-i18n="previewOriginal">
+              Original
+            </button>
+          </div>
+          <button type="button" class="icon-close-btn" id="closePreviewModalBtn" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-stage checkerboard" id="previewStage">
+          <img id="previewImageEl" alt="Preview" />
+        </div>
+        <div class="modal-footer">
+          <span class="modal-meta" id="previewMetaText"></span>
+          <button type="button" class="secondary-btn small" id="previewRevealBtn" data-i18n="revealInFolder">
+            Show in Folder
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>
