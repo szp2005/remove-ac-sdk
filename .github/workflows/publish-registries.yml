@@ -158,18 +158,54 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          registry-url: "https://registry.npmjs.org"
+          node-version: "24"
 
-      - name: Publish remove-ac to npmjs.org (when NPM_TOKEN is configured)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Ensure npm >= 11.5.1 for OIDC Trusted Publishing
         run: |
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "Skipping npmjs.org publish: secrets.NPM_TOKEN is not configured yet."
-            exit 0
+          set -euo pipefail
+          NPM_VER="$(npm --version)"
+          echo "Detected npm version: ${NPM_VER}"
+          node -e '
+            const [maj, min, pat] = process.argv[1].split(".").map(Number);
+            const ok = maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)));
+            process.exit(ok ? 0 : 1);
+          ' "$NPM_VER" || npm install -g "npm@^11.6.0"
+
+      - name: Publish remove-ac to npmjs.org (OIDC Trusted Publisher or NPM_TOKEN)
+        env:
+          NPM_TOKEN_OPT: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          TEMP_NPMRC=""
+          cleanup() {
+            if [ -n "$TEMP_NPMRC" ] && [ -f "$TEMP_NPMRC" ]; then
+              rm -f "$TEMP_NPMRC"
+            fi
+          }
+          trap cleanup EXIT
+          if [ -n "${NPM_TOKEN_OPT:-}" ]; then
+            echo "Using configured secrets.NPM_TOKEN for npmjs.org authentication."
+            TEMP_NPMRC="$(mktemp)"
+            chmod 600 "$TEMP_NPMRC"
+            printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN_OPT" > "$TEMP_NPMRC"
+            export NPM_CONFIG_USERCONFIG="$TEMP_NPMRC"
+          else
+            echo "Using GitHub Actions OIDC Trusted Publisher for npmjs.org authentication."
+            unset NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG
           fi
-          npm publish --provenance --access public
+          set +e
+          PUBLISH_OUT="$(npm publish --provenance --access public --registry=https://registry.npmjs.org 2>&1)"
+          PUBLISH_RC=$?
+          set -e
+          echo "$PUBLISH_OUT"
+          if [ "$PUBLISH_RC" -ne 0 ]; then
+            if echo "$PUBLISH_OUT" | grep -Eqi "EPUBLISHCONFLICT|409 Conflict|cannot publish over existing version|You cannot publish over the previously published versions"; then
+              echo "Version already published on npmjs.org; treating as idempotent skip."
+              exit 0
+            fi
+            echo "::error::npmjs.org publish failed with exit code ${PUBLISH_RC}"
+            exit "$PUBLISH_RC"
+          fi
 
   publish-pypi:
     needs: [verify]
@@ -194,4 +230,4 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build
           python -m twine check dist/*
-          python -m twine upload dist/*
+          python -m twine upload --skip-existing dist/*
