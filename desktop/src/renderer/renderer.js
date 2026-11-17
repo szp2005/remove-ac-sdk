@@ -15,7 +15,7 @@
       refreshCreditsAria: "Refresh credit balance",
       buyCredits: "Get Credits",
       dropTitle: "Drag & drop images or entire folders here",
-      dropSub: "PNG, JPG, WebP up to 25 MB & 40 MP per image · Zero disk storage on Cloud GPU",
+      dropSub: "PNG, JPG, WebP up to 25 MB & 50 MP per image · Zero disk storage on Cloud GPU",
       selectImages: "+ Select Images",
       selectFolder: "+ Select Folder",
       imagesCount: (n) => `${n} ${n === 1 ? "image" : "images"}`,
@@ -33,12 +33,13 @@
       cancelBatch: "Stop",
       startBatch: "Start Batch Cutout",
       apiKeyHeading: "Cloud GPU API Key",
-      getFreeKey: "Get Key (1 Free Credit) ↗",
+      getFreeKey: "Get Key (10 Welcome Credits) ↗",
       replaceKey: "Change",
       clearKey: "Clear",
       saveVerifyKey: "Save & Verify",
       cancelEditKey: "Cancel",
-      apiKeyHint: "Encrypted locally via Windows DPAPI / macOS Keychain.",
+      apiKeyHint:
+        "Includes 10 full-resolution welcome credits (valid 30 days) · Encrypted locally via Windows DPAPI / macOS Keychain.",
       apiKeySessionOnly: "Session-only memory mode (OS keyring unavailable).",
       apiKeyVerified: (c) => `Connected · ${c} credits available`,
       keyBadgeEncrypted: "Encrypted in OS Keychain",
@@ -53,11 +54,16 @@
       customColorHexAria: "Custom background hex color",
       formatLabel: "Format",
       resolutionLabel: "Resolution",
-      sizeAuto: "Auto (up to 25 MP)",
-      sizeFull: "Full (up to 25 MP)",
-      sizePreview: "Preview (0.25 MP)",
+      sizeAuto: "Auto (up to 50 MP)",
+      sizeFull: "Full (up to 50 MP)",
+      size50mp: "50 MP (up to 50 MP)",
+      size25mp: "25 MP (up to 25 MP)",
       size4k: "4K (up to 10 MP)",
       sizeHd: "HD (up to 4 MP)",
+      sizeMedium: "Medium (up to 1.5 MP)",
+      sizeRegular: "Regular (0.25 MP)",
+      sizeSmall: "Small (0.25 MP)",
+      sizePreview: "Preview (0.25 MP)",
       autoCropLabel: "Trim transparent bounds (Auto-Crop)",
       cropMarginLabel: "Padding",
       addShadowLabel: "Add realistic ground/drop shadow",
@@ -67,6 +73,8 @@
       shadowCar: "Car / Vehicle",
       shadowSoft: "Soft",
       shadowContact: "Contact",
+      shadowReflection: "Reflection",
+      shadowNone: "None",
       workflowHeading: "Output Folder & Concurrency",
       outputFolderLabel: "Destination Folder",
       defaultOutputDir: "Auto (remove-ac-output next to source)",
@@ -77,6 +85,8 @@
       skipExistingLabel: "Skip images that already have cutouts",
       previewCutout: "Cutout Result",
       previewOriginal: "Original",
+      previewUnavailable:
+        "Inline preview is unavailable for this file. Use “Show in Folder” below to view the full file.",
       closeModalAria: "Close preview",
       revealInFolder: "Show in Folder",
       badgeQueued: "Queued",
@@ -101,7 +111,7 @@
       refreshCreditsAria: "刷新积分余额",
       buyCredits: "充值 / 获取积分",
       dropTitle: "拖拽图片或整个文件夹到此处",
-      dropSub: "支持 PNG、JPG、WebP（单张最高 25 MB / 4000 万像素）· 云端 GPU 内存流式零落盘",
+      dropSub: "支持 PNG、JPG、WebP（单张最高 25 MB / 5000 万像素）· 云端 GPU 内存流式零落盘",
       selectImages: "+ 选择多张图片",
       selectFolder: "+ 选择整个文件夹",
       imagesCount: (n) => `共 ${n} 张图片`,
@@ -118,12 +128,12 @@
       cancelBatch: "停止",
       startBatch: "开始批量抠图",
       apiKeyHeading: "Cloud GPU API 密钥",
-      getFreeKey: "免费领密钥 (送 1 积分) ↗",
+      getFreeKey: "免费领密钥 (送 10 全清积分·30天有效) ↗",
       replaceKey: "更换",
       clearKey: "清除",
       saveVerifyKey: "保存并验证",
       cancelEditKey: "取消",
-      apiKeyHint: "使用系统级加密（Windows DPAPI / macOS 钥匙串）安全存储于本机。",
+      apiKeyHint: "新注册验证即享 10 个全分辨率欢迎积分（30 天有效）· 使用系统级钥匙串加密存储于本机。",
       apiKeySessionOnly: "当前系统密钥环不可用，密钥仅保存在本次内存会话中。",
       apiKeyVerified: (c) => `已连接 · 当前可用 ${c} 积分`,
       keyBadgeEncrypted: "系统钥匙串已加密",
@@ -138,11 +148,16 @@
       customColorHexAria: "自定义背景十六进制色号",
       formatLabel: "导出格式",
       resolutionLabel: "输出分辨率",
-      sizeAuto: "智能自动 (最高 25MP)",
-      sizeFull: "原图全高清 (最高 25MP)",
-      sizePreview: "预览尺寸 (0.25MP · 0.25积分)",
+      sizeAuto: "智能自动 (最高 50MP)",
+      sizeFull: "原图全高清 (最高 50MP)",
+      size50mp: "50MP 超高像素 (最高 50MP)",
+      size25mp: "25MP 高像素 (最高 25MP)",
       size4k: "4K 超清 (最高 10MP)",
       sizeHd: "HD 高清 (最高 4MP)",
+      sizeMedium: "中等尺寸 (最高 1.5MP)",
+      sizeRegular: "常规尺寸 (0.25MP)",
+      sizeSmall: "小尺寸 (0.25MP)",
+      sizePreview: "预览尺寸 (0.25MP · 0.25积分)",
       autoCropLabel: "自动裁切四周多余透明边",
       cropMarginLabel: "留白边距",
       addShadowLabel: "添加自然落地阴影 / 投影",
@@ -152,6 +167,8 @@
       shadowCar: "汽车接地阴影",
       shadowSoft: "柔和漫射",
       shadowContact: "底部接触阴影",
+      shadowReflection: "镜面倒影",
+      shadowNone: "无阴影",
       workflowHeading: "输出目录与并发加速",
       outputFolderLabel: "保存目录",
       defaultOutputDir: "自动（原图旁新建 remove-ac-output）",
@@ -162,6 +179,7 @@
       skipExistingLabel: "跳过已存在抠图结果的图片",
       previewCutout: "抠图结果",
       previewOriginal: "原图对比",
+      previewUnavailable: "当前文件暂无法内置预览，请点击下方「在文件夹中显示」直接查看原文件。",
       closeModalAria: "关闭预览弹窗",
       revealInFolder: "在文件夹中显示",
       badgeQueued: "排队中",
@@ -267,6 +285,16 @@
     renderKeySection();
     renderSettingsControls();
     renderQueue();
+    if (!el("previewModal").hidden && state.previewItem) {
+      const fallbackEl = el("previewFallbackMsg");
+      if (fallbackEl && !fallbackEl.hidden) {
+        const targetPath =
+          state.previewMode === "after" ? state.previewItem.outputPath : state.previewItem.inputPath;
+        const msg = t("previewUnavailable");
+        fallbackEl.textContent = msg;
+        el("previewMetaText").textContent = targetPath ? `${msg} · ${targetPath}` : msg;
+      }
+    }
   }
 
   function renderHeaderCredits() {
@@ -531,6 +559,8 @@
     renderSettingsControls();
   }
 
+  let previewRequestSeq = 0;
+
   async function openPreviewModal(item, triggerEl = null) {
     state.previewItem = item;
     state.previewMode = "after";
@@ -544,7 +574,16 @@
 
   function closePreviewModal() {
     if (el("previewModal").hidden) return;
+    previewRequestSeq += 1;
     el("previewModal").hidden = true;
+    const imgEl = el("previewImageEl");
+    imgEl.removeAttribute("src");
+    imgEl.hidden = false;
+    const fallbackEl = el("previewFallbackMsg");
+    if (fallbackEl) {
+      fallbackEl.hidden = true;
+      fallbackEl.textContent = "";
+    }
     state.previewItem = null;
     if (state.lastPreviewTriggerEl && state.lastPreviewTriggerEl.isConnected) {
       state.lastPreviewTriggerEl.focus();
@@ -555,14 +594,41 @@
   async function refreshPreviewStage() {
     const item = state.previewItem;
     if (!item) return;
+    const reqId = ++previewRequestSeq;
     el("previewTabAfter").classList.toggle("active", state.previewMode === "after");
     el("previewTabBefore").classList.toggle("active", state.previewMode === "before");
     const targetPath = state.previewMode === "after" ? item.outputPath : item.inputPath;
     const imgEl = el("previewImageEl");
+    const fallbackEl = el("previewFallbackMsg");
+    const metaEl = el("previewMetaText");
+
     imgEl.removeAttribute("src");
-    const res = await bridge.readPreviewDataUrl(targetPath);
-    if (res?.ok && res.dataUrl) {
+    imgEl.hidden = true;
+    if (fallbackEl) {
+      fallbackEl.hidden = true;
+      fallbackEl.textContent = "";
+    }
+    metaEl.textContent = targetPath || "";
+
+    let res = null;
+    try {
+      res = await bridge.readPreviewDataUrl(targetPath);
+    } catch {
+      res = null;
+    }
+    if (reqId !== previewRequestSeq || !state.previewItem) return;
+
+    if (res?.ok && typeof res.dataUrl === "string" && res.dataUrl) {
       imgEl.src = res.dataUrl;
+      imgEl.hidden = false;
+      metaEl.textContent = targetPath || "";
+    } else {
+      const msg = t("previewUnavailable");
+      if (fallbackEl) {
+        fallbackEl.textContent = msg;
+        fallbackEl.hidden = false;
+      }
+      metaEl.textContent = targetPath ? `${msg} · ${targetPath}` : msg;
     }
   }
 

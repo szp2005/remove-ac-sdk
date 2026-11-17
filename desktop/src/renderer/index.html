@@ -30,7 +30,7 @@
             <div class="brand-wordmark">
               <span class="brand-main">remove</span><span class="brand-suffix">ac</span>
             </div>
-            <span class="brand-badge" id="appVersionBadge">Desktop v1.0.0</span>
+            <span class="brand-badge" id="appVersionBadge">Desktop v1.1.0</span>
           </div>
         </div>
 
@@ -67,7 +67,7 @@
               Drag &amp; drop images or entire folders here
             </h2>
             <p class="dropzone-sub" data-i18n="dropSub">
-              PNG, JPG, WebP up to 25 MB &amp; 40 MP per image · Zero disk storage on Cloud GPU
+              PNG, JPG, WebP up to 25 MB &amp; 50 MP per image · Zero disk storage on Cloud GPU
             </p>
             <div class="dropzone-btns">
               <button type="button" class="primary-btn" id="pickFilesBtn" data-i18n="selectImages">
@@ -134,7 +134,7 @@
             <div class="panel-header">
               <h3 data-i18n="apiKeyHeading">Cloud GPU API Key</h3>
               <button type="button" class="link-btn" id="getApiKeyLinkBtn" data-i18n="getFreeKey">
-                Get Key (1 Free Credit) ↗
+                Get Key (10 Welcome Credits) ↗
               </button>
             </div>
 
@@ -167,7 +167,7 @@
               </button>
             </div>
             <p class="panel-note" id="apiKeyFeedback" data-i18n="apiKeyHint">
-              Encrypted locally via Windows DPAPI / macOS Keychain.
+              Includes 10 full-resolution welcome credits (valid 30 days) · Encrypted via OS Keychain.
             </p>
           </section>
 
@@ -214,11 +214,16 @@
               <div class="field-row">
                 <label for="sizeSelect" data-i18n="resolutionLabel">Resolution</label>
                 <select id="sizeSelect" class="select-input">
-                  <option value="auto" data-i18n="sizeAuto">Auto (up to 25 MP)</option>
-                  <option value="full" data-i18n="sizeFull">Full (up to 25 MP)</option>
-                  <option value="preview" data-i18n="sizePreview">Preview (0.25 MP)</option>
+                  <option value="auto" data-i18n="sizeAuto">Auto (up to 50 MP)</option>
+                  <option value="full" data-i18n="sizeFull">Full (up to 50 MP)</option>
+                  <option value="50mp" data-i18n="size50mp">50 MP (up to 50 MP)</option>
+                  <option value="25mp" data-i18n="size25mp">25 MP (up to 25 MP)</option>
                   <option value="4k" data-i18n="size4k">4K (up to 10 MP)</option>
                   <option value="hd" data-i18n="sizeHd">HD (up to 4 MP)</option>
+                  <option value="medium" data-i18n="sizeMedium">Medium (up to 1.5 MP)</option>
+                  <option value="regular" data-i18n="sizeRegular">Regular (0.25 MP)</option>
+                  <option value="small" data-i18n="sizeSmall">Small (0.25 MP)</option>
+                  <option value="preview" data-i18n="sizePreview">Preview (0.25 MP)</option>
                 </select>
               </div>
             </div>
@@ -250,6 +255,8 @@
                   <option value="car" data-i18n="shadowCar">Car / Vehicle</option>
                   <option value="soft" data-i18n="shadowSoft">Soft</option>
                   <option value="contact" data-i18n="shadowContact">Contact</option>
+                  <option value="reflection" data-i18n="shadowReflection">Reflection</option>
+                  <option value="none" data-i18n="shadowNone">None</option>
                 </select>
               </div>
             </div>
@@ -320,6 +327,7 @@
         </div>
         <div class="modal-stage checkerboard" id="previewStage">
           <img id="previewImageEl" alt="Preview" />
+          <p class="preview-empty-msg" id="previewFallbackMsg" hidden></p>
         </div>
         <div class="modal-footer">
           <span class="modal-meta" id="previewMetaText"></span>

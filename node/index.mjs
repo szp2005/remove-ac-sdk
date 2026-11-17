@@ -4,11 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   fetchWithoutRedirects,
+  isDisallowedRemoteUrl,
   isLoopbackTestOrigin,
   validateHttpsEndpointUrl,
+  validateRemoteImageUrl,
 } from "./net-safety.mjs";
 
-export const SDK_VERSION = "1.2.0";
+export const SDK_VERSION = "1.3.0";
 export const USER_AGENT = `remove-ac-node-sdk/${SDK_VERSION}`;
 
 export const VALID_SIZES = Object.freeze([
@@ -52,8 +54,109 @@ const VALID_SHADOW_SET = new Set(VALID_SHADOW_TYPES);
 
 const DEFAULT_BASE_URL = "https://remove.ac";
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 50_000_000;
+const MAX_IMAGE_DIMENSION = 50_000;
+const MAX_IMPROVE_TAG_LEN = 64;
+const MAX_IMPROVE_DESCRIPTION_LEN = 500;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
+
+function looksLikeUrlCandidate(raw) {
+  const s = String(raw || "").trim();
+  return /^[a-zA-Z][a-zA-Z0-9+.-]+:\/\//.test(s) || /^(data|javascript|file):/i.test(s);
+}
+
+function assertValidImageDimensions(bytes, label) {
+  const dims = parseImageDimensions(bytes);
+  if (!dims) return;
+  if (
+    dims.width > MAX_IMAGE_DIMENSION ||
+    dims.height > MAX_IMAGE_DIMENSION ||
+    dims.width * dims.height > MAX_IMAGE_PIXELS
+  ) {
+    throw new RemoveAcError(
+      400,
+      `${label} resolution ${dims.width}x${dims.height} exceeds 50 MP / 50,000 px maximum`,
+    );
+  }
+}
+
+function assertValidBinaryEnvelope(bytes, label) {
+  if (!bytes || bytes.byteLength === 0) {
+    throw new RemoveAcError(400, `${label} must not be empty`);
+  }
+  if (bytes.byteLength > MAX_UPLOAD_BYTES) {
+    throw new RemoveAcError(413, `${label} exceeds 25 MB maximum upload size (26214400 bytes)`);
+  }
+  assertValidImageDimensions(bytes, label);
+}
+
+function toNodeBuffer(val) {
+  if (Buffer.isBuffer(val)) return val;
+  if (val instanceof Uint8Array) return Buffer.from(val.buffer, val.byteOffset, val.byteLength);
+  if (val instanceof ArrayBuffer) return Buffer.from(val);
+  return null;
+}
+
+function inferImageMimeType(bytes, fileName = "") {
+  if (bytes && bytes.byteLength >= 12) {
+    if (
+      bytes[0] === 0x89 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x4e &&
+      bytes[3] === 0x47
+    ) {
+      return "image/png";
+    }
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+      return "image/jpeg";
+    }
+    if (
+      bytes[0] === 0x52 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x46 &&
+      bytes[8] === 0x57 &&
+      bytes[9] === 0x45 &&
+      bytes[10] === 0x42 &&
+      bytes[11] === 0x50
+    ) {
+      return "image/webp";
+    }
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) {
+      return "image/gif";
+    }
+  }
+  const ext = path.extname(String(fileName || "")).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "application/octet-stream";
+}
+
+function decodeBase64Image(rawB64, label) {
+  const trimmed = String(rawB64 || "").trim();
+  const withoutPrefix = trimmed.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/i, "");
+  const compact = withoutPrefix.replace(/\s+/g, "");
+  if (!compact || compact.length % 4 === 1) {
+    throw new RemoveAcError(400, `Invalid ${label}: malformed base64 payload`);
+  }
+  const padded = compact.length % 4 === 0 ? compact : compact + "=".repeat(4 - (compact.length % 4));
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(padded)) {
+    throw new RemoveAcError(400, `Invalid ${label}: malformed base64 payload`);
+  }
+  const bytes = Buffer.from(padded, "base64");
+  if (bytes.byteLength === 0) {
+    throw new RemoveAcError(400, `${label} must not be empty`);
+  }
+  if (bytes.byteLength > MAX_UPLOAD_BYTES) {
+    throw new RemoveAcError(413, `${label} exceeds 25 MB maximum upload size (26214400 bytes)`);
+  }
+  return { cleanB64: trimmed, bytes };
+}
 
 export function parseImageDimensions(input) {
   const bytes =
@@ -279,6 +382,32 @@ export class RemoveAcClient {
       }
     }
 
+    const rawBgColor =
+      options.bgColor !== undefined && options.bgColor !== null ? String(options.bgColor).trim() : "";
+    const rawBgImageUrl =
+      options.bgImageUrl !== undefined && options.bgImageUrl !== null ? String(options.bgImageUrl).trim() : "";
+    const hasBgImageFile = options.bgImageFile !== undefined && options.bgImageFile !== null;
+    const hasBgImageFileB64Arg = options.bgImageFileB64 !== undefined && options.bgImageFileB64 !== null;
+    if (hasBgImageFileB64Arg && typeof options.bgImageFileB64 !== "string") {
+      throw new RemoveAcError(400, "bgImageFileB64 must be a base64 string");
+    }
+    const rawBgImageFileB64 = hasBgImageFileB64Arg ? options.bgImageFileB64.trim() : "";
+    if (hasBgImageFileB64Arg && !rawBgImageFileB64) {
+      throw new RemoveAcError(400, "bgImageFileB64 must not be empty");
+    }
+
+    const bgSourceCount =
+      (rawBgColor ? 1 : 0) +
+      (rawBgImageUrl ? 1 : 0) +
+      (hasBgImageFile ? 1 : 0) +
+      (rawBgImageFileB64 ? 1 : 0);
+    if (bgSourceCount > 1) {
+      throw new RemoveAcError(
+        400,
+        "Specify at most one of bgColor, bgImageUrl, bgImageFile, or bgImageFileB64",
+      );
+    }
+
     if (options.idempotencyKey !== undefined) {
       const trimmedIdem = String(options.idempotencyKey).trim();
       if (!trimmedIdem || trimmedIdem.length > 255) {
@@ -287,23 +416,95 @@ export class RemoveAcClient {
     }
     const idem = options.idempotencyKey ? String(options.idempotencyKey).trim() : `sdk-${crypto.randomUUID()}`;
 
+    let bgFileBytes = null;
+    let bgFileName = "bg-image.png";
+    let bgFileMime = "application/octet-stream";
+    let bgB64Clean = "";
+    let bgB64DecodedBytes = null;
+
+    if (rawBgImageUrl) {
+      const bgUrlErr = await validateRemoteImageUrl(rawBgImageUrl, this.lookupImpl);
+      if (bgUrlErr) {
+        throw new RemoveAcError(400, `Disallowed bgImageUrl (${bgUrlErr})`);
+      }
+    }
+
+    if (hasBgImageFile) {
+      if (typeof options.bgImageFile === "string") {
+        const trimmedBgPath = options.bgImageFile.trim();
+        if (!trimmedBgPath || trimmedBgPath.includes("\0")) {
+          throw new RemoveAcError(400, "bgImageFile path must not be empty");
+        }
+        if (looksLikeUrlCandidate(trimmedBgPath)) {
+          throw new RemoveAcError(
+            400,
+            "bgImageFile expects a local file path or byte buffer; use bgImageUrl for remote URLs",
+          );
+        }
+        bgFileBytes = await fs.promises.readFile(trimmedBgPath);
+        bgFileName = path.basename(trimmedBgPath) || "bg-image.png";
+      } else {
+        const convertedBg = toNodeBuffer(options.bgImageFile);
+        if (!convertedBg) {
+          throw new RemoveAcError(
+            400,
+            "Unsupported bgImageFile source; expected file path string, Buffer, Uint8Array, or ArrayBuffer",
+          );
+        }
+        bgFileBytes = convertedBg;
+      }
+      assertValidBinaryEnvelope(bgFileBytes, "bgImageFile");
+      bgFileMime = inferImageMimeType(bgFileBytes, bgFileName);
+    } else if (rawBgImageFileB64) {
+      const decodedBg = decodeBase64Image(rawBgImageFileB64, "bgImageFileB64");
+      assertValidImageDimensions(decodedBg.bytes, "bgImageFileB64");
+      bgB64Clean = decodedBg.cleanB64;
+      bgB64DecodedBytes = decodedBg.bytes;
+      bgFileMime = inferImageMimeType(bgB64DecodedBytes, bgFileName);
+    }
+
     let sourceBytes = null;
     let sourceName = "image.png";
     let sourceUrl = null;
 
     if (typeof input === "string") {
-      if (/^https?:\/\//i.test(input)) {
-        sourceUrl = input;
-      } else {
-        sourceBytes = fs.readFileSync(input);
-        sourceName = path.basename(input);
+      const trimmedInput = input.trim();
+      if (!trimmedInput || input.includes("\0")) {
+        throw new RemoveAcError(400, "Unsupported input source");
       }
-    } else if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
-      sourceBytes = Buffer.from(input);
-    } else if (input instanceof ArrayBuffer) {
-      sourceBytes = Buffer.from(input);
+      if (looksLikeUrlCandidate(trimmedInput)) {
+        const srcUrlErr = await validateRemoteImageUrl(trimmedInput, this.lookupImpl);
+        if (srcUrlErr) {
+          throw new RemoveAcError(400, `Disallowed image_url (${srcUrlErr})`);
+        }
+        sourceUrl = trimmedInput;
+      } else {
+        sourceBytes = fs.readFileSync(trimmedInput);
+        sourceName = path.basename(trimmedInput) || "image.png";
+      }
     } else {
-      throw new RemoveAcError(400, "Unsupported input source");
+      const convertedInput = toNodeBuffer(input);
+      if (convertedInput) {
+        sourceBytes = convertedInput;
+      } else {
+        throw new RemoveAcError(400, "Unsupported input source");
+      }
+    }
+
+    if (sourceBytes !== null) {
+      assertValidBinaryEnvelope(sourceBytes, "Foreground image");
+    }
+
+    const ticketBgBytes = bgFileBytes || bgB64DecodedBytes;
+    if (
+      sourceBytes !== null &&
+      ticketBgBytes !== null &&
+      sourceBytes.byteLength + ticketBgBytes.byteLength > MAX_COMBINED_UPLOAD_BYTES
+    ) {
+      throw new RemoveAcError(
+        413,
+        "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+      );
     }
 
     const runViaTicket = async (suffix) => {
@@ -319,8 +520,14 @@ export class RemoveAcClient {
         ...(options.roi ? { roi: options.roi } : {}),
         ...(options.scale ? { scale: options.scale } : {}),
         ...(options.position ? { position: options.position } : {}),
-        ...(options.bgColor ? { bg_color: options.bgColor } : {}),
-        ...(options.bgImageUrl ? { bg_image_url: options.bgImageUrl } : {}),
+        ...(rawBgColor ? { bg_color: rawBgColor } : {}),
+        ...(rawBgImageUrl ? { bg_image_url: rawBgImageUrl } : {}),
+        ...(ticketBgBytes
+          ? {
+              bgImageSha256: sha256Hex(ticketBgBytes),
+              bgImageByteLength: ticketBgBytes.byteLength,
+            }
+          : {}),
         ...(options.crop !== undefined ? { crop: options.crop } : {}),
         ...(options.cropMargin ? { crop_margin: options.cropMargin } : {}),
         ...(options.addShadow !== undefined ? { add_shadow: options.addShadow } : {}),
@@ -342,7 +549,7 @@ export class RemoveAcClient {
       const tData = tJson?.data;
       const ticketToken = tData?.ticket;
       const directEndpoint = tData?.directEndpoint;
-      const rawHoldId = tData?.holdId ?? tData?.lock_id;
+      const rawHoldId = tData?.holdId ?? tData?.hold_id ?? tData?.lock_id;
       const rawReleaseToken = tData?.releaseToken ?? tData?.release_token;
       const holdId = typeof rawHoldId === "string" ? rawHoldId.trim() : "";
       const releaseToken = typeof rawReleaseToken === "string" ? rawReleaseToken.trim() : "";
@@ -367,6 +574,9 @@ export class RemoveAcClient {
       }
       const fd = new FormData();
       fd.set("image_file", new Blob([sourceBytes]), sourceName);
+      if (ticketBgBytes) {
+        fd.set("bg_image_file", new Blob([ticketBgBytes], { type: bgFileMime }), bgFileName);
+      }
       let dRes;
       try {
         dRes = await this._request(directEndpoint, {
@@ -379,10 +589,9 @@ export class RemoveAcClient {
         throw err;
       }
       if (!dRes.ok) {
-        if (dRes.status >= 502 && dRes.status <= 504) {
-          await this._releaseTicketHold(holdId, releaseToken);
-        }
-        throw new RemoveAcError(dRes.status, await dRes.text());
+        const errBody = await dRes.text();
+        await this._releaseTicketHold(holdId, releaseToken);
+        throw new RemoveAcError(dRes.status, errBody);
       }
       return {
         buffer: Buffer.from(await dRes.arrayBuffer()),
@@ -393,10 +602,18 @@ export class RemoveAcClient {
       };
     };
 
+    const syncBgWireBytes = bgFileBytes
+      ? bgFileBytes.byteLength
+      : bgB64Clean
+        ? Buffer.byteLength(bgB64Clean, "utf8")
+        : 0;
+
     if (
       sourceBytes &&
       (options.direct ||
         sourceBytes.byteLength > DIRECT_THRESHOLD_BYTES ||
+        (ticketBgBytes && ticketBgBytes.byteLength > DIRECT_THRESHOLD_BYTES) ||
+        sourceBytes.byteLength + syncBgWireBytes > DIRECT_THRESHOLD_BYTES ||
         shouldPreFlightViaTicket(sourceBytes, size, format, channels, Boolean(options.crop)))
     ) {
       return runViaTicket("direct");
@@ -414,8 +631,12 @@ export class RemoveAcClient {
       if (options.roi) fd.set("roi", options.roi);
       if (options.scale) fd.set("scale", options.scale);
       if (options.position) fd.set("position", options.position);
-      if (options.bgColor) fd.set("bg_color", options.bgColor);
-      if (options.bgImageUrl) fd.set("bg_image_url", options.bgImageUrl);
+      if (rawBgColor) fd.set("bg_color", rawBgColor);
+      if (rawBgImageUrl) fd.set("bg_image_url", rawBgImageUrl);
+      if (bgFileBytes) {
+        fd.set("bg_image_file", new Blob([bgFileBytes], { type: bgFileMime }), bgFileName);
+      }
+      if (bgB64Clean) fd.set("bg_image_file_b64", bgB64Clean);
       if (options.crop !== undefined) fd.set("crop", String(options.crop));
       if (options.cropMargin) fd.set("crop_margin", options.cropMargin);
       if (options.addShadow !== undefined) fd.set("add_shadow", String(options.addShadow));
@@ -454,6 +675,106 @@ export class RemoveAcClient {
       mediaType: res.headers.get("Content-Type") || "image/png",
     };
   }
+
+  async submitImprove(input, options = {}) {
+    if (!this.apiKey) throw new RemoveAcError(403, "Missing remove.ac API key");
+    const opts = options && typeof options === "object" ? options : {};
+
+    let cleanTag = "";
+    if (opts.tag !== undefined && opts.tag !== null) {
+      if (typeof opts.tag !== "string") {
+        throw new RemoveAcError(400, "tag must be a string");
+      }
+      cleanTag = opts.tag.trim();
+      if (cleanTag.includes("\0") || cleanTag.length > MAX_IMPROVE_TAG_LEN) {
+        throw new RemoveAcError(400, `tag must be ${MAX_IMPROVE_TAG_LEN} characters or fewer`);
+      }
+    }
+
+    let cleanDescription = "";
+    if (opts.description !== undefined && opts.description !== null) {
+      if (typeof opts.description !== "string") {
+        throw new RemoveAcError(400, "description must be a string");
+      }
+      cleanDescription = opts.description.trim();
+      if (cleanDescription.includes("\0") || cleanDescription.length > MAX_IMPROVE_DESCRIPTION_LEN) {
+        throw new RemoveAcError(
+          400,
+          `description must be ${MAX_IMPROVE_DESCRIPTION_LEN} characters or fewer`,
+        );
+      }
+    }
+
+    let imageBytes = null;
+    let imageName =
+      typeof opts.filename === "string" && opts.filename.trim()
+        ? path.basename(opts.filename.trim())
+        : "image.png";
+    let imageUrl = null;
+
+    if (typeof input === "string") {
+      const trimmed = input.trim();
+      if (!trimmed || input.includes("\0")) {
+        throw new RemoveAcError(400, "Unsupported input source");
+      }
+      if (looksLikeUrlCandidate(trimmed)) {
+        const urlErr = await validateRemoteImageUrl(trimmed, this.lookupImpl);
+        if (urlErr) {
+          throw new RemoveAcError(400, `Disallowed image_url (${urlErr})`);
+        }
+        imageUrl = trimmed;
+      } else {
+        imageBytes = await fs.promises.readFile(trimmed);
+        if (!(typeof opts.filename === "string" && opts.filename.trim())) {
+          imageName = path.basename(trimmed) || "image.png";
+        }
+      }
+    } else {
+      const converted = toNodeBuffer(input);
+      if (!converted) {
+        throw new RemoveAcError(400, "Unsupported input source");
+      }
+      imageBytes = converted;
+    }
+
+    if (imageBytes !== null) {
+      assertValidBinaryEnvelope(imageBytes, "Image input");
+    }
+
+    const fd = new FormData();
+    if (imageUrl) {
+      fd.set("image_url", imageUrl);
+    } else {
+      fd.set(
+        "image_file",
+        new Blob([imageBytes], { type: inferImageMimeType(imageBytes, imageName) }),
+        imageName,
+      );
+    }
+    if (cleanTag) {
+      fd.set("tag", cleanTag);
+    }
+    if (cleanDescription) {
+      fd.set("description", cleanDescription);
+    }
+
+    const res = await this._request(`${this.baseUrl}/v1.0/improve`, {
+      method: "POST",
+      headers: { "X-Api-Key": this.apiKey },
+      body: fd,
+    });
+    if (!res.ok) throw new RemoveAcError(res.status, await res.text());
+    const json = await res.json();
+    const unwrapped =
+      json && typeof json === "object" && json.data && typeof json.data === "object"
+        ? json.data
+        : json;
+    return {
+      ...(unwrapped && typeof unwrapped === "object" ? unwrapped : {}),
+      id: String(unwrapped?.id ?? ""),
+      status: String(unwrapped?.status ?? "submitted"),
+    };
+  }
 }
 
 export async function removeBackgroundFromImageFile(opts) {
@@ -469,6 +790,13 @@ export async function removeBackgroundFromImageFile(opts) {
 }
 
 export async function removeBackgroundFromImageUrl(opts) {
+  if (!opts || typeof opts.url !== "string" || !opts.url.trim()) {
+    throw new RemoveAcError(400, "Missing image URL");
+  }
+  const syncUrlErr = isDisallowedRemoteUrl(opts.url.trim());
+  if (syncUrlErr) {
+    throw new RemoveAcError(400, `Disallowed image_url (${syncUrlErr})`);
+  }
   const client = new RemoveAcClient({
     apiKey: opts.apiKey,
     baseUrl: opts.baseUrl,

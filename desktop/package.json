@@ -1,8 +1,8 @@
 {
   "name": "remove-ac-desktop",
   "productName": "Remove.ac",
-  "version": "1.0.0",
-  "description": "Remove.ac Desktop Bulk Background Remover — Standalone App for Windows, macOS & Linux",
+  "version": "1.1.0",
+  "description": "Remove.ac Desktop Bulk Background Remover — Standalone App for Windows, macOS & Linux (up to 25 MB / 50 MP)",
   "author": "remove.ac <support@remove.ac>",
   "homepage": "https://remove.ac/plugins/desktop",
   "license": "MIT",

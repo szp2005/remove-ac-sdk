@@ -324,18 +324,18 @@ test("MF-1 & MF-2: Node SDK and CLI block 3xx redirects without leaking X-Api-Ke
   }
 });
 
-test("v1.2.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight, CLI --flag=value/--concurrency/--version, and ticket hold release", async () => {
-  assert.equal(SDK_VERSION, "1.2.0");
-  assert.equal(USER_AGENT, "remove-ac-node-sdk/1.2.0");
-  assert.equal(CLI_VERSION, "1.2.0");
-  assert.equal(CLI_USER_AGENT, "remove-ac-cli/1.2.0");
+test("v1.3.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight, CLI --flag=value/--concurrency/--version, and ticket hold release", async () => {
+  assert.equal(SDK_VERSION, "1.3.0");
+  assert.equal(USER_AGENT, "remove-ac-node-sdk/1.3.0");
+  assert.equal(CLI_VERSION, "1.3.0");
+  assert.equal(CLI_USER_AGENT, "remove-ac-cli/1.3.0");
   assert.ok(VALID_SIZES.includes("25mp") && VALID_SIZES.includes("50mp"));
   assert.deepEqual(VALID_SIZES, CLI_VALID_SIZES);
 
   // CLI --version / -v
   const verRun = spawnSync(process.execPath, [cliBinPath, "--version"], { encoding: "utf8" });
   assert.equal(verRun.status, 0);
-  assert.equal(verRun.stdout.trim(), "1.2.0");
+  assert.equal(verRun.stdout.trim(), "1.3.0");
 
   // Exact README Section 3 invocations parse cleanly
   const readmeBatch = parseCliArgs([
@@ -435,8 +435,8 @@ test("v1.2.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight,
       fetchImpl: mockHandler(cliTrace),
     });
 
-    for (const item of sdkTrace) assert.equal(item.ua, "remove-ac-node-sdk/1.2.0");
-    for (const item of cliTrace) assert.equal(item.ua, "remove-ac-cli/1.2.0");
+    for (const item of sdkTrace) assert.equal(item.ua, "remove-ac-node-sdk/1.3.0");
+    for (const item of cliTrace) assert.equal(item.ua, "remove-ac-cli/1.3.0");
     return { sdkUrls: sdkTrace.map((x) => x.url), cliUrls: cliTrace.map((x) => x.url) };
   };
 
@@ -529,4 +529,431 @@ test("v1.2.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight,
   assert.equal(cliFailOut.ok, false);
   assert.equal(cliFailOut.status, 502);
   assert.deepEqual(cliReleasePayloads, [{ holdId: "hold_cli_1", releaseToken: "rel_cli_secret_1" }]);
+});
+
+test("v1.3.0 bgImageFile, bgImageFileB64, combined >4 MB ticket routing, mutual exclusion, and submitImprove", async () => {
+  const crypto = await import("node:crypto");
+  const tempBase = fs.existsSync("/Volumes/Expansion/dev-tools/build-temp")
+    ? "/Volumes/Expansion/dev-tools/build-temp"
+    : os.tmpdir();
+  const tmpDir = fs.mkdtempSync(path.join(tempBase, "rac-sdk-v130-"));
+
+  try {
+    const bgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+    const bgPath = path.join(tmpDir, "backdrop.png");
+    fs.writeFileSync(bgPath, bgBytes);
+
+    // 1. Mutual exclusion & invalid bgImageFile checks with 0 HTTP calls
+    let blockedCalls = 0;
+    const guardClient = new RemoveAcClient({
+      apiKey: "rac_live_guard",
+      fetch: async () => {
+        blockedCalls += 1;
+        return new Response("unexpected");
+      },
+    });
+    for (const badOpts of [
+      { bgColor: "FFFFFF", bgImageFile: bgBytes },
+      { bgImageUrl: "https://example.com/bg.jpg", bgImageFile: bgPath },
+      { bgColor: "000000", bgImageFileB64: bgBytes.toString("base64") },
+      { bgImageFile: bgBytes, bgImageFileB64: bgBytes.toString("base64") },
+      { bgImageFile: Buffer.alloc(0) },
+      { bgImageFile: "" },
+      { bgImageFile: "https://example.com/not-local.png" },
+      { bgImageFileB64: "   " },
+      { bgImageFileB64: "!!!not-base64!!!" },
+    ]) {
+      await assert.rejects(
+        () => guardClient.removeBackground(Buffer.from([1, 2, 3]), badOpts),
+        (err) => err instanceof RemoveAcError && err.statusCode === 400,
+      );
+    }
+    await assert.rejects(
+      () =>
+        guardClient.removeBackground(Buffer.from([1, 2, 3]), {
+          bgImageFile: Buffer.alloc(25 * 1024 * 1024 + 1, 0x11),
+        }),
+      (err) => err instanceof RemoveAcError && err.statusCode === 413,
+    );
+    assert.equal(blockedCalls, 0);
+
+    // 2. Sync /v1.0/removebg multipart with bgImageFile (path, Uint8Array subarray, ArrayBuffer) and bgImageFileB64
+    const seenSyncForms = [];
+    const syncClient = new RemoveAcClient({
+      apiKey: "rac_live_sync",
+      fetch: async (url, init) => {
+        assert.equal(String(url), "https://remove.ac/v1.0/removebg");
+        seenSyncForms.push(init.body);
+        return new Response(Buffer.from("CUTOUT_OK"), {
+          status: 200,
+          headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+        });
+      },
+    });
+
+    await syncClient.removeBackground(Buffer.from("fg1"), { bgImageFile: bgPath });
+    const paddedU8 = new Uint8Array([99, ...bgBytes, 88]);
+    await syncClient.removeBackground(Buffer.from("fg2"), {
+      bgImageFile: paddedU8.subarray(1, 1 + bgBytes.length),
+    });
+    const ab = bgBytes.buffer.slice(bgBytes.byteOffset, bgBytes.byteOffset + bgBytes.byteLength);
+    await syncClient.removeBackground(Buffer.from("fg3"), { bgImageFile: ab });
+    await syncClient.removeBackground(Buffer.from("fg4"), {
+      bgImageFileB64: bgBytes.toString("base64"),
+    });
+
+    assert.equal(seenSyncForms.length, 4);
+    for (let i = 0; i < 3; i++) {
+      const bgBlob = seenSyncForms[i].get("bg_image_file");
+      assert.ok(bgBlob instanceof Blob);
+      assert.deepEqual(Buffer.from(await bgBlob.arrayBuffer()), bgBytes);
+    }
+    assert.equal(seenSyncForms[0].get("bg_image_file").name, "backdrop.png");
+    assert.equal(seenSyncForms[3].get("bg_image_file_b64"), bgBytes.toString("base64"));
+
+    // 3. Combined foreground (2.5 MB) + bgImageFile (2.5 MB) > 4 MB routes automatically via /v1.0/removebg/ticket
+    const fg25 = Buffer.alloc(Math.floor(2.5 * 1024 * 1024), 0xaa);
+    const bg25 = Buffer.alloc(Math.floor(2.5 * 1024 * 1024), 0xbb);
+    const expectedFgSha = crypto.createHash("sha256").update(fg25).digest("hex");
+    const expectedBgSha = crypto.createHash("sha256").update(bg25).digest("hex");
+
+    let capturedTicketBody = null;
+    let capturedDirectForm = null;
+    const ticketClient = new RemoveAcClient({
+      apiKey: "rac_live_ticket_bg",
+      lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      fetch: async (url, init) => {
+        if (String(url).endsWith("/v1.0/removebg/ticket")) {
+          capturedTicketBody = JSON.parse(init.body);
+          return Response.json({
+            data: {
+              ticket: "tkt_combined_bg",
+              directEndpoint: "https://gpu.example.invalid/v1.0/direct-cutout",
+            },
+          });
+        }
+        assert.equal(String(url), "https://gpu.example.invalid/v1.0/direct-cutout");
+        assert.equal(init.headers.Authorization, "Bearer tkt_combined_bg");
+        capturedDirectForm = init.body;
+        return new Response(Buffer.from("DIRECT_BG_OK"), {
+          status: 200,
+          headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+        });
+      },
+    });
+
+    const tOut = await ticketClient.removeBackground(fg25, { bgImageFile: bg25, size: "50mp" });
+    assert.equal(tOut.buffer.toString("utf8"), "DIRECT_BG_OK");
+    assert.equal(capturedTicketBody.foregroundSha256, expectedFgSha);
+    assert.equal(capturedTicketBody.foregroundByteLength, fg25.byteLength);
+    assert.equal(capturedTicketBody.bgImageSha256, expectedBgSha);
+    assert.equal(capturedTicketBody.bgImageByteLength, bg25.byteLength);
+    assert.equal((await capturedDirectForm.get("image_file").arrayBuffer()).byteLength, fg25.byteLength);
+    assert.equal((await capturedDirectForm.get("bg_image_file").arrayBuffer()).byteLength, bg25.byteLength);
+
+    // 4. submitImprove supports local file path, bytes, and image_url with tag & description
+    const improveCalls = [];
+    const improveClient = new RemoveAcClient({
+      apiKey: "rac_live_improve",
+      fetch: async (url, init) => {
+        improveCalls.push({ url: String(url), headers: init.headers, body: init.body });
+        return Response.json({ data: { id: `imp_${improveCalls.length}`, status: "received" } });
+      },
+    });
+
+    const imp1 = await improveClient.submitImprove(bgPath, {
+      tag: "hair-edge",
+      description: "Fine flyaway strands against studio backdrop",
+    });
+    assert.equal(imp1.id, "imp_1");
+    assert.equal(imp1.status, "received");
+    assert.equal(improveCalls[0].url, "https://remove.ac/v1.0/improve");
+    assert.equal(improveCalls[0].headers["X-Api-Key"], "rac_live_improve");
+    assert.equal(improveCalls[0].headers["User-Agent"], "remove-ac-node-sdk/1.3.0");
+    assert.equal(improveCalls[0].body.get("tag"), "hair-edge");
+    assert.equal(improveCalls[0].body.get("description"), "Fine flyaway strands against studio backdrop");
+    assert.equal(improveCalls[0].body.get("image_file").name, "backdrop.png");
+
+    const imp2 = await improveClient.submitImprove("https://example.com/hard-case.jpg", {
+      tag: "glass",
+    });
+    assert.equal(imp2.id, "imp_2");
+    assert.equal(improveCalls[1].body.get("image_url"), "https://example.com/hard-case.jpg");
+    assert.equal(improveCalls[1].body.get("tag"), "glass");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("R2 MF-01, MF-02 & MF-03: SSRF URL guards, submitImprove bounds, all-non-2xx hold release, <=30 MB combined envelope, and CLI --bg-image hardening", async () => {
+  const TINY_PNG = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "base64",
+  );
+  const png54Mp = Buffer.alloc(64);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]).copy(png54Mp, 0);
+  png54Mp.write("IHDR", 12, "ascii");
+  png54Mp.writeUInt32BE(9000, 16);
+  png54Mp.writeUInt32BE(6000, 20);
+
+  // 1. MF-01: Upfront SSRF validation on submitImprove, removeBackground (image_url & bgImageUrl), and removeBackgroundFromImageUrl (0 HTTP calls)
+  let ssrfHttpHits = 0;
+  const ssrfClient = new RemoveAcClient({
+    apiKey: "rac_live_ssrf_guard",
+    lookup: async () => [{ address: "169.254.169.254", family: 4 }],
+    fetch: async () => {
+      ssrfHttpHits += 1;
+      return Response.json({ data: { id: "leaked", status: "accepted" } });
+    },
+  });
+
+  const disallowedUrls = [
+    "http://169.254.169.254/latest/meta-data/",
+    "http://127.0.0.1:8080/internal.png",
+    "http://[::ffff:127.0.0.1]/secret.png",
+    "http://[64:ff9b::169.254.169.254]/secret.png",
+    "http://100.64.0.1/cgnat.png",
+    "http://localhost/admin.png",
+    "http://service.internal/img.png",
+    "http://2130706433/decimal.png",
+    "http://0x7f000001/hex.png",
+    "http://user:pass@example.com/private.png",
+    "ftp://example.com/file.png",
+    "file:///etc/passwd",
+    "https://rebind.attacker.example/img.png",
+  ];
+
+  for (const badUrl of disallowedUrls) {
+    await assert.rejects(
+      () => ssrfClient.submitImprove(badUrl, { tag: "probe" }),
+      (err) => err instanceof RemoveAcError && err.statusCode === 400,
+    );
+    await assert.rejects(
+      () => ssrfClient.removeBackground(badUrl),
+      (err) => err instanceof RemoveAcError && err.statusCode === 400,
+    );
+    await assert.rejects(
+      () => ssrfClient.removeBackground(TINY_PNG, { bgImageUrl: badUrl }),
+      (err) => err instanceof RemoveAcError && err.statusCode === 400,
+    );
+  }
+  await assert.rejects(
+    () =>
+      removeBackgroundFromImageUrl({
+        apiKey: "rac_live_ssrf_guard",
+        url: "/etc/passwd",
+        fetch: async () => {
+          ssrfHttpHits += 1;
+          return new Response(TINY_PNG);
+        },
+      }),
+    (err) => err instanceof RemoveAcError && err.statusCode === 400,
+  );
+
+  // submitImprove tag (<=64), description (<=500), 0-byte, >25MB, and >50MP checks
+  await assert.rejects(
+    () => ssrfClient.submitImprove(TINY_PNG, { tag: "t".repeat(65) }),
+    (err) => err instanceof RemoveAcError && err.statusCode === 400,
+  );
+  await assert.rejects(
+    () => ssrfClient.submitImprove(TINY_PNG, { description: "d".repeat(501) }),
+    (err) => err instanceof RemoveAcError && err.statusCode === 400,
+  );
+  await assert.rejects(
+    () => ssrfClient.submitImprove(Buffer.alloc(0)),
+    (err) => err instanceof RemoveAcError && err.statusCode === 400,
+  );
+  await assert.rejects(
+    () => ssrfClient.submitImprove(Buffer.alloc(25 * 1024 * 1024 + 1, 0x22)),
+    (err) => err instanceof RemoveAcError && err.statusCode === 413,
+  );
+  await assert.rejects(
+    () => ssrfClient.submitImprove(png54Mp),
+    (err) => err instanceof RemoveAcError && err.statusCode === 400,
+  );
+  assert.equal(ssrfHttpHits, 0, "All invalid URLs and bounds must fail before any HTTP call");
+
+  // 2. MF-02: Combined >30 MB envelope rejected upfront (0 HTTP calls) + hold released on ALL non-2xx directEndpoint statuses
+  let envelopeHits = 0;
+  const envClient = new RemoveAcClient({
+    apiKey: "rac_live_env",
+    fetch: async () => {
+      envelopeHits += 1;
+      return new Response(TINY_PNG);
+    },
+  });
+  await assert.rejects(
+    () => envClient.removeBackground(Buffer.alloc(0)),
+    (err) => err instanceof RemoveAcError && err.statusCode === 400,
+  );
+  await assert.rejects(
+    () => envClient.removeBackground(Buffer.alloc(25 * 1024 * 1024 + 1, 0x11)),
+    (err) => err instanceof RemoveAcError && err.statusCode === 413,
+  );
+  await assert.rejects(
+    () => envClient.removeBackground(png54Mp),
+    (err) => err instanceof RemoveAcError && err.statusCode === 400,
+  );
+  await assert.rejects(
+    () => envClient.removeBackground(TINY_PNG, { bgImageFile: png54Mp }),
+    (err) => err instanceof RemoveAcError && err.statusCode === 400,
+  );
+  await assert.rejects(
+    () =>
+      envClient.removeBackground(Buffer.alloc(18 * 1024 * 1024, 0xaa), {
+        bgImageFile: Buffer.alloc(16 * 1024 * 1024, 0xbb),
+      }),
+    (err) => err instanceof RemoveAcError && err.statusCode === 413,
+  );
+  assert.equal(envelopeHits, 0);
+
+  for (const status of [400, 401, 403, 413, 415, 422, 429, 500, 502, 503, 504]) {
+    let sdkReleases = 0;
+    const c = new RemoveAcClient({
+      apiKey: "rac_live_hold_matrix",
+      lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      fetch: async (url) => {
+        const u = String(url);
+        if (u.endsWith("/v1.0/removebg/ticket")) {
+          return Response.json({
+            data: {
+              ticket: `t_${status}`,
+              directEndpoint: "https://gpu.example.invalid/v1.0/direct-cutout",
+              holdId: `h_${status}`,
+              releaseToken: `r_${status}`,
+            },
+          });
+        }
+        if (u.endsWith("/v1.0/removebg/ticket/release")) {
+          sdkReleases += 1;
+          return Response.json({ ok: true });
+        }
+        return new Response(`err_${status}`, { status });
+      },
+    });
+    await assert.rejects(
+      () => c.removeBackground(TINY_PNG, { direct: true }),
+      (err) => err instanceof RemoveAcError && err.statusCode === status,
+    );
+    assert.equal(sdkReleases, 1, `Node SDK must release ticket hold on directEndpoint HTTP ${status}`);
+
+    let cliReleases = 0;
+    const cliOut = await processImageBuffer({
+      bytes: TINY_PNG,
+      fileName: "fg.png",
+      mimeType: "image/png",
+      opts: parseCliArgs(["fg.png", "--direct", "--api-key=rac_live_hold_matrix"]),
+      baseUrl: "https://remove.ac",
+      lookupFn: async () => [{ address: "93.184.216.34", family: 4 }],
+      fetchImpl: async (url) => {
+        const u = String(url);
+        if (u.endsWith("/v1.0/removebg/ticket")) {
+          return Response.json({
+            data: {
+              ticket: `tc_${status}`,
+              directEndpoint: "https://gpu.example.invalid/v1.0/direct-cutout",
+              holdId: `hc_${status}`,
+              releaseToken: `rc_${status}`,
+            },
+          });
+        }
+        if (u.endsWith("/v1.0/removebg/ticket/release")) {
+          cliReleases += 1;
+          return Response.json({ ok: true });
+        }
+        return new Response(`err_${status}`, { status });
+      },
+    });
+    assert.equal(cliOut.ok, false);
+    assert.equal(cliOut.status, status);
+    assert.equal(cliReleases, 1, `CLI must release ticket hold on directEndpoint HTTP ${status}`);
+  }
+
+  // 3. MF-03: CLI --bg-color + --bg-image conflict, 0-byte/fake-magic/oversize/SSRF --bg-image, and processImageBuffer auto-resolving opts.bgImage
+  assert.throws(
+    () => parseCliArgs(["fg.png", "--bg-color", "ffffff", "--bg-image", "bg.png"]),
+    /Cannot combine --bg-color and --bg-image/,
+  );
+
+  const tempBase = fs.existsSync("/Volumes/Expansion/dev-tools/build-temp")
+    ? "/Volumes/Expansion/dev-tools/build-temp"
+    : os.tmpdir();
+  const tmpDir = fs.mkdtempSync(path.join(tempBase, "rac-cli-mf03-"));
+  try {
+    const fgPath = path.join(tmpDir, "fg.png");
+    const bgPath = path.join(tmpDir, "bg.png");
+    const emptyBgPath = path.join(tmpDir, "empty.png");
+    const fakePngPath = path.join(tmpDir, "disguised.png");
+    const dotEnvPath = path.join(tmpDir, "secret.env");
+    fs.writeFileSync(fgPath, TINY_PNG);
+    fs.writeFileSync(bgPath, TINY_PNG);
+    fs.writeFileSync(emptyBgPath, Buffer.alloc(0));
+    fs.writeFileSync(fakePngPath, "SUPER_SECRET_TOKEN=12345\n");
+    fs.writeFileSync(dotEnvPath, "SUPER_SECRET_TOKEN=12345\n");
+
+    let cliNetHits = 0;
+    const neverFetch = async () => {
+      cliNetHits += 1;
+      return new Response(TINY_PNG);
+    };
+
+    for (const badBg of [
+      emptyBgPath,
+      fakePngPath,
+      dotEnvPath,
+      "http://169.254.169.254/latest/meta-data",
+      "https://rebind.attacker.example/bg.png",
+    ]) {
+      await assert.rejects(() =>
+        processImageBuffer({
+          bytes: TINY_PNG,
+          fileName: "fg.png",
+          mimeType: "image/png",
+          opts: parseCliArgs(["fg.png", `--bg-image=${badBg}`, "--api-key=rac_live_cli"]),
+          baseUrl: "https://remove.ac",
+          lookupFn: async () => [{ address: "169.254.169.254", family: 4 }],
+          fetchImpl: neverFetch,
+        }),
+      );
+    }
+
+    // Combined >30 MB via processImageBuffer
+    const bigValidBgPath = path.join(tmpDir, "big-bg.png");
+    fs.writeFileSync(bigValidBgPath, Buffer.concat([TINY_PNG, Buffer.alloc(16 * 1024 * 1024, 0)]));
+    await assert.rejects(
+      () =>
+        processImageBuffer({
+          bytes: Buffer.concat([TINY_PNG, Buffer.alloc(15 * 1024 * 1024, 0)]),
+          fileName: "fg.png",
+          mimeType: "image/png",
+          opts: parseCliArgs(["fg.png", `--bg-image=${bigValidBgPath}`, "--api-key=rac_live_cli"]),
+          baseUrl: "https://remove.ac",
+          fetchImpl: neverFetch,
+        }),
+      /exceeds 30 MB/,
+    );
+    assert.equal(cliNetHits, 0);
+
+    // Exported processImageBuffer resolves opts.bgImage automatically when bgInput is omitted
+    let sawBgFilePart = false;
+    const okOut = await processImageBuffer({
+      bytes: TINY_PNG,
+      fileName: "fg.png",
+      mimeType: "image/png",
+      opts: parseCliArgs(["fg.png", `--bg-image=${bgPath}`, "--api-key=rac_live_cli"]),
+      baseUrl: "https://remove.ac",
+      fetchImpl: async (_url, init) => {
+        const bgPart = init.body.get("bg_image_file");
+        sawBgFilePart = bgPart instanceof Blob && bgPart.type === "image/png";
+        return new Response(TINY_PNG, {
+          status: 200,
+          headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+        });
+      },
+    });
+    assert.equal(okOut.ok, true);
+    assert.equal(sawBgFilePart, true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

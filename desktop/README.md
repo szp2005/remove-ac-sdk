@@ -1,4 +1,4 @@
-# Remove.ac Desktop App (`v1.0.0`)
+# Remove.ac Desktop App (`v1.1.0`)
 
 Standalone native Electron desktop application for **[remove.ac](https://remove.ac/plugins/desktop)** — built for high-volume bulk AI background removal on **Windows 10/11 (`.exe`)**, **macOS Universal (`.dmg`)**, and **Linux x64 (`.AppImage`)**.
 
@@ -6,10 +6,10 @@ Standalone native Electron desktop application for **[remove.ac](https://remove.
 
 - **Zero Runtime Dependencies for End Users:** Ships a self-contained Electron 45 (Chromium + Node) binary — no Node.js, Python, or system WebView installation required.
 - **Drag-and-Drop Folders & Thousands of Photos:** Recursively scans nested directories, preserves subfolder hierarchy under `remove-ac-output` (or a custom destination folder), and automatically excludes previous output folders to prevent duplicate re-ingestion.
-- **Up to 25 MB / 40 MP Input & 25 MP Output:** Files above 4 MB seamlessly negotiate a 180-second HMAC direct ticket (`POST /v1.0/remove/ticket`) and stream straight to ephemeral Cloud GPU memory with zero disk storage.
+- **Up to 25 MB / 50 MP Input & 50 MP Output:** Files above 4 MB (or high-resolution lossless PNGs across `25mp`, `50mp`, `full`, and `auto`) seamlessly negotiate a 180-second HMAC direct ticket (`POST /v1.0/remove/ticket`) and stream straight to ephemeral Cloud GPU memory with zero disk storage. Verified accounts start with **10 full-resolution welcome credits (valid 30 days)**.
 - **OS Keychain Encryption:** Encrypts your `rac_live_...` API key locally via Windows DPAPI (`CryptProtectData`), macOS Keychain, or Linux Secret Service (`safeStorage`).
 - **System Proxy Aware:** Uses Chromium's native OS networking stack (`electron.net.fetch`) so Windows / macOS system proxies, PAC rules, and enterprise TLS roots work out of the box.
-- **Bilingual Native Studio (`English` / `简体中文`):** Switch between transparent PNG/WebP, pure `#FFFFFF` marketplace white, custom hex colors, or 4-file editable `.zip` layer packs, plus auto-crop, realistic drop/car/contact shadows, `1×–8×` parallel GPU workers, and side-by-side cutout preview.
+- **Bilingual Native Studio (`English` / `简体中文`):** Switch between transparent PNG/WebP, pure `#FFFFFF` marketplace white, custom hex colors, or 4-file editable `.zip` layer packs, plus auto-crop, realistic drop/car/contact/reflection shadows, `1×–8×` parallel GPU workers, and side-by-side cutout preview.
 
 ## Local Development & Verification
 
@@ -25,9 +25,9 @@ npm start         # Launch interactive desktop window
 
 ```bash
 cd desktop
-npm run dist:win    # -> dist/remove-ac-for-windows-1.0.0.exe (NSIS) + dist/remove-ac-portable-1.0.0.exe
-npm run dist:mac    # -> dist/remove-ac-for-macos-1.0.0.dmg (Universal arm64 + x64)
-npm run dist:linux  # -> dist/remove-ac-for-linux-1.0.0.AppImage (x64)
+npm run dist:win    # -> dist/remove-ac-for-windows-1.1.0.exe (NSIS) + dist/remove-ac-portable-1.1.0.exe
+npm run dist:mac    # -> dist/remove-ac-for-macos-1.1.0.dmg (Universal arm64 + x64)
+npm run dist:linux  # -> dist/remove-ac-for-linux-1.1.0.AppImage (x64)
 ```
 
 ### Unsigned Binary Notes (First Launch)

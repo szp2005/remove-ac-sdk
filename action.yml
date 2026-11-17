@@ -1,13 +1,13 @@
 name: "remove.ac Background Remover"
 author: "remove.ac"
-description: "Drop-in /v1.0/removebg Cloud GPU background removal for local files, folders, or URLs (up to 25 MB zero-disk streaming)."
+description: "Drop-in /v1.0/removebg Cloud GPU background removal for local files, folders, or URLs (up to 25 MB / 50 MP zero-disk streaming)."
 branding:
   icon: "scissors"
   color: "purple"
 
 inputs:
   api_key:
-    description: "remove.ac API key (rac_live_...). Falls back to REMOVE_AC_API_KEY env var."
+    description: "remove.ac API key (rac_live_...). Claim 10 full-resolution welcome credits (valid 30 days) at https://remove.ac/api-info. Falls back to REMOVE_AC_API_KEY env var."
     required: false
   input_path:
     description: "Local image file (.png, .jpg, .jpeg, .webp) or folder of images inside GITHUB_WORKSPACE."
@@ -35,6 +35,18 @@ inputs:
     default: "png"
   bg_color:
     description: "Optional solid background hex color (e.g. 'FFFFFF') instead of transparency."
+    required: false
+  bg-image-file:
+    description: "Optional local background image file (.png, .jpg, .jpeg, .webp, up to 25 MB / 50 MP) inside GITHUB_WORKSPACE."
+    required: false
+  bg-image-url:
+    description: "Optional public https:// or http:// background image URL to composite behind the subject."
+    required: false
+  bg_image_file:
+    description: "Alias for bg-image-file (local background image file path)."
+    required: false
+  bg_image_url:
+    description: "Alias for bg-image-url (public background image URL)."
     required: false
   crop:
     description: "Trim transparent padding around the foreground subject ('true' or 'false')."

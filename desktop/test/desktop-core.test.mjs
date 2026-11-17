@@ -9,20 +9,31 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const {
+  ALLOWED_SHADOW_TYPES,
+  ALLOWED_SIZES,
   CredentialManager,
   DesktopApiClient,
+  MAX_INPUT_PIXELS,
+  MAX_PREVIEW_FALLBACK_BYTES,
+  MAX_PREVIEW_FILE_BYTES,
   areSameOrCaseCollidingPaths,
   collectInputItems,
   isPlausibleApiKey,
   maskApiKey,
   parseImageDimensions,
   parseRetryAfterMs,
+  readPreviewDataUrlPayload,
   resolveOutputTarget,
   runBatchQueue,
   sanitizeSettings,
+  shouldPreFlightViaTicket,
   validateServiceEndpointUrl,
   writeFileAtomically,
 } = require("../src/core.cjs");
+
+const DESKTOP_TEST_TMP_ROOT = fs.existsSync("/Volumes/Expansion/dev-tools/build-temp")
+  ? "/Volumes/Expansion/dev-tools/build-temp"
+  : os.tmpdir();
 
 function makeTinyPng(width = 4, height = 3) {
   const crcTable = new Uint32Array(256);
@@ -122,7 +133,7 @@ test("validateServiceEndpointUrl enforces strict HTTPS and first-party/GPU host 
 });
 
 test("CredentialManager encrypts API keys via safeStorage and never writes plaintext keys", async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "rac-desk-cred-"));
+  const tmpDir = fs.mkdtempSync(path.join(DESKTOP_TEST_TMP_ROOT, "rac-desk-cred-"));
   try {
     let keychainCalls = 0;
     const fakeSafeStorage = {
@@ -162,7 +173,7 @@ test("CredentialManager encrypts API keys via safeStorage and never writes plain
     assert.equal(await mgr2.getApiKey(), "rac_live_SecretToken9876");
 
     // When OS keyring is unavailable, keep key in session memory only (no disk write)
-    const tmpNoKeyring = fs.mkdtempSync(path.join(os.tmpdir(), "rac-desk-nokeyring-"));
+    const tmpNoKeyring = fs.mkdtempSync(path.join(DESKTOP_TEST_TMP_ROOT, "rac-desk-nokeyring-"));
     const mgrNoEnc = new CredentialManager({
       storageDir: tmpNoKeyring,
       safeStorage: { isAsyncEncryptionAvailable: async () => false },
@@ -178,7 +189,7 @@ test("CredentialManager encrypts API keys via safeStorage and never writes plain
 });
 
 test("collectInputItems & resolveOutputTarget preserve subfolders, skip output folders & avoid collisions", () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "rac-desk-scan-"));
+  const tmpDir = fs.mkdtempSync(path.join(DESKTOP_TEST_TMP_ROOT, "rac-desk-scan-"));
   try {
     const png = makeTinyPng(4, 4);
     fs.mkdirSync(path.join(tmpDir, "shoes", "sneakers"), { recursive: true });
@@ -423,18 +434,59 @@ test("DesktopApiClient handles /v1.0/account, /v1.0/remove, 503 retries, 413 tic
       /Refused untrusted direct host/
     );
 
-    // 4. Rejects >40 MP image locally before touching network
+    // 4. Accepts 48 MP (<= 50 MP) via ticket and rejects >50 MP image locally before touching network
+    maliciousDirectUrl = false;
+    const png48Mp = makeFakeLargeHeaderPng(8000, 6000); // 48 MP
+    const r48 = await client.removeBackgroundBuffer(
+      png48Mp,
+      "48mp.png",
+      sanitizeSettings({ size: "50mp", format: "png", addShadow: true, shadowType: "reflection" })
+    );
+    assert.equal(r48.buffer.length, pngOut.length);
+
     const prevRemoveCalls = removeCalls;
     const prevTicketCalls = ticketCalls;
-    const hugePng = makeFakeLargeHeaderPng(8000, 6000); // 48 MP
+    const hugePng = makeFakeLargeHeaderPng(9000, 6000); // 54 MP
     await assert.rejects(
-      () => client.removeBackgroundBuffer(hugePng, "48mp.png", {}),
-      /exceeds 40 MP maximum/
+      () => client.removeBackgroundBuffer(hugePng, "54mp.png", {}),
+      /exceeds 50 MP maximum/
     );
     assert.equal(removeCalls, prevRemoveCalls);
     assert.equal(ticketCalls, prevTicketCalls);
   } finally {
     server.close();
+  }
+});
+
+test("Desktop v1.1.0 enforces 50 MP ceiling, full size/shadow parity, and accurate ticket preflight tiers", () => {
+  assert.equal(MAX_INPUT_PIXELS, 50_000_000);
+  assert.deepEqual(
+    ALLOWED_SIZES,
+    new Set(["auto", "full", "50mp", "25mp", "4k", "hd", "medium", "regular", "small", "preview"])
+  );
+  assert.ok(ALLOWED_SHADOW_TYPES.has("reflection") && ALLOWED_SHADOW_TYPES.has("none"));
+
+  assert.equal(sanitizeSettings({ size: "50mp" }).size, "50mp");
+  assert.equal(sanitizeSettings({ size: "25mp" }).size, "25mp");
+  assert.equal(sanitizeSettings({ size: "medium" }).size, "medium");
+  assert.equal(sanitizeSettings({ shadowType: "reflection" }).shadowType, "reflection");
+  assert.equal(sanitizeSettings({ shadowType: "none" }).shadowType, "none");
+
+  const png8Mp = makeFakeLargeHeaderPng(4000, 2000); // 8 MP
+  const png20Mp = makeFakeLargeHeaderPng(5000, 4000); // 20 MP
+  const png45Mp = makeFakeLargeHeaderPng(9000, 5000); // 45 MP
+
+  // Preview/small/regular/medium/hd stay <= 4 MP -> never preflight
+  for (const tier of ["preview", "small", "regular", "medium", "hd"]) {
+    assert.equal(shouldPreFlightViaTicket(png45Mp, tier, "png", false), false);
+  }
+  // 4k caps at 10 MP: 8 MP uncropped (>5 MP) preflights; 20 MP cropped (capped at 10 MP <= 10 MP) stays sync
+  assert.equal(shouldPreFlightViaTicket(png8Mp, "4k", "png", false), true);
+  assert.equal(shouldPreFlightViaTicket(png20Mp, "4k", "png", true), false);
+  // 25mp, 50mp, full, auto on 20 MP and 45 MP preflight via ticket
+  for (const hiTier of ["25mp", "50mp", "full", "auto"]) {
+    assert.equal(shouldPreFlightViaTicket(png20Mp, hiTier, "png", true), true);
+    assert.equal(shouldPreFlightViaTicket(png45Mp, hiTier, "png", true), true);
   }
 });
 
@@ -668,7 +720,7 @@ test("DesktopApiClient releases ticket holds on transport failure/abort, honors 
 
 test("after-pack.cjs strips _CodeSignature on *-temp universal staging dirs and only signs final bundle", async () => {
   const afterPack = require("../scripts/after-pack.cjs").default;
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rac-afterpack-"));
+  const tmpRoot = fs.mkdtempSync(path.join(DESKTOP_TEST_TMP_ROOT, "rac-afterpack-"));
   try {
     const tempOutDir = path.join(tmpRoot, "mac-universal-arm64-temp");
     const sigDir = path.join(
@@ -693,5 +745,123 @@ test("after-pack.cjs strips _CodeSignature on *-temp universal staging dirs and 
     assert.equal(fs.existsSync(sigDir), false);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("R2 MF-06: Desktop preview handler supports up to 90 MB 50 MP PNGs & 35 MB WebP cutouts and renderer surfaces localized fallback message", async () => {
+  assert.equal(MAX_PREVIEW_FILE_BYTES, 90 * 1024 * 1024);
+  assert.equal(MAX_PREVIEW_FALLBACK_BYTES, 35 * 1024 * 1024);
+
+  const tmpDir = fs.mkdtempSync(path.join(DESKTOP_TEST_TMP_ROOT, "rac-desk-mf06-"));
+  try {
+    const png60Mb = path.join(tmpDir, "cutout-50mp.png");
+    const png91Mb = path.join(tmpDir, "cutout-too-big.png");
+    const webp20Mb = path.join(tmpDir, "cutout-50mp.webp");
+    const webp36Mb = path.join(tmpDir, "cutout-huge.webp");
+    const zipPath = path.join(tmpDir, "layers.zip");
+
+    // Sparse/allocated test files on Expansion build-temp
+    const validWebpHeader = Buffer.from(
+      "UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAfQ//73v/+BiOh/AAA=",
+      "base64"
+    );
+    fs.writeFileSync(png60Mb, makeFakeLargeHeaderPng(8000, 6000));
+    fs.truncateSync(png60Mb, 60 * 1024 * 1024);
+
+    fs.writeFileSync(png91Mb, makeFakeLargeHeaderPng(8000, 6000));
+    fs.truncateSync(png91Mb, 91 * 1024 * 1024);
+
+    fs.writeFileSync(webp20Mb, validWebpHeader);
+    fs.truncateSync(webp20Mb, 20 * 1024 * 1024);
+
+    fs.writeFileSync(webp36Mb, validWebpHeader);
+    fs.truncateSync(webp36Mb, 36 * 1024 * 1024);
+
+    fs.writeFileSync(zipPath, Buffer.from("PK\x03\x04"));
+
+    const allowedFilePaths = new Set([png60Mb, png91Mb, webp20Mb, webp36Mb, zipPath]);
+
+    // Simulate Electron 45 nativeImage: decodes PNGs & downscales >960px, but returns isEmpty()=true on WebP
+    const mockElectron45NativeImage = {
+      createFromPath(p) {
+        if (p.endsWith(".webp")) {
+          return { isEmpty: () => true };
+        }
+        return {
+          isEmpty: () => false,
+          getSize: () => ({ width: 8000, height: 6000 }),
+          resize: ({ width }) => ({
+            toDataURL: () => `data:image/png;base64,DOWNSCALED_${width}`,
+          }),
+        };
+      },
+    };
+
+    // 1. Unauthorized path blocked
+    const unauth = await readPreviewDataUrlPayload(path.join(tmpDir, "other.png"), {
+      allowedFilePaths,
+      nativeImageImpl: mockElectron45NativeImage,
+    });
+    assert.equal(unauth.ok, false);
+    assert.equal(unauth.code, "forbidden_path");
+
+    // 2. ZIP blocked cleanly
+    const zipRes = await readPreviewDataUrlPayload(zipPath, {
+      allowedFilePaths,
+      nativeImageImpl: mockElectron45NativeImage,
+    });
+    assert.equal(zipRes.ok, false);
+    assert.equal(zipRes.code, "zip_no_preview");
+
+    // 3. 60 MB (>30 MB old limit, <=90 MB new limit) 50 MP PNG succeeds via nativeImage downscale to 960px
+    const pngOk = await readPreviewDataUrlPayload(png60Mb, {
+      allowedFilePaths,
+      nativeImageImpl: mockElectron45NativeImage,
+    });
+    assert.equal(pngOk.ok, true);
+    assert.equal(pngOk.width, 8000);
+    assert.equal(pngOk.height, 6000);
+    assert.equal(pngOk.dataUrl, "data:image/png;base64,DOWNSCALED_960");
+
+    // 4. >90 MB PNG rejected before decoding
+    const pngTooBig = await readPreviewDataUrlPayload(png91Mb, {
+      allowedFilePaths,
+      nativeImageImpl: mockElectron45NativeImage,
+    });
+    assert.equal(pngTooBig.ok, false);
+    assert.equal(pngTooBig.code, "invalid_preview_size");
+
+    // 5. 20 MB (>15 MB old limit, <=35 MB new limit) WebP succeeds via fallback data URL when nativeImage.isEmpty() === true
+    const webpOk = await readPreviewDataUrlPayload(webp20Mb, {
+      allowedFilePaths,
+      nativeImageImpl: mockElectron45NativeImage,
+    });
+    assert.equal(webpOk.ok, true);
+    assert.ok(webpOk.dataUrl.startsWith("data:image/webp;base64,"));
+    assert.equal(webpOk.width, 1);
+    assert.equal(webpOk.height, 1);
+
+    // 6. >35 MB WebP rejected cleanly without OOM
+    const webpTooBig = await readPreviewDataUrlPayload(webp36Mb, {
+      allowedFilePaths,
+      nativeImageImpl: mockElectron45NativeImage,
+    });
+    assert.equal(webpTooBig.ok, false);
+    assert.equal(webpTooBig.code, "decode_failed");
+
+    // 7. Renderer & HTML wire localized en + zh-CN previewUnavailable fallback
+    const rendererJs = fs.readFileSync(
+      path.resolve(path.dirname(new URL(import.meta.url).pathname), "../src/renderer/renderer.js"),
+      "utf8"
+    );
+    const indexHtml = fs.readFileSync(
+      path.resolve(path.dirname(new URL(import.meta.url).pathname), "../src/renderer/index.html"),
+      "utf8"
+    );
+    assert.match(indexHtml, /id="previewFallbackMsg"/);
+    assert.match(rendererJs, /previewUnavailable:\s*"Inline preview is unavailable/);
+    assert.match(rendererJs, /previewUnavailable:\s*"当前文件暂无法内置预览/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Zero-dependency GitHub Action entrypoint (node20) for remove.ac (/v1.0/removebg).
+ * Zero-dependency GitHub Action entrypoint v1.3.0 (node20) for remove.ac (/v1.0/removebg).
  * Supports single local image files, batch folders, and SSRF-validated public image URLs.
  */
 
@@ -12,6 +12,10 @@ import { fileURLToPath } from "node:url";
 import { RemoveAcClient } from "../node/index.mjs";
 import { validateRemoteImageUrl } from "../node/net-safety.mjs";
 
+export const ACTION_VERSION = "1.3.0";
+const MAX_ACTION_FG_BYTES = 25 * 1024 * 1024;
+const MAX_ACTION_BG_BYTES = 25 * 1024 * 1024;
+const MAX_ACTION_COMBINED_BYTES = 30 * 1024 * 1024;
 const SUPPORTED_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 const ALLOWED_SIZES = new Set(["auto", "preview", "small", "regular", "medium", "hd", "4k", "25mp", "50mp", "full"]);
 const ALLOWED_FORMATS = new Set(["png", "jpg", "webp", "zip"]);
@@ -21,8 +25,19 @@ const ALLOWED_SHADOW_TYPES = new Set(["auto", "car", "drop", "soft", "contact", 
 function readInput(env, name, fallback = "") {
   const upper = name.toUpperCase();
   const hyphenUpper = upper.replace(/_/g, "-");
-  const raw = env[`INPUT_${upper}`] ?? env[`INPUT_${hyphenUpper}`] ?? fallback;
-  return String(raw ?? "").trim();
+  const hasUpper = env[`INPUT_${upper}`] !== undefined && env[`INPUT_${upper}`] !== null;
+  const hasHyphen =
+    hyphenUpper !== upper &&
+    env[`INPUT_${hyphenUpper}`] !== undefined &&
+    env[`INPUT_${hyphenUpper}`] !== null;
+  const vUpper = hasUpper ? String(env[`INPUT_${upper}`]).trim() : "";
+  const vHyphen = hasHyphen ? String(env[`INPUT_${hyphenUpper}`]).trim() : "";
+  if (vUpper && vHyphen && vUpper !== vHyphen) {
+    throw new Error(`Conflicting inputs provided for '${name}' and '${name.replace(/_/g, "-")}'.`);
+  }
+  if (vUpper) return vUpper;
+  if (vHyphen) return vHyphen;
+  return String(fallback ?? "").trim();
 }
 
 function parseBool(val, defaultVal = false) {
@@ -263,6 +278,8 @@ export async function runGithubAction({
   const size = readInput(env, "size", "full").toLowerCase();
   const format = readInput(env, "format", "png").toLowerCase();
   const bgColor = readInput(env, "bg_color", "");
+  const rawBgImageFile = readInput(env, "bg_image_file", "");
+  const rawBgImageUrl = readInput(env, "bg_image_url", "");
   const crop = parseBool(readInput(env, "crop", "false"), false);
   const fgType = readInput(env, "type", "auto").toLowerCase();
   const addShadow = parseBool(readInput(env, "add_shadow", "false"), false);
@@ -274,6 +291,12 @@ export async function runGithubAction({
   if (!ALLOWED_TYPES.has(fgType)) throw new Error(`Unsupported type '${fgType}'`);
   if (shadowType && !ALLOWED_SHADOW_TYPES.has(shadowType)) {
     throw new Error(`Unsupported shadow_type '${shadowType}'`);
+  }
+
+  const bgOptionCount =
+    (bgColor ? 1 : 0) + (rawBgImageFile ? 1 : 0) + (rawBgImageUrl ? 1 : 0);
+  if (bgOptionCount > 1) {
+    throw new Error("Provide at most one of 'bg_color', 'bg-image-file', or 'bg-image-url'.");
   }
 
   const baseUrl = await validateActionBaseUrl(rawBaseUrl, {
@@ -288,6 +311,47 @@ export async function runGithubAction({
 
   if ((rawInputPath && rawImageUrl) || (!rawInputPath && !rawImageUrl)) {
     throw new Error("Provide exactly one of 'input_path' or 'image_url'.");
+  }
+
+  let resolvedBgImageFile = "";
+  let canonicalBgImageFile = "";
+  let bgFileByteLength = 0;
+  if (rawBgImageFile) {
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]+:\/\//.test(rawBgImageFile) || /^(data|javascript|file):/i.test(rawBgImageFile)) {
+      throw new Error("'bg-image-file' must be a local file path; use 'bg-image-url' for remote URLs.");
+    }
+    resolvedBgImageFile = resolveSafeActionPath(rawBgImageFile, {
+      env,
+      cwd,
+      allowOutsideWorkspace,
+      forWrite: false,
+    });
+    if (!fs.existsSync(resolvedBgImageFile)) {
+      throw new Error(`bg-image-file does not exist: ${resolvedBgImageFile}`);
+    }
+    const bgStat = fs.statSync(resolvedBgImageFile);
+    if (!bgStat.isFile()) {
+      throw new Error(`bg-image-file must be a regular file: ${resolvedBgImageFile}`);
+    }
+    const bgExt = path.extname(resolvedBgImageFile).toLowerCase();
+    if (!SUPPORTED_EXTS.has(bgExt)) {
+      throw new Error(
+        `Unsupported bg-image-file extension '${bgExt}' (expected .png, .jpg, .jpeg, or .webp)`
+      );
+    }
+    if (bgStat.size <= 0) {
+      throw new Error(`bg-image-file must not be empty: ${resolvedBgImageFile}`);
+    }
+    if (bgStat.size > MAX_ACTION_BG_BYTES) {
+      throw new Error(`bg-image-file exceeds 25 MB limit: ${resolvedBgImageFile}`);
+    }
+    canonicalBgImageFile = fs.realpathSync(resolvedBgImageFile);
+    bgFileByteLength = bgStat.size;
+  } else if (rawBgImageUrl) {
+    const bgSsrfErr = await validateRemoteImageUrl(rawBgImageUrl, lookupFn);
+    if (bgSsrfErr) {
+      throw new Error(`Disallowed bg-image-url (${bgSsrfErr})`);
+    }
   }
 
   const client = new RemoveAcClient({
@@ -305,6 +369,8 @@ export async function runGithubAction({
     addShadow,
   };
   if (bgColor) cutoutOpts.bgColor = bgColor;
+  if (resolvedBgImageFile) cutoutOpts.bgImageFile = resolvedBgImageFile;
+  if (rawBgImageUrl) cutoutOpts.bgImageUrl = rawBgImageUrl;
   if (shadowType) cutoutOpts.shadowType = shadowType;
 
   const generatedFiles = [];
@@ -327,6 +393,11 @@ export async function runGithubAction({
       allowOutsideWorkspace,
       forWrite: true,
     });
+    if (canonicalBgImageFile && canonicalizePathWithRealAncestor(destPath) === canonicalBgImageFile) {
+      throw new Error(
+        `Refusing to overwrite bg-image-file with output_path: ${destPath}`
+      );
+    }
     if (!overwrite && fs.existsSync(destPath)) {
       throw new Error(`Output file already exists: ${destPath}`);
     }
@@ -355,6 +426,17 @@ export async function runGithubAction({
       if (!SUPPORTED_EXTS.has(ext)) {
         throw new Error(`Unsupported input image extension '${ext}' (expected .png, .jpg, .jpeg, or .webp)`);
       }
+      if (st.size <= 0) {
+        throw new Error(`input_path must not be empty: ${srcPath}`);
+      }
+      if (st.size > MAX_ACTION_FG_BYTES) {
+        throw new Error(`input_path exceeds 25 MB limit: ${srcPath}`);
+      }
+      if (bgFileByteLength > 0 && st.size + bgFileByteLength > MAX_ACTION_COMBINED_BYTES) {
+        throw new Error(
+          `Combined input_path and bg-image-file size exceeds 30 MB limit (${st.size + bgFileByteLength} bytes)`
+        );
+      }
       const destPath = rawOutputPath
         ? resolveSafeActionPath(rawOutputPath, { env, cwd, allowOutsideWorkspace, forWrite: true })
         : resolveSafeActionPath(defaultCutoutPath(srcPath, format), {
@@ -363,6 +445,11 @@ export async function runGithubAction({
             allowOutsideWorkspace,
             forWrite: true,
           });
+      if (canonicalBgImageFile && canonicalizePathWithRealAncestor(destPath) === canonicalBgImageFile) {
+        throw new Error(
+          `Refusing to overwrite bg-image-file with output_path: ${destPath}`
+        );
+      }
       if (!overwrite && fs.existsSync(destPath)) {
         throw new Error(`Output file already exists: ${destPath}`);
       }
@@ -382,6 +469,11 @@ export async function runGithubAction({
             allowOutsideWorkspace,
             forWrite: true,
           });
+      if (canonicalBgImageFile && canonicalizePathWithRealAncestor(outDir) === canonicalBgImageFile) {
+        throw new Error(
+          `Refusing to use bg-image-file path as output_dir: ${outDir}`
+        );
+      }
       fs.mkdirSync(outDir, { recursive: true });
       const sameDir = fs.realpathSync(srcPath) === fs.realpathSync(outDir);
 
@@ -392,6 +484,10 @@ export async function runGithubAction({
           const ext = path.extname(d.name).toLowerCase();
           if (!SUPPORTED_EXTS.has(ext)) return false;
           if (sameDir && path.basename(d.name, ext).endsWith("-nobg")) return false;
+          if (canonicalBgImageFile) {
+            const candidateReal = fs.realpathSync(path.join(srcPath, d.name));
+            if (candidateReal === canonicalBgImageFile) return false;
+          }
           return true;
         })
         .map((d) => d.name)
@@ -402,8 +498,20 @@ export async function runGithubAction({
       }
 
       const outExt = format === "jpg" ? ".jpg" : format === "webp" ? ".webp" : format === "zip" ? ".zip" : ".png";
-      for (const fileName of entries) {
+      const batchPlan = entries.map((fileName) => {
         const itemSrc = path.join(srcPath, fileName);
+        const itemStat = fs.statSync(itemSrc);
+        if (itemStat.size <= 0) {
+          throw new Error(`Batch input image must not be empty: ${itemSrc}`);
+        }
+        if (itemStat.size > MAX_ACTION_FG_BYTES) {
+          throw new Error(`Batch input image exceeds 25 MB limit: ${itemSrc}`);
+        }
+        if (bgFileByteLength > 0 && itemStat.size + bgFileByteLength > MAX_ACTION_COMBINED_BYTES) {
+          throw new Error(
+            `Combined batch image '${fileName}' and bg-image-file size exceeds 30 MB limit (${itemStat.size + bgFileByteLength} bytes)`
+          );
+        }
         const stem = path.basename(fileName, path.extname(fileName));
         const outName = sameDir ? `${stem}-nobg${outExt}` : `${stem}${outExt}`;
         const itemDest = resolveSafeActionPath(path.join(outDir, outName), {
@@ -412,9 +520,18 @@ export async function runGithubAction({
           allowOutsideWorkspace,
           forWrite: true,
         });
+        if (canonicalBgImageFile && canonicalizePathWithRealAncestor(itemDest) === canonicalBgImageFile) {
+          throw new Error(
+            `Refusing to overwrite bg-image-file with batch output: ${itemDest}`
+          );
+        }
         if (!overwrite && fs.existsSync(itemDest)) {
           throw new Error(`Output file already exists: ${itemDest}`);
         }
+        return { itemSrc, itemDest };
+      });
+
+      for (const { itemSrc, itemDest } of batchPlan) {
         const res = await client.removeBackground(itemSrc, cutoutOpts);
         writeBufferAtomically(itemDest, res.buffer, overwrite);
         generatedFiles.push(itemDest);
@@ -453,9 +570,13 @@ const isMain =
   fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
 
 if (isMain) {
+  if (process.argv.includes("--version") || process.argv.includes("-v")) {
+    process.stdout.write(`${ACTION_VERSION}\n`);
+    process.exit(0);
+  }
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     process.stdout.write(
-      "remove.ac GitHub Action runner (node20)\nUsage: set INPUT_API_KEY and INPUT_INPUT_PATH or INPUT_IMAGE_URL.\n"
+      `remove.ac GitHub Action runner v${ACTION_VERSION} (node20)\nUsage: set INPUT_API_KEY and INPUT_INPUT_PATH or INPUT_IMAGE_URL.\n`
     );
     process.exit(0);
   }
