@@ -19,6 +19,7 @@ import {
   fetchWithoutRedirects,
   isLoopbackTestOrigin,
   validateHttpsEndpointUrl,
+  validateRemoteImageUrl,
 } from "../node/net-safety.mjs";
 
 export const CLI_VERSION = "1.3.0";
@@ -65,9 +66,67 @@ const VALID_SHADOW_SET = new Set(VALID_SHADOW_TYPES);
 const DEFAULT_BASE_URL = "https://remove.ac";
 const SUPPORTED_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const DIRECT_STREAM_THRESHOLD_BYTES = 4 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 50_000_000;
+const MAX_IMAGE_DIMENSION = 50_000;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
 const MAX_CONCURRENCY = 8;
+
+function detectSupportedImageMime(bytes) {
+  if (!bytes || bytes.byteLength < 4) return null;
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.byteLength >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+function assertCliBinaryBounds(bytes, label) {
+  if (!bytes || bytes.byteLength === 0) {
+    throw new Error(`${label} must not be empty.`);
+  }
+  if (bytes.byteLength > MAX_UPLOAD_BYTES) {
+    throw new Error(`${label} exceeds 25 MB maximum upload size (26214400 bytes).`);
+  }
+  const dims = parseImageDimensions(bytes);
+  if (
+    dims &&
+    (dims.width > MAX_IMAGE_DIMENSION ||
+      dims.height > MAX_IMAGE_DIMENSION ||
+      dims.width * dims.height > MAX_IMAGE_PIXELS)
+  ) {
+    throw new Error(
+      `${label} resolution ${dims.width}x${dims.height} exceeds 50 MP / 50,000 px maximum.`,
+    );
+  }
+}
 
 export function parseImageDimensions(input) {
   const bytes =
@@ -201,6 +260,11 @@ function normalizeAndValidateCliEnums(opts) {
     }
   } else {
     opts.shadowType = "";
+  }
+  opts.bgColor = opts.bgColor !== undefined && opts.bgColor !== null ? String(opts.bgColor).trim() : "";
+  opts.bgImage = opts.bgImage !== undefined && opts.bgImage !== null ? String(opts.bgImage).trim() : "";
+  if (opts.bgColor && opts.bgImage) {
+    throw new Error("Cannot combine --bg-color and --bg-image; specify at most one background option.");
   }
 }
 
@@ -368,9 +432,17 @@ export function parseArgs(argv) {
     } else if (arg === "--position") {
       opts.position = nextValue() || "";
     } else if (arg === "--bg-color") {
-      opts.bgColor = nextValue() || "";
+      const next = nextValue();
+      if (!next || !String(next).trim() || (!hasInline && String(next).startsWith("-"))) {
+        throw new Error("--bg-color requires a non-empty hex color value.");
+      }
+      opts.bgColor = String(next).trim();
     } else if (arg === "--bg-image") {
-      opts.bgImage = nextValue() || "";
+      const next = nextValue();
+      if (!next || !String(next).trim() || (!hasInline && String(next).startsWith("-"))) {
+        throw new Error("--bg-image requires a non-empty local file path or http(s):// URL.");
+      }
+      opts.bgImage = String(next).trim();
     } else if (arg === "--endpoint") {
       opts.endpoint = nextValue() || DEFAULT_BASE_URL;
     } else {
@@ -382,7 +454,7 @@ export function parseArgs(argv) {
   return opts;
 }
 
-export function collectFiles(inputs) {
+export function collectFiles(inputs, { excludeCanonicalPath = "" } = {}) {
   const files = [];
   for (const target of inputs) {
     const resolved = path.resolve(target);
@@ -394,7 +466,12 @@ export function collectFiles(inputs) {
         if (SUPPORTED_EXTS.has(ext) && !entry.includes("-nobg.")) {
           const full = path.join(resolved, entry);
           try {
-            if (fs.statSync(full).isFile()) files.push(full);
+            if (fs.statSync(full).isFile()) {
+              if (excludeCanonicalPath && fs.realpathSync(full) === excludeCanonicalPath) {
+                continue;
+              }
+              files.push(full);
+            }
           } catch {
             // ignore transient file races in watch folders
           }
@@ -429,19 +506,58 @@ export function deriveSubIdempotencyKey(idem, suffix) {
   return `${trimmed.slice(0, 180)}:${hash}:${suffix}`;
 }
 
-function resolveBgInput(bgSpec) {
-  if (!bgSpec) return null;
-  if (/^https?:\/\//i.test(bgSpec)) {
-    return { kind: "url", url: bgSpec };
+function looksLikeCliUrlCandidate(raw) {
+  const s = String(raw || "").trim();
+  return /^[a-zA-Z][a-zA-Z0-9+.-]+:\/\//.test(s) || /^(data|javascript|file):/i.test(s);
+}
+
+export async function resolveBgInput(bgSpec, { lookupFn = dns.promises.lookup } = {}) {
+  const trimmed = bgSpec !== undefined && bgSpec !== null ? String(bgSpec).trim() : "";
+  if (!trimmed) return null;
+  if (trimmed.includes("\0")) {
+    throw new Error("Invalid --bg-image value.");
   }
-  const resolved = path.resolve(bgSpec);
+  if (looksLikeCliUrlCandidate(trimmed)) {
+    const ssrfErr = await validateRemoteImageUrl(trimmed, lookupFn);
+    if (ssrfErr) {
+      throw new Error(`Disallowed --bg-image URL (${ssrfErr})`);
+    }
+    return { kind: "url", url: trimmed };
+  }
+  const resolved = path.resolve(trimmed);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`--bg-image file does not exist: ${resolved}`);
+  }
+  const st = fs.statSync(resolved);
+  if (!st.isFile()) {
+    throw new Error(`--bg-image must point to a regular image file: ${resolved}`);
+  }
+  const ext = path.extname(resolved).toLowerCase();
+  if (!SUPPORTED_EXTS.has(ext)) {
+    throw new Error(
+      `Unsupported --bg-image extension '${ext || "(none)"}'. Expected .png, .jpg, .jpeg, or .webp.`,
+    );
+  }
+  if (st.size <= 0) {
+    throw new Error(`--bg-image file must not be empty: ${resolved}`);
+  }
+  if (st.size > MAX_UPLOAD_BYTES) {
+    throw new Error(
+      `--bg-image file exceeds 25 MB maximum upload size (26214400 bytes): ${resolved}`,
+    );
+  }
   const bytes = fs.readFileSync(resolved);
+  assertCliBinaryBounds(bytes, "--bg-image file");
+  const detectedMime = detectSupportedImageMime(bytes);
+  if (!detectedMime) {
+    throw new Error(`--bg-image file is not a valid PNG, JPEG, or WebP image: ${resolved}`);
+  }
   return {
     kind: "file",
     path: resolved,
     bytes,
     sha256: sha256Hex(bytes),
-    mime: mimeForPath(resolved),
+    mime: detectedMime,
   };
 }
 
@@ -457,6 +573,45 @@ export async function processImageBuffer({
 }) {
   const validatedOpts = { ...opts };
   normalizeAndValidateCliEnums(validatedOpts);
+  assertCliBinaryBounds(bytes, "Foreground image");
+
+  let effectiveBgInput = null;
+  if (bgInput !== null && bgInput !== undefined) {
+    if (validatedOpts.bgColor) {
+      throw new Error("Cannot combine --bg-color and --bg-image; specify at most one background option.");
+    }
+    if (bgInput.kind === "url") {
+      const ssrfErr = await validateRemoteImageUrl(bgInput.url, lookupFn);
+      if (ssrfErr) {
+        throw new Error(`Disallowed --bg-image URL (${ssrfErr})`);
+      }
+      effectiveBgInput = { kind: "url", url: String(bgInput.url).trim() };
+    } else if (bgInput.kind === "file") {
+      assertCliBinaryBounds(bgInput.bytes, "--bg-image file");
+      const detectedMime = detectSupportedImageMime(bgInput.bytes);
+      if (!detectedMime) {
+        throw new Error("--bg-image file is not a valid PNG, JPEG, or WebP image.");
+      }
+      effectiveBgInput = {
+        ...bgInput,
+        mime: detectedMime,
+        sha256: bgInput.sha256 || sha256Hex(bgInput.bytes),
+      };
+    } else {
+      throw new Error("Invalid bgInput descriptor.");
+    }
+  } else if (validatedOpts.bgImage) {
+    effectiveBgInput = await resolveBgInput(validatedOpts.bgImage, { lookupFn });
+  }
+
+  if (
+    effectiveBgInput?.kind === "file" &&
+    bytes.byteLength + effectiveBgInput.bytes.byteLength > MAX_COMBINED_UPLOAD_BYTES
+  ) {
+    throw new Error(
+      "Combined foreground and --bg-image size exceeds 30 MB maximum upload envelope (31457280 bytes).",
+    );
+  }
 
   const safeFetch = async (url, init = {}) =>
     fetchWithoutRedirects(fetchImpl, url, {
@@ -483,10 +638,10 @@ export async function processImageBuffer({
   };
 
   const fgSha = sha256Hex(bytes);
-  const bgTag = bgInput
-    ? bgInput.kind === "url"
-      ? `bgurl:${sha256Hex(Buffer.from(bgInput.url)).slice(0, 12)}`
-      : `bg:${bgInput.sha256.slice(0, 12)}`
+  const bgTag = effectiveBgInput
+    ? effectiveBgInput.kind === "url"
+      ? `bgurl:${sha256Hex(Buffer.from(effectiveBgInput.url)).slice(0, 12)}`
+      : `bg:${effectiveBgInput.sha256.slice(0, 12)}`
     : "";
   const paramFingerprint = sha256Hex(
     Buffer.from(
@@ -531,10 +686,10 @@ export async function processImageBuffer({
     if (validatedOpts.scale) ticketBody.scale = validatedOpts.scale;
     if (validatedOpts.position) ticketBody.position = validatedOpts.position;
     if (validatedOpts.bgColor) ticketBody.bg_color = validatedOpts.bgColor;
-    if (bgInput?.kind === "url") ticketBody.bg_image_url = bgInput.url;
-    if (bgInput?.kind === "file") {
-      ticketBody.bgImageSha256 = bgInput.sha256;
-      ticketBody.bgImageByteLength = bgInput.bytes.byteLength;
+    if (effectiveBgInput?.kind === "url") ticketBody.bg_image_url = effectiveBgInput.url;
+    if (effectiveBgInput?.kind === "file") {
+      ticketBody.bgImageSha256 = effectiveBgInput.sha256;
+      ticketBody.bgImageByteLength = effectiveBgInput.bytes.byteLength;
     }
     if (validatedOpts.crop) ticketBody.crop = true;
     if (validatedOpts.cropMargin) ticketBody.crop_margin = validatedOpts.cropMargin;
@@ -566,7 +721,7 @@ export async function processImageBuffer({
     const tData = ticketJson?.data;
     const ticket = tData?.ticket;
     const directEndpoint = tData?.directEndpoint;
-    const rawHoldId = tData?.holdId ?? tData?.lock_id;
+    const rawHoldId = tData?.holdId ?? tData?.hold_id ?? tData?.lock_id;
     const rawReleaseToken = tData?.releaseToken ?? tData?.release_token;
     const holdId = typeof rawHoldId === "string" ? rawHoldId.trim() : "";
     const releaseToken = typeof rawReleaseToken === "string" ? rawReleaseToken.trim() : "";
@@ -592,11 +747,11 @@ export async function processImageBuffer({
 
     const directForm = new FormData();
     directForm.set("image_file", new Blob([bytes], { type: mimeType }), fileName);
-    if (bgInput?.kind === "file") {
+    if (effectiveBgInput?.kind === "file") {
       directForm.set(
         "bg_image_file",
-        new Blob([bgInput.bytes], { type: bgInput.mime }),
-        path.basename(bgInput.path),
+        new Blob([effectiveBgInput.bytes], { type: effectiveBgInput.mime }),
+        path.basename(effectiveBgInput.path),
       );
     }
     let directRes;
@@ -616,10 +771,9 @@ export async function processImageBuffer({
       throw err;
     }
     if (!directRes.ok) {
-      if (directRes.status >= 502 && directRes.status <= 504) {
-        await releaseTicketHold(holdId, releaseToken);
-      }
-      return { ok: false, status: directRes.status, errorText: await directRes.text() };
+      const errText = await directRes.text();
+      await releaseTicketHold(holdId, releaseToken);
+      return { ok: false, status: directRes.status, errorText: errText };
     }
     return {
       ok: true,
@@ -634,9 +788,9 @@ export async function processImageBuffer({
   const needsDirect =
     validatedOpts.direct ||
     bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES ||
-    (bgInput?.kind === "file" &&
-      (bgInput.bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES ||
-        bytes.byteLength + bgInput.bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES)) ||
+    (effectiveBgInput?.kind === "file" &&
+      (effectiveBgInput.bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES ||
+        bytes.byteLength + effectiveBgInput.bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES)) ||
     shouldPreFlightViaTicket(
       bytes,
       validatedOpts.size,
@@ -661,9 +815,13 @@ export async function processImageBuffer({
     if (validatedOpts.scale) form.set("scale", validatedOpts.scale);
     if (validatedOpts.position) form.set("position", validatedOpts.position);
     if (validatedOpts.bgColor) form.set("bg_color", validatedOpts.bgColor);
-    if (bgInput?.kind === "url") form.set("bg_image_url", bgInput.url);
-    if (bgInput?.kind === "file") {
-      form.set("bg_image_file", new Blob([bgInput.bytes], { type: bgInput.mime }), path.basename(bgInput.path));
+    if (effectiveBgInput?.kind === "url") form.set("bg_image_url", effectiveBgInput.url);
+    if (effectiveBgInput?.kind === "file") {
+      form.set(
+        "bg_image_file",
+        new Blob([effectiveBgInput.bytes], { type: effectiveBgInput.mime }),
+        path.basename(effectiveBgInput.path),
+      );
     }
     if (validatedOpts.crop) form.set("crop", "true");
     if (validatedOpts.cropMargin) form.set("crop_margin", validatedOpts.cropMargin);
@@ -740,20 +898,49 @@ function resolveDestPath(filePath, opts) {
 }
 
 async function processSingleFile(filePath, opts, baseUrl, bgInput) {
+  const destPath = resolveDestPath(filePath, opts);
+  if (
+    bgInput?.kind === "file" &&
+    fs.existsSync(destPath) &&
+    fs.realpathSync(destPath) === fs.realpathSync(bgInput.path)
+  ) {
+    console.error(`[FAIL] ${path.basename(filePath)} -> Refusing to overwrite --bg-image file: ${destPath}`);
+    return false;
+  }
+  const st = fs.statSync(filePath);
+  if (st.size <= 0) {
+    console.error(`[FAIL] ${path.basename(filePath)} -> Foreground image must not be empty.`);
+    return false;
+  }
+  if (st.size > MAX_UPLOAD_BYTES) {
+    console.error(`[FAIL] ${path.basename(filePath)} -> Foreground image exceeds 25 MB maximum upload size.`);
+    return false;
+  }
+  if (bgInput?.kind === "file" && st.size + bgInput.bytes.byteLength > MAX_COMBINED_UPLOAD_BYTES) {
+    console.error(
+      `[FAIL] ${path.basename(filePath)} -> Combined foreground and --bg-image size exceeds 30 MB limit.`,
+    );
+    return false;
+  }
   const bytes = fs.readFileSync(filePath);
-  const outcome = await processImageBuffer({
-    bytes,
-    fileName: path.basename(filePath),
-    mimeType: mimeForPath(filePath),
-    opts,
-    baseUrl,
-    bgInput,
-  });
+  let outcome;
+  try {
+    outcome = await processImageBuffer({
+      bytes,
+      fileName: path.basename(filePath),
+      mimeType: detectSupportedImageMime(bytes) || mimeForPath(filePath),
+      opts,
+      baseUrl,
+      bgInput,
+    });
+  } catch (err) {
+    console.error(`[FAIL] ${path.basename(filePath)} -> ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
   if (!outcome.ok) {
     console.error(`[FAIL] ${path.basename(filePath)} -> HTTP ${outcome.status}: ${outcome.errorText}`);
     return false;
   }
-  const destPath = resolveDestPath(filePath, opts);
   fs.mkdirSync(path.dirname(destPath), { recursive: true });
   fs.writeFileSync(destPath, outcome.buffer);
   console.log(`[OK] ${path.basename(filePath)} -> ${destPath} (${outcome.charged} credits, ${outcome.via})`);
@@ -801,23 +988,6 @@ export async function runCli(argv = process.argv.slice(2)) {
     }
   }
 
-  let precollectedFiles = null;
-  if (!opts.account && !opts.watch) {
-    precollectedFiles = collectFiles(opts.inputs);
-    if (precollectedFiles.length === 0) {
-      console.error("No supported image files (.jpg, .jpeg, .png, .webp) found.");
-      process.exit(1);
-    }
-    if (opts.idempotencyKey && precollectedFiles.length > 1) {
-      console.error("Error: --idempotency-key can only be used with a single input file.");
-      process.exit(2);
-    }
-    if (opts.output && precollectedFiles.length > 1) {
-      console.error("Error: --output can only be used with a single input file. Use --output-dir for batches.");
-      process.exit(2);
-    }
-  }
-
   const baseUrl = opts.endpoint.replace(/\/+$/, "");
   const endpointErr = await validateHttpsEndpointUrl(baseUrl, {
     allowLoopbackOrigin: isLoopbackTestOrigin(baseUrl),
@@ -841,7 +1011,26 @@ export async function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
-  const bgInput = resolveBgInput(opts.bgImage);
+  const bgInput = await resolveBgInput(opts.bgImage);
+  const excludeCanonicalPath =
+    bgInput?.kind === "file" ? fs.realpathSync(bgInput.path) : "";
+
+  let precollectedFiles = null;
+  if (!opts.watch) {
+    precollectedFiles = collectFiles(opts.inputs, { excludeCanonicalPath });
+    if (precollectedFiles.length === 0) {
+      console.error("No supported image files (.jpg, .jpeg, .png, .webp) found.");
+      process.exit(1);
+    }
+    if (opts.idempotencyKey && precollectedFiles.length > 1) {
+      console.error("Error: --idempotency-key can only be used with a single input file.");
+      process.exit(2);
+    }
+    if (opts.output && precollectedFiles.length > 1) {
+      console.error("Error: --output can only be used with a single input file. Use --output-dir for batches.");
+      process.exit(2);
+    }
+  }
 
   if (opts.watch) {
     if (opts.outputDir) {
@@ -857,7 +1046,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     console.log(`[WATCH] Monitoring ${opts.inputs.join(", ")} (poll=${opts.pollMs}ms). Press Ctrl+C to stop.`);
 
     while (!stopping) {
-      const candidates = collectFiles(opts.inputs);
+      const candidates = collectFiles(opts.inputs, { excludeCanonicalPath });
       for (const filePath of candidates) {
         if (stopping) break;
         if (opts.outputDir && path.resolve(path.dirname(filePath)) === path.resolve(opts.outputDir)) {

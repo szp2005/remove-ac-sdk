@@ -26,6 +26,10 @@ const serverJsonPath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../server.json",
 );
+const TINY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "base64",
+);
 const tempRoot = fs.existsSync("/Volumes/Expansion/dev-tools/build-temp")
   ? "/Volumes/Expansion/dev-tools/build-temp"
   : os.tmpdir();
@@ -102,7 +106,7 @@ test("MCP get_account_balance surfaces totalCredits cleanly for positive and zer
 test("MCP remove_background_file writes cutout output and upgrades >4 MB files via ticket", async () => {
   const tmpDir = fs.mkdtempSync(path.join(tempRoot, "remove-ac-mcp-test-"));
   const inputPath = path.join(tmpDir, "large-input.png");
-  fs.writeFileSync(inputPath, Buffer.alloc(4 * 1024 * 1024 + 128, 0x2a));
+  fs.writeFileSync(inputPath, Buffer.concat([TINY_PNG, Buffer.alloc(4 * 1024 * 1024 + 128, 0x2a)]));
 
   const calls = [];
   const fakeClient = () =>
@@ -334,7 +338,7 @@ test("MF-02 & MF-03: server.json satisfies Official MCP Registry <=100-char limi
     const workDir = path.join(sandbox, "nested", "workspace");
     fs.mkdirSync(workDir, { recursive: true });
     const inputPath = path.join(workDir, "photo.png");
-    fs.writeFileSync(inputPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]));
+    fs.writeFileSync(inputPath, TINY_PNG);
 
     const outsideSecret = path.join(sandbox, "victim.txt");
     fs.writeFileSync(outsideSecret, "DO_NOT_OVERWRITE");
@@ -395,8 +399,8 @@ test("v1.3.0 MCP bg_image_path and bg_image_url support with symlink and SSRF pr
     const fgPath = path.join(sandbox, "fg.png");
     const bgPath = path.join(sandbox, "bg.png");
     const symlinkBg = path.join(sandbox, "symlink-bg.png");
-    fs.writeFileSync(fgPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]));
-    fs.writeFileSync(bgPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 5, 6, 7, 8]));
+    fs.writeFileSync(fgPath, TINY_PNG);
+    fs.writeFileSync(bgPath, TINY_PNG);
     fs.symlinkSync(bgPath, symlinkBg);
 
     const capturedOpts = [];
@@ -470,6 +474,73 @@ test("v1.3.0 MCP bg_image_path and bg_image_url support with symlink and SSRF pr
       assert.equal(badRes.result.isError, true);
     }
     assert.equal(capturedOpts.length, beforeCount);
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("R2 MF-05 & MF-02: MCP blocks non-image file exfiltration (.env, SSH keys, disguised text) and >30 MB combined uploads with 0 HTTP calls", async () => {
+  const sandbox = fs.mkdtempSync(path.join(tempRoot, "remove-ac-mcp-mf05-"));
+  try {
+    const validFg = path.join(sandbox, "fg.png");
+    const dotEnv = path.join(sandbox, ".env.production");
+    const sshKey = path.join(sandbox, "id_rsa");
+    const disguisedPng = path.join(sandbox, "disguised-secret.png");
+    const bigFg = path.join(sandbox, "fg18.png");
+    const bigBg = path.join(sandbox, "bg16.png");
+
+    fs.writeFileSync(validFg, TINY_PNG);
+    fs.writeFileSync(dotEnv, "SUPER_SECRET_DB_URL=postgres://admin:pw@db/prod\n");
+    fs.writeFileSync(sshKey, "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET\n");
+    fs.writeFileSync(disguisedPng, "SUPER_SECRET_API_TOKEN=secret\n");
+    fs.writeFileSync(bigFg, Buffer.concat([TINY_PNG, Buffer.alloc(18 * 1024 * 1024, 0)]));
+    fs.writeFileSync(bigBg, Buffer.concat([TINY_PNG, Buffer.alloc(16 * 1024 * 1024, 0)]));
+
+    let networkCalls = 0;
+    const guardClient = () =>
+      new RemoveAcClient({
+        apiKey: "rac_live_mcp_guard",
+        fetch: async () => {
+          networkCalls += 1;
+          return new Response(TINY_PNG, { status: 200, headers: { "Content-Type": "image/png" } });
+        },
+      });
+
+    for (const [toolName, badArgs] of [
+      ["remove_background_file", { inputPath: dotEnv, outputPath: path.join(sandbox, "o1.png") }],
+      ["remove_background_file", { inputPath: sshKey, outputPath: path.join(sandbox, "o2.png") }],
+      ["remove_background_file", { inputPath: disguisedPng, outputPath: path.join(sandbox, "o3.png") }],
+      ["remove_background_file", { inputPath: validFg, bg_image_path: dotEnv, outputPath: path.join(sandbox, "o4.png") }],
+      ["remove_background_file", { inputPath: validFg, bg_image_path: sshKey, outputPath: path.join(sandbox, "o5.png") }],
+      ["remove_background_file", { inputPath: validFg, bg_image_path: disguisedPng, outputPath: path.join(sandbox, "o6.png") }],
+      [
+        "remove_background_url",
+        {
+          imageUrl: "https://cdn.example.com/photo.jpg",
+          bg_image_path: dotEnv,
+          outputPath: path.join(sandbox, "o7.png"),
+        },
+      ],
+      ["remove_background_file", { inputPath: bigFg, bg_image_path: bigBg, outputPath: path.join(sandbox, "o8.png") }],
+      [
+        "remove_background_file",
+        { inputPath: validFg, bg_image_path: bigBg, outputPath: bigBg, overwrite: true },
+      ],
+    ]) {
+      const res = await handleMcpRequest(
+        {
+          jsonrpc: "2.0",
+          id: 505,
+          method: "tools/call",
+          params: { name: toolName, arguments: badArgs },
+        },
+        guardClient,
+        { lookup: async () => [{ address: "93.184.216.34", family: 4 }] },
+      );
+      assert.equal(res.result.isError, true, `Expected MCP rejection for ${JSON.stringify(badArgs)}`);
+    }
+
+    assert.equal(networkCalls, 0, "MCP must make 0 HTTP calls on non-image or >30 MB inputs");
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true });
   }

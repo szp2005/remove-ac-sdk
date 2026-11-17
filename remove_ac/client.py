@@ -21,6 +21,11 @@ USER_AGENT = f"remove-ac-python-sdk/{SDK_VERSION}"
 DEFAULT_BASE_URL = "https://remove.ac"
 DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024
+MAX_IMAGE_PIXELS = 50_000_000
+MAX_IMAGE_DIMENSION = 50_000
+MAX_IMPROVE_TAG_LEN = 64
+MAX_IMPROVE_DESCRIPTION_LEN = 500
 DIRECT_RGBA_PNG_PIXELS = 5_000_000
 DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000
 
@@ -331,24 +336,62 @@ def _is_loopback_test_origin(raw_url: str) -> bool:
     return host in ("127.0.0.1", "::1", "localhost")
 
 
-def validate_https_endpoint_url(
+def _looks_like_url_candidate(raw: str) -> bool:
+    s = (raw or "").strip()
+    if s.lower().startswith(("data:", "javascript:", "file:")):
+        return True
+    if "://" not in s:
+        return False
+    scheme = s.split("://", 1)[0]
+    if len(scheme) < 2 or not scheme[0].isalpha():
+        return False
+    return all(ch.isalnum() or ch in "+.-" for ch in scheme)
+
+
+def _assert_valid_image_dimensions(data: bytes, label: str) -> None:
+    dims = parse_image_dimensions(data)
+    if dims is None:
+        return
+    if (
+        dims[0] > MAX_IMAGE_DIMENSION
+        or dims[1] > MAX_IMAGE_DIMENSION
+        or dims[0] * dims[1] > MAX_IMAGE_PIXELS
+    ):
+        raise RemoveAcError(
+            400,
+            f"{label} resolution {dims[0]}x{dims[1]} exceeds 50 MP / 50,000 px maximum",
+        )
+
+
+def _assert_valid_binary_envelope(data: bytes, label: str) -> None:
+    if len(data) == 0:
+        raise RemoveAcError(400, f"{label} must not be empty")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise RemoveAcError(413, f"{label} exceeds 25 MB maximum upload size (26214400 bytes)")
+    _assert_valid_image_dimensions(data, label)
+
+
+def validate_remote_image_url(
     raw_url: str,
     *,
-    allow_loopback_origin: bool = False,
     resolver: Optional[ResolverFn] = None,
-    label: str = "directEndpoint",
+    label: str = "image_url",
 ) -> Optional[str]:
+    trimmed = (raw_url or "").strip()
+    if not trimmed or "\x00" in trimmed or "\r" in trimmed or "\n" in trimmed:
+        return f"Invalid {label} URL"
     try:
-        parsed = urllib.parse.urlsplit((raw_url or "").strip())
+        parsed = urllib.parse.urlsplit(trimmed)
     except Exception:
         return f"Invalid {label} URL"
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return f"Disallowed {label} (only http:// and https:// image URLs are allowed)"
     if parsed.username or parsed.password:
-        return f"{label} must not contain embedded credentials"
-    if allow_loopback_origin and _is_loopback_test_origin(raw_url):
-        return None
-    if parsed.scheme.lower() != "https":
-        return f"{label} must use https://"
-    host = (parsed.hostname or "").lower()
+        return f"Disallowed {label} (embedded credentials are not permitted)"
+
+    raw_host = (parsed.hostname or "").lower()
+    host = raw_host.strip("[]").rstrip(".")
     if (
         not host
         or host == "localhost"
@@ -366,14 +409,20 @@ def validate_https_endpoint_url(
     except ValueError:
         is_literal = False
 
-    if is_literal:
+    if is_literal or ":" in clean_host:
         if _is_disallowed_ip(clean_host):
             return f"Disallowed {label} (private, loopback, or reserved IP address)"
         return None
 
-    if "." not in host or host.isdigit() or host.startswith("0x"):
+    labels = host.split(".")
+    if (
+        len(labels) < 2
+        or any(not lbl for lbl in labels)
+        or all(lbl.isdigit() or lbl.startswith("0x") for lbl in labels)
+    ):
         return f"Disallowed {label} (single-label or numeric hostname)"
 
+    is_default_resolver = resolver is None
     resolve_fn = resolver or _default_resolver
     try:
         addrs = list(resolve_fn(host))
@@ -381,7 +430,10 @@ def validate_https_endpoint_url(
         return f"Disallowed {label} (unable to resolve hostname '{host}')"
     if not addrs:
         return f"Disallowed {label} (hostname '{host}' returned no DNS records)"
-    allow_tun_fake_ip = host == "remove.ac" or host.endswith(".remove.ac")
+
+    allow_tun_fake_ip = is_default_resolver or (
+        scheme == "https" and (host == "remove.ac" or host.endswith(".remove.ac"))
+    )
     for addr in addrs:
         if not addr:
             return f"Disallowed {label} (hostname '{host}' resolves to a private, loopback, or reserved IP)"
@@ -395,6 +447,26 @@ def validate_https_endpoint_url(
         if _is_disallowed_ip(clean_addr):
             return f"Disallowed {label} (hostname '{host}' resolves to a private, loopback, or reserved IP)"
     return None
+
+
+def validate_https_endpoint_url(
+    raw_url: str,
+    *,
+    allow_loopback_origin: bool = False,
+    resolver: Optional[ResolverFn] = None,
+    label: str = "directEndpoint",
+) -> Optional[str]:
+    try:
+        parsed = urllib.parse.urlsplit((raw_url or "").strip())
+    except Exception:
+        return f"Invalid {label} URL"
+    if parsed.username or parsed.password:
+        return f"{label} must not contain embedded credentials"
+    if allow_loopback_origin and _is_loopback_test_origin(raw_url):
+        return None
+    if parsed.scheme.lower() != "https":
+        return f"{label} must use https://"
+    return validate_remote_image_url(raw_url, resolver=resolver, label=label)
 
 
 def _ensure_user_agent(headers: Dict[str, str]) -> Dict[str, str]:
@@ -577,6 +649,13 @@ class RemoveAcClient:
         bg_b64_clean = ""
         bg_b64_decoded: Optional[bytes] = None
 
+        if clean_bg_url:
+            bg_url_err = validate_remote_image_url(
+                clean_bg_url, resolver=self._resolver, label="bg_image_url"
+            )
+            if bg_url_err:
+                raise RemoveAcError(400, bg_url_err)
+
         if has_bg_file:
             if isinstance(bg_image_file, (bytes, bytearray)):
                 bg_bytes = bytes(bg_image_file)
@@ -587,9 +666,7 @@ class RemoveAcClient:
                 trimmed_bg_path = bg_path_str.strip()
                 if not trimmed_bg_path or "\x00" in trimmed_bg_path:
                     raise RemoveAcError(400, "bg_image_file path must not be empty")
-                if isinstance(bg_image_file, str) and trimmed_bg_path.lower().startswith(
-                    ("http://", "https://")
-                ):
+                if isinstance(bg_image_file, str) and _looks_like_url_candidate(trimmed_bg_path):
                     raise RemoveAcError(
                         400,
                         "bg_image_file expects a local file path or bytes; use bg_image_url for remote URLs",
@@ -600,16 +677,12 @@ class RemoveAcClient:
             else:
                 raise RemoveAcError(400, "Unsupported bg_image_file input")
 
-            if len(bg_bytes) == 0:
-                raise RemoveAcError(400, "bg_image_file must not be empty")
-            if len(bg_bytes) > MAX_UPLOAD_BYTES:
-                raise RemoveAcError(
-                    413, "bg_image_file exceeds 25 MB maximum upload size (26214400 bytes)"
-                )
+            _assert_valid_binary_envelope(bg_bytes, "bg_image_file")
         elif clean_bg_b64_input:
             bg_b64_clean, bg_b64_decoded = _decode_base64_image(
                 clean_bg_b64_input, "bg_image_file_b64"
             )
+            _assert_valid_image_dimensions(bg_b64_decoded, "bg_image_file_b64")
 
         img_bytes: Optional[bytes] = None
         img_name = "image.png"
@@ -617,19 +690,40 @@ class RemoveAcClient:
 
         if isinstance(image, (bytes, bytearray)):
             img_bytes = bytes(image)
-        elif isinstance(image, str) and image.startswith(("http://", "https://")):
-            img_url = image
+        elif isinstance(image, str) and _looks_like_url_candidate(image):
+            trimmed_img_url = image.strip()
+            img_url_err = validate_remote_image_url(
+                trimmed_img_url, resolver=self._resolver, label="image_url"
+            )
+            if img_url_err:
+                raise RemoveAcError(400, img_url_err)
+            img_url = trimmed_img_url
         elif isinstance(image, (str, os.PathLike)):
             img_path_str = os.fspath(image)
             if not isinstance(img_path_str, str):
                 img_path_str = os.fsdecode(img_path_str)
-            img_name = os.path.basename(img_path_str) or "image.png"
-            with open(img_path_str, "rb") as fh:
+            trimmed_img_path = img_path_str.strip()
+            if not trimmed_img_path or "\x00" in trimmed_img_path:
+                raise RemoveAcError(400, "Unsupported image input")
+            img_name = os.path.basename(trimmed_img_path) or "image.png"
+            with open(trimmed_img_path, "rb") as fh:
                 img_bytes = fh.read()
         else:
             raise RemoveAcError(400, "Unsupported image input")
 
+        if img_bytes is not None:
+            _assert_valid_binary_envelope(img_bytes, "Foreground image")
+
         ticket_bg_bytes = bg_bytes if bg_bytes is not None else bg_b64_decoded
+        if (
+            img_bytes is not None
+            and ticket_bg_bytes is not None
+            and len(img_bytes) + len(ticket_bg_bytes) > MAX_COMBINED_UPLOAD_BYTES
+        ):
+            raise RemoveAcError(
+                413,
+                "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+            )
 
         def _via_ticket(suffix: str) -> bytes:
             if img_bytes is None:
@@ -693,7 +787,9 @@ class RemoveAcClient:
             ticket_tok = t_data.get("ticket") if isinstance(t_data, dict) else None
             direct_ep = t_data.get("directEndpoint") if isinstance(t_data, dict) else None
             raw_hold_id = (
-                (t_data.get("holdId") or t_data.get("lock_id")) if isinstance(t_data, dict) else None
+                (t_data.get("holdId") or t_data.get("hold_id") or t_data.get("lock_id"))
+                if isinstance(t_data, dict)
+                else None
             )
             raw_release_tok = (
                 (t_data.get("releaseToken") or t_data.get("release_token"))
@@ -747,8 +843,7 @@ class RemoveAcClient:
                 self._release_ticket_hold(hold_id, release_tok)
                 raise
             if d_status < 200 or d_status >= 300:
-                if (300 <= d_status < 400) or d_status in (502, 503, 504):
-                    self._release_ticket_hold(hold_id, release_tok)
+                self._release_ticket_hold(hold_id, release_tok)
                 raise RemoveAcError(d_status, d_body.decode("utf-8", errors="replace"))
             return d_body
 
@@ -854,14 +949,41 @@ class RemoveAcClient:
         if not self.api_key:
             raise RemoveAcError(403, "Missing remove.ac API key")
 
+        clean_tag = ""
+        if tag is not None:
+            if not isinstance(tag, str):
+                raise RemoveAcError(400, "tag must be a string")
+            clean_tag = tag.strip()
+            if "\x00" in clean_tag or len(clean_tag) > MAX_IMPROVE_TAG_LEN:
+                raise RemoveAcError(
+                    400, f"tag must be {MAX_IMPROVE_TAG_LEN} characters or fewer"
+                )
+
+        clean_description = ""
+        if description is not None:
+            if not isinstance(description, str):
+                raise RemoveAcError(400, "description must be a string")
+            clean_description = description.strip()
+            if "\x00" in clean_description or len(clean_description) > MAX_IMPROVE_DESCRIPTION_LEN:
+                raise RemoveAcError(
+                    400,
+                    f"description must be {MAX_IMPROVE_DESCRIPTION_LEN} characters or fewer",
+                )
+
         img_bytes: Optional[bytes] = None
         img_name = os.path.basename(filename.strip()) if filename and filename.strip() else "image.png"
         img_url: Optional[str] = None
 
         if isinstance(image, (bytes, bytearray)):
             img_bytes = bytes(image)
-        elif isinstance(image, str) and image.strip().startswith(("http://", "https://")):
-            img_url = image.strip()
+        elif isinstance(image, str) and _looks_like_url_candidate(image):
+            trimmed_url = image.strip()
+            url_err = validate_remote_image_url(
+                trimmed_url, resolver=self._resolver, label="image_url"
+            )
+            if url_err:
+                raise RemoveAcError(400, url_err)
+            img_url = trimmed_url
         elif isinstance(image, (str, os.PathLike)):
             img_path_str = os.fspath(image)
             if not isinstance(img_path_str, str):
@@ -877,20 +999,15 @@ class RemoveAcClient:
             raise RemoveAcError(400, "Unsupported image input")
 
         if img_bytes is not None:
-            if len(img_bytes) == 0:
-                raise RemoveAcError(400, "Image input must not be empty")
-            if len(img_bytes) > MAX_UPLOAD_BYTES:
-                raise RemoveAcError(
-                    413, "Image input exceeds 25 MB maximum upload size (26214400 bytes)"
-                )
+            _assert_valid_binary_envelope(img_bytes, "Image input")
 
         fields: Dict[str, str] = {}
         if img_url:
             fields["image_url"] = img_url
-        if tag is not None and str(tag).strip():
-            fields["tag"] = str(tag).strip()
-        if description is not None and str(description).strip():
-            fields["description"] = str(description).strip()
+        if clean_tag:
+            fields["tag"] = clean_tag
+        if clean_description:
+            fields["description"] = clean_description
 
         file_tuple = ("image_file", img_name, img_bytes) if img_bytes is not None else None
         mp_body, mp_ct = _encode_multipart(fields, file_tuple)
@@ -969,8 +1086,15 @@ class RemoveBg:
         bg_image_file_b64: Optional[str] = None,
         **kwargs: Any,
     ) -> bytes:
+        if not isinstance(img_url, str) or not img_url.strip():
+            raise RemoveAcError(400, "Missing image_url")
+        url_err = validate_remote_image_url(
+            img_url.strip(), resolver=self.client._resolver, label="image_url"
+        )
+        if url_err:
+            raise RemoveAcError(400, url_err)
         out = self.client.remove_background(
-            img_url,
+            img_url.strip(),
             size=size,
             bg_color=bg_color,
             bg_image_file=bg_image_file,

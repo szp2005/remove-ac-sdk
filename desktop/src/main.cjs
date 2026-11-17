@@ -19,8 +19,11 @@ const {
   CredentialManager,
   DesktopApiClient,
   DesktopAppError,
+  MAX_PREVIEW_FALLBACK_BYTES,
+  MAX_PREVIEW_FILE_BYTES,
   collectInputItems,
   isPlausibleApiKey,
+  readPreviewDataUrlPayload,
   resolveOutputTarget,
   runBatchQueue,
   sanitizeSettings,
@@ -415,49 +418,12 @@ function setupIpcHandlers() {
 
   ipcMain.handle("desktop:read-preview-data-url", async (event, rawFilePath) => {
     assertTrustedSender(event);
-    const resolved = path.resolve(String(rawFilePath || ""));
-    if (!allowedFilePaths.has(resolved)) {
-      return { ok: false, code: "forbidden_path", message: "Preview path is not authorized" };
-    }
-    const ext = path.extname(resolved).toLowerCase();
-    if (ext === ".zip") {
-      return { ok: false, code: "zip_no_preview", message: "ZIP archive cannot be previewed inline" };
-    }
-    try {
-      const st = await fs.promises.stat(resolved);
-      if (!st.isFile() || st.size <= 0 || st.size > 30 * 1024 * 1024) {
-        return { ok: false, code: "invalid_preview_size", message: "Preview unavailable" };
-      }
-      const img = nativeImage.createFromPath(resolved);
-      if (!img.isEmpty()) {
-        const sz = img.getSize();
-        const previewImg = sz.width > 960 ? img.resize({ width: 960, quality: "good" }) : img;
-        return {
-          ok: true,
-          dataUrl: previewImg.toDataURL(),
-          width: sz.width,
-          height: sz.height,
-        };
-      }
-      if (st.size <= 15 * 1024 * 1024) {
-        const buf = await fs.promises.readFile(resolved);
-        const mime =
-          ext === ".webp"
-            ? "image/webp"
-            : ext === ".jpg" || ext === ".jpeg"
-              ? "image/jpeg"
-              : "image/png";
-        return {
-          ok: true,
-          dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
-          width: 0,
-          height: 0,
-        };
-      }
-      return { ok: false, code: "decode_failed", message: "Preview unavailable" };
-    } catch {
-      return { ok: false, code: "read_error", message: "Preview unavailable" };
-    }
+    return readPreviewDataUrlPayload(rawFilePath, {
+      allowedFilePaths,
+      nativeImageImpl: nativeImage,
+      maxStatBytes: MAX_PREVIEW_FILE_BYTES, // 90 * 1024 * 1024 (90 MB for 50 MP lossless PNG cutouts)
+      maxFallbackBytes: MAX_PREVIEW_FALLBACK_BYTES, // 35 * 1024 * 1024 (35 MB for 50 MP WebP cutouts)
+    });
   });
 
   ipcMain.handle("desktop:reveal-file", (event, rawFilePath) => {

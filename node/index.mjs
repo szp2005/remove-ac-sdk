@@ -4,8 +4,10 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   fetchWithoutRedirects,
+  isDisallowedRemoteUrl,
   isLoopbackTestOrigin,
   validateHttpsEndpointUrl,
+  validateRemoteImageUrl,
 } from "./net-safety.mjs";
 
 export const SDK_VERSION = "1.3.0";
@@ -53,8 +55,43 @@ const VALID_SHADOW_SET = new Set(VALID_SHADOW_TYPES);
 const DEFAULT_BASE_URL = "https://remove.ac";
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 50_000_000;
+const MAX_IMAGE_DIMENSION = 50_000;
+const MAX_IMPROVE_TAG_LEN = 64;
+const MAX_IMPROVE_DESCRIPTION_LEN = 500;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
+
+function looksLikeUrlCandidate(raw) {
+  const s = String(raw || "").trim();
+  return /^[a-zA-Z][a-zA-Z0-9+.-]+:\/\//.test(s) || /^(data|javascript|file):/i.test(s);
+}
+
+function assertValidImageDimensions(bytes, label) {
+  const dims = parseImageDimensions(bytes);
+  if (!dims) return;
+  if (
+    dims.width > MAX_IMAGE_DIMENSION ||
+    dims.height > MAX_IMAGE_DIMENSION ||
+    dims.width * dims.height > MAX_IMAGE_PIXELS
+  ) {
+    throw new RemoveAcError(
+      400,
+      `${label} resolution ${dims.width}x${dims.height} exceeds 50 MP / 50,000 px maximum`,
+    );
+  }
+}
+
+function assertValidBinaryEnvelope(bytes, label) {
+  if (!bytes || bytes.byteLength === 0) {
+    throw new RemoveAcError(400, `${label} must not be empty`);
+  }
+  if (bytes.byteLength > MAX_UPLOAD_BYTES) {
+    throw new RemoveAcError(413, `${label} exceeds 25 MB maximum upload size (26214400 bytes)`);
+  }
+  assertValidImageDimensions(bytes, label);
+}
 
 function toNodeBuffer(val) {
   if (Buffer.isBuffer(val)) return val;
@@ -385,13 +422,20 @@ export class RemoveAcClient {
     let bgB64Clean = "";
     let bgB64DecodedBytes = null;
 
+    if (rawBgImageUrl) {
+      const bgUrlErr = await validateRemoteImageUrl(rawBgImageUrl, this.lookupImpl);
+      if (bgUrlErr) {
+        throw new RemoveAcError(400, `Disallowed bgImageUrl (${bgUrlErr})`);
+      }
+    }
+
     if (hasBgImageFile) {
       if (typeof options.bgImageFile === "string") {
         const trimmedBgPath = options.bgImageFile.trim();
         if (!trimmedBgPath || trimmedBgPath.includes("\0")) {
           throw new RemoveAcError(400, "bgImageFile path must not be empty");
         }
-        if (/^https?:\/\//i.test(trimmedBgPath)) {
+        if (looksLikeUrlCandidate(trimmedBgPath)) {
           throw new RemoveAcError(
             400,
             "bgImageFile expects a local file path or byte buffer; use bgImageUrl for remote URLs",
@@ -409,15 +453,11 @@ export class RemoveAcClient {
         }
         bgFileBytes = convertedBg;
       }
-      if (bgFileBytes.byteLength === 0) {
-        throw new RemoveAcError(400, "bgImageFile must not be empty");
-      }
-      if (bgFileBytes.byteLength > MAX_UPLOAD_BYTES) {
-        throw new RemoveAcError(413, "bgImageFile exceeds 25 MB maximum upload size (26214400 bytes)");
-      }
+      assertValidBinaryEnvelope(bgFileBytes, "bgImageFile");
       bgFileMime = inferImageMimeType(bgFileBytes, bgFileName);
     } else if (rawBgImageFileB64) {
       const decodedBg = decodeBase64Image(rawBgImageFileB64, "bgImageFileB64");
+      assertValidImageDimensions(decodedBg.bytes, "bgImageFileB64");
       bgB64Clean = decodedBg.cleanB64;
       bgB64DecodedBytes = decodedBg.bytes;
       bgFileMime = inferImageMimeType(bgB64DecodedBytes, bgFileName);
@@ -428,11 +468,19 @@ export class RemoveAcClient {
     let sourceUrl = null;
 
     if (typeof input === "string") {
-      if (/^https?:\/\//i.test(input)) {
-        sourceUrl = input;
+      const trimmedInput = input.trim();
+      if (!trimmedInput || input.includes("\0")) {
+        throw new RemoveAcError(400, "Unsupported input source");
+      }
+      if (looksLikeUrlCandidate(trimmedInput)) {
+        const srcUrlErr = await validateRemoteImageUrl(trimmedInput, this.lookupImpl);
+        if (srcUrlErr) {
+          throw new RemoveAcError(400, `Disallowed image_url (${srcUrlErr})`);
+        }
+        sourceUrl = trimmedInput;
       } else {
-        sourceBytes = fs.readFileSync(input);
-        sourceName = path.basename(input);
+        sourceBytes = fs.readFileSync(trimmedInput);
+        sourceName = path.basename(trimmedInput) || "image.png";
       }
     } else {
       const convertedInput = toNodeBuffer(input);
@@ -443,7 +491,21 @@ export class RemoveAcClient {
       }
     }
 
+    if (sourceBytes !== null) {
+      assertValidBinaryEnvelope(sourceBytes, "Foreground image");
+    }
+
     const ticketBgBytes = bgFileBytes || bgB64DecodedBytes;
+    if (
+      sourceBytes !== null &&
+      ticketBgBytes !== null &&
+      sourceBytes.byteLength + ticketBgBytes.byteLength > MAX_COMBINED_UPLOAD_BYTES
+    ) {
+      throw new RemoveAcError(
+        413,
+        "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+      );
+    }
 
     const runViaTicket = async (suffix) => {
       if (!sourceBytes) throw new RemoveAcError(413, "Ticket mode requires binary input");
@@ -487,7 +549,7 @@ export class RemoveAcClient {
       const tData = tJson?.data;
       const ticketToken = tData?.ticket;
       const directEndpoint = tData?.directEndpoint;
-      const rawHoldId = tData?.holdId ?? tData?.lock_id;
+      const rawHoldId = tData?.holdId ?? tData?.hold_id ?? tData?.lock_id;
       const rawReleaseToken = tData?.releaseToken ?? tData?.release_token;
       const holdId = typeof rawHoldId === "string" ? rawHoldId.trim() : "";
       const releaseToken = typeof rawReleaseToken === "string" ? rawReleaseToken.trim() : "";
@@ -527,10 +589,9 @@ export class RemoveAcClient {
         throw err;
       }
       if (!dRes.ok) {
-        if (dRes.status >= 502 && dRes.status <= 504) {
-          await this._releaseTicketHold(holdId, releaseToken);
-        }
-        throw new RemoveAcError(dRes.status, await dRes.text());
+        const errBody = await dRes.text();
+        await this._releaseTicketHold(holdId, releaseToken);
+        throw new RemoveAcError(dRes.status, errBody);
       }
       return {
         buffer: Buffer.from(await dRes.arrayBuffer()),
@@ -618,6 +679,32 @@ export class RemoveAcClient {
   async submitImprove(input, options = {}) {
     if (!this.apiKey) throw new RemoveAcError(403, "Missing remove.ac API key");
     const opts = options && typeof options === "object" ? options : {};
+
+    let cleanTag = "";
+    if (opts.tag !== undefined && opts.tag !== null) {
+      if (typeof opts.tag !== "string") {
+        throw new RemoveAcError(400, "tag must be a string");
+      }
+      cleanTag = opts.tag.trim();
+      if (cleanTag.includes("\0") || cleanTag.length > MAX_IMPROVE_TAG_LEN) {
+        throw new RemoveAcError(400, `tag must be ${MAX_IMPROVE_TAG_LEN} characters or fewer`);
+      }
+    }
+
+    let cleanDescription = "";
+    if (opts.description !== undefined && opts.description !== null) {
+      if (typeof opts.description !== "string") {
+        throw new RemoveAcError(400, "description must be a string");
+      }
+      cleanDescription = opts.description.trim();
+      if (cleanDescription.includes("\0") || cleanDescription.length > MAX_IMPROVE_DESCRIPTION_LEN) {
+        throw new RemoveAcError(
+          400,
+          `description must be ${MAX_IMPROVE_DESCRIPTION_LEN} characters or fewer`,
+        );
+      }
+    }
+
     let imageBytes = null;
     let imageName =
       typeof opts.filename === "string" && opts.filename.trim()
@@ -627,10 +714,14 @@ export class RemoveAcClient {
 
     if (typeof input === "string") {
       const trimmed = input.trim();
-      if (!trimmed || trimmed.includes("\0")) {
+      if (!trimmed || input.includes("\0")) {
         throw new RemoveAcError(400, "Unsupported input source");
       }
-      if (/^https?:\/\//i.test(trimmed)) {
+      if (looksLikeUrlCandidate(trimmed)) {
+        const urlErr = await validateRemoteImageUrl(trimmed, this.lookupImpl);
+        if (urlErr) {
+          throw new RemoveAcError(400, `Disallowed image_url (${urlErr})`);
+        }
         imageUrl = trimmed;
       } else {
         imageBytes = await fs.promises.readFile(trimmed);
@@ -647,12 +738,7 @@ export class RemoveAcClient {
     }
 
     if (imageBytes !== null) {
-      if (imageBytes.byteLength === 0) {
-        throw new RemoveAcError(400, "Image input must not be empty");
-      }
-      if (imageBytes.byteLength > MAX_UPLOAD_BYTES) {
-        throw new RemoveAcError(413, "Image input exceeds 25 MB maximum upload size (26214400 bytes)");
-      }
+      assertValidBinaryEnvelope(imageBytes, "Image input");
     }
 
     const fd = new FormData();
@@ -665,15 +751,11 @@ export class RemoveAcClient {
         imageName,
       );
     }
-    if (opts.tag !== undefined && opts.tag !== null && String(opts.tag).trim() !== "") {
-      fd.set("tag", String(opts.tag).trim());
+    if (cleanTag) {
+      fd.set("tag", cleanTag);
     }
-    if (
-      opts.description !== undefined &&
-      opts.description !== null &&
-      String(opts.description).trim() !== ""
-    ) {
-      fd.set("description", String(opts.description).trim());
+    if (cleanDescription) {
+      fd.set("description", cleanDescription);
     }
 
     const res = await this._request(`${this.baseUrl}/v1.0/improve`, {
@@ -708,6 +790,13 @@ export async function removeBackgroundFromImageFile(opts) {
 }
 
 export async function removeBackgroundFromImageUrl(opts) {
+  if (!opts || typeof opts.url !== "string" || !opts.url.trim()) {
+    throw new RemoveAcError(400, "Missing image URL");
+  }
+  const syncUrlErr = isDisallowedRemoteUrl(opts.url.trim());
+  if (syncUrlErr) {
+    throw new RemoveAcError(400, `Disallowed image_url (${syncUrlErr})`);
+  }
   const client = new RemoveAcClient({
     apiKey: opts.apiKey,
     baseUrl: opts.baseUrl,

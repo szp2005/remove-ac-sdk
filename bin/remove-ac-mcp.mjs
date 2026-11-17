@@ -39,7 +39,10 @@ export {
 export const SERVER_NAME = "remove-ac-mcp";
 export const SERVER_VERSION = "1.3.0";
 export const MAX_MCP_MESSAGE_BYTES = 8 * 1024 * 1024;
-const MAX_BG_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_BG_IMAGE_BYTES = MAX_IMAGE_BYTES;
+const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024;
+const SUPPORTED_IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 const MAX_MCP_HEADER_BYTES = 16 * 1024;
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 const SUPPORTED_PROTOCOLS = new Set([
@@ -483,11 +486,71 @@ export function mapToolCutoutOptions(args = {}) {
   };
 }
 
+function assertSupportedMcpImageExtension(filePath, label) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!SUPPORTED_IMAGE_EXTS.has(ext)) {
+    throw new Error(
+      `Unsupported ${label} extension '${ext || "(none)"}'. Expected one of: .png, .jpg, .jpeg, .webp`,
+    );
+  }
+}
+
+function hasSupportedImageMagicBytes(bytes) {
+  if (!bytes || bytes.byteLength < 3) return false;
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return true;
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return true;
+  }
+  if (
+    bytes.byteLength >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function assertSupportedMcpImageMagicHeader(filePath, label) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const header = Buffer.alloc(16);
+    const bytesRead = fs.readSync(fd, header, 0, header.length, 0);
+    if (!hasSupportedImageMagicBytes(header.subarray(0, bytesRead))) {
+      throw new Error(
+        `Invalid ${label}: file header is not a valid PNG, JPEG, or WebP image`,
+      );
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 async function prepareValidatedCutoutOptions(cutoutOpts, lookupFn) {
   const prepared = { ...cutoutOpts };
+  let bgByteLength = 0;
   if (prepared.bgImageFile) {
     const resolvedBg = path.resolve(prepared.bgImageFile);
     validateNoSymlinkPathChain(resolvedBg, "bg_image_path");
+    assertSupportedMcpImageExtension(resolvedBg, "bg_image_path");
     let bgStat = null;
     try {
       bgStat = fs.lstatSync(resolvedBg);
@@ -503,7 +566,9 @@ async function prepareValidatedCutoutOptions(cutoutOpts, lookupFn) {
     if (bgStat.size > MAX_BG_IMAGE_BYTES) {
       throw new Error(`Background image file exceeds 25 MB limit: ${resolvedBg}`);
     }
+    assertSupportedMcpImageMagicHeader(resolvedBg, "bg_image_path");
     prepared.bgImageFile = resolvedBg;
+    bgByteLength = bgStat.size;
   }
   if (prepared.bgImageUrl) {
     const bgUrlErr = await validateRemoteImageUrl(prepared.bgImageUrl, lookupFn);
@@ -511,7 +576,7 @@ async function prepareValidatedCutoutOptions(cutoutOpts, lookupFn) {
       throw new Error(bgUrlErr);
     }
   }
-  return prepared;
+  return { cutoutOpts: prepared, bgByteLength };
 }
 
 function toolSuccess(payload) {
@@ -625,6 +690,7 @@ export async function handleMcpRequest(
         }
         const resolvedInput = path.resolve(args.inputPath);
         validateNoSymlinkPathChain(resolvedInput, "inputPath");
+        assertSupportedMcpImageExtension(resolvedInput, "inputPath");
         let inputStat = null;
         try {
           inputStat = fs.lstatSync(resolvedInput);
@@ -638,8 +704,31 @@ export async function handleMcpRequest(
             result: toolFailure(`Input image file not found: ${resolvedInput}`),
           };
         }
+        if (inputStat.size <= 0) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: toolFailure(`Input image file is empty: ${resolvedInput}`),
+          };
+        }
+        if (inputStat.size > MAX_IMAGE_BYTES) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: toolFailure(`Input image file exceeds 25 MB limit: ${resolvedInput}`),
+          };
+        }
+        assertSupportedMcpImageMagicHeader(resolvedInput, "inputPath");
 
-        const cutoutOpts = await prepareValidatedCutoutOptions(rawCutoutOpts, options.lookup);
+        const { cutoutOpts, bgByteLength } = await prepareValidatedCutoutOptions(
+          rawCutoutOpts,
+          options.lookup,
+        );
+        if (bgByteLength > 0 && inputStat.size + bgByteLength > MAX_COMBINED_UPLOAD_BYTES) {
+          throw new Error(
+            `Combined inputPath and bg_image_path size exceeds 30 MB limit (${inputStat.size + bgByteLength} bytes)`,
+          );
+        }
 
         const rawOut =
           typeof args.outputPath === "string" && args.outputPath.trim()
@@ -647,9 +736,9 @@ export async function handleMcpRequest(
             : resolveDefaultOutputPath(resolvedInput, cutoutOpts.format);
         const overwrite = Boolean(args.overwrite);
         const resolvedOutput = ensureSafeWriteTarget(rawOut, overwrite, resolvedInput);
-        if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile && !overwrite) {
+        if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile) {
           throw new Error(
-            "outputPath resolves to bg_image_path; specify a separate outputPath or set overwrite: true",
+            "outputPath resolves to bg_image_path; specify a separate outputPath",
           );
         }
 
@@ -693,12 +782,12 @@ export async function handleMcpRequest(
         if (urlErr) {
           return { jsonrpc: "2.0", id, result: toolFailure(urlErr) };
         }
-        const cutoutOpts = await prepareValidatedCutoutOptions(rawCutoutOpts, options.lookup);
+        const { cutoutOpts } = await prepareValidatedCutoutOptions(rawCutoutOpts, options.lookup);
         const overwrite = Boolean(args.overwrite);
         const resolvedOutput = ensureSafeWriteTarget(args.outputPath, overwrite);
-        if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile && !overwrite) {
+        if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile) {
           throw new Error(
-            "outputPath resolves to bg_image_path; specify a separate outputPath or set overwrite: true",
+            "outputPath resolves to bg_image_path; specify a separate outputPath",
           );
         }
 

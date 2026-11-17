@@ -14,6 +14,7 @@ from .client import (
     derive_sub_idempotency_key,
     parse_image_dimensions,
     validate_https_endpoint_url,
+    validate_remote_image_url,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "parse_image_dimensions",
     "derive_sub_idempotency_key",
     "validate_https_endpoint_url",
+    "validate_remote_image_url",
 ]

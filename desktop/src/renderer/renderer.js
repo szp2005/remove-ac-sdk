@@ -85,6 +85,8 @@
       skipExistingLabel: "Skip images that already have cutouts",
       previewCutout: "Cutout Result",
       previewOriginal: "Original",
+      previewUnavailable:
+        "Inline preview is unavailable for this file. Use “Show in Folder” below to view the full file.",
       closeModalAria: "Close preview",
       revealInFolder: "Show in Folder",
       badgeQueued: "Queued",
@@ -177,6 +179,7 @@
       skipExistingLabel: "跳过已存在抠图结果的图片",
       previewCutout: "抠图结果",
       previewOriginal: "原图对比",
+      previewUnavailable: "当前文件暂无法内置预览，请点击下方「在文件夹中显示」直接查看原文件。",
       closeModalAria: "关闭预览弹窗",
       revealInFolder: "在文件夹中显示",
       badgeQueued: "排队中",
@@ -282,6 +285,16 @@
     renderKeySection();
     renderSettingsControls();
     renderQueue();
+    if (!el("previewModal").hidden && state.previewItem) {
+      const fallbackEl = el("previewFallbackMsg");
+      if (fallbackEl && !fallbackEl.hidden) {
+        const targetPath =
+          state.previewMode === "after" ? state.previewItem.outputPath : state.previewItem.inputPath;
+        const msg = t("previewUnavailable");
+        fallbackEl.textContent = msg;
+        el("previewMetaText").textContent = targetPath ? `${msg} · ${targetPath}` : msg;
+      }
+    }
   }
 
   function renderHeaderCredits() {
@@ -546,6 +559,8 @@
     renderSettingsControls();
   }
 
+  let previewRequestSeq = 0;
+
   async function openPreviewModal(item, triggerEl = null) {
     state.previewItem = item;
     state.previewMode = "after";
@@ -559,7 +574,16 @@
 
   function closePreviewModal() {
     if (el("previewModal").hidden) return;
+    previewRequestSeq += 1;
     el("previewModal").hidden = true;
+    const imgEl = el("previewImageEl");
+    imgEl.removeAttribute("src");
+    imgEl.hidden = false;
+    const fallbackEl = el("previewFallbackMsg");
+    if (fallbackEl) {
+      fallbackEl.hidden = true;
+      fallbackEl.textContent = "";
+    }
     state.previewItem = null;
     if (state.lastPreviewTriggerEl && state.lastPreviewTriggerEl.isConnected) {
       state.lastPreviewTriggerEl.focus();
@@ -570,14 +594,41 @@
   async function refreshPreviewStage() {
     const item = state.previewItem;
     if (!item) return;
+    const reqId = ++previewRequestSeq;
     el("previewTabAfter").classList.toggle("active", state.previewMode === "after");
     el("previewTabBefore").classList.toggle("active", state.previewMode === "before");
     const targetPath = state.previewMode === "after" ? item.outputPath : item.inputPath;
     const imgEl = el("previewImageEl");
+    const fallbackEl = el("previewFallbackMsg");
+    const metaEl = el("previewMetaText");
+
     imgEl.removeAttribute("src");
-    const res = await bridge.readPreviewDataUrl(targetPath);
-    if (res?.ok && res.dataUrl) {
+    imgEl.hidden = true;
+    if (fallbackEl) {
+      fallbackEl.hidden = true;
+      fallbackEl.textContent = "";
+    }
+    metaEl.textContent = targetPath || "";
+
+    let res = null;
+    try {
+      res = await bridge.readPreviewDataUrl(targetPath);
+    } catch {
+      res = null;
+    }
+    if (reqId !== previewRequestSeq || !state.previewItem) return;
+
+    if (res?.ok && typeof res.dataUrl === "string" && res.dataUrl) {
       imgEl.src = res.dataUrl;
+      imgEl.hidden = false;
+      metaEl.textContent = targetPath || "";
+    } else {
+      const msg = t("previewUnavailable");
+      if (fallbackEl) {
+        fallbackEl.textContent = msg;
+        fallbackEl.hidden = false;
+      }
+      metaEl.textContent = targetPath ? `${msg} · ${targetPath}` : msg;
     }
   }
 

@@ -510,6 +510,139 @@ class PythonSdkTest(unittest.TestCase):
             self.assertEqual(imp2["id"], "imp_2")
             self.assertIn(b'name="image_url"\r\n\r\nhttps://example.com/item.jpg', improve_reqs[1][3])
 
+    def test_r2_mf01_and_mf02_ssrf_guards_improve_bounds_envelope_and_hold_release(self):
+        import struct
+
+        png_54mp = (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">I", 13)
+            + b"IHDR"
+            + struct.pack(">II", 9000, 6000)
+            + b"\x08\x06\x00\x00\x00"
+            + b"\x00" * 32
+        )
+
+        # 1. MF-01: SSRF URL checks in submit_improve, remove_background, and RemoveBg shim (0 HTTP calls)
+        ssrf_hits = []
+        ssrf_client = RemoveAcClient(
+            api_key="rac_live_py_ssrf",
+            transport=lambda m, u, h, b, t: ssrf_hits.append(u) or (200, {}, b'{"id":"x"}'),
+            resolver=lambda _h: ["169.254.169.254"],
+        )
+        disallowed_urls = [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/internal.png",
+            "http://[::ffff:127.0.0.1]/secret.png",
+            "http://[64:ff9b::169.254.169.254]/secret.png",
+            "http://100.64.0.1/cgnat.png",
+            "http://localhost/admin.png",
+            "http://service.internal/img.png",
+            "http://2130706433/decimal.png",
+            "http://0x7f000001/hex.png",
+            "http://0177.0.0.1/octal.png",
+            "http://user:pass@example.com/private.png",
+            "ftp://example.com/file.png",
+            "file:///etc/passwd",
+            "https://rebind.attacker.example/img.png",
+        ]
+        for bad_u in disallowed_urls:
+            with self.assertRaises(RemoveAcError) as c1:
+                ssrf_client.submit_improve(bad_u, tag="probe")
+            self.assertEqual(c1.exception.status_code, 400)
+            with self.assertRaises(RemoveAcError) as c2:
+                ssrf_client.remove_background(bad_u)
+            self.assertEqual(c2.exception.status_code, 400)
+            with self.assertRaises(RemoveAcError) as c3:
+                ssrf_client.remove_background(b"fg", bg_image_url=bad_u)
+            self.assertEqual(c3.exception.status_code, 400)
+
+        rmbg_shim = RemoveBg(
+            "rac_live_py_ssrf",
+            transport=lambda m, u, h, b, t: ssrf_hits.append(u) or (200, {}, b"OK"),
+        )
+        with self.assertRaises(RemoveAcError) as shim_ctx:
+            rmbg_shim.remove_background_from_img_url("/etc/passwd", new_file_name="")
+        self.assertEqual(shim_ctx.exception.status_code, 400)
+
+        # submit_improve bounds: tag <= 64, description <= 500, 0-byte, >25MB, >50MP
+        for bad_imp_kw in (
+            {"tag": "t" * 65},
+            {"tag": 12345},
+            {"description": "d" * 501},
+            {"description": ["not-a-str"]},
+        ):
+            with self.assertRaises(RemoveAcError) as b_ctx:
+                ssrf_client.submit_improve(b"valid", **bad_imp_kw)
+            self.assertEqual(b_ctx.exception.status_code, 400)
+        with self.assertRaises(RemoveAcError) as empty_imp:
+            ssrf_client.submit_improve(b"")
+        self.assertEqual(empty_imp.exception.status_code, 400)
+        with self.assertRaises(RemoveAcError) as big_imp:
+            ssrf_client.submit_improve(b"x" * (25 * 1024 * 1024 + 1))
+        self.assertEqual(big_imp.exception.status_code, 413)
+        with self.assertRaises(RemoveAcError) as mp_imp:
+            ssrf_client.submit_improve(png_54mp)
+        self.assertEqual(mp_imp.exception.status_code, 400)
+        self.assertEqual(len(ssrf_hits), 0)
+
+        # 2. MF-02: Upfront binary/combined <= 30 MB checks (0 HTTP calls) & hold release on ALL non-2xx directEndpoint statuses
+        with self.assertRaises(RemoveAcError) as fg_empty:
+            ssrf_client.remove_background(b"")
+        self.assertEqual(fg_empty.exception.status_code, 400)
+        with self.assertRaises(RemoveAcError) as fg_big:
+            ssrf_client.remove_background(b"x" * (25 * 1024 * 1024 + 1))
+        self.assertEqual(fg_big.exception.status_code, 413)
+        with self.assertRaises(RemoveAcError) as fg_mp:
+            ssrf_client.remove_background(png_54mp)
+        self.assertEqual(fg_mp.exception.status_code, 400)
+        with self.assertRaises(RemoveAcError) as bg_mp:
+            ssrf_client.remove_background(b"fg", bg_image_file=png_54mp)
+        self.assertEqual(bg_mp.exception.status_code, 400)
+        with self.assertRaises(RemoveAcError) as combined_big:
+            ssrf_client.remove_background(
+                b"x" * (18 * 1024 * 1024),
+                bg_image_file=b"y" * (16 * 1024 * 1024),
+            )
+        self.assertEqual(combined_big.exception.status_code, 413)
+        self.assertEqual(len(ssrf_hits), 0)
+
+        for status in (400, 401, 403, 413, 415, 422, 429, 500, 502, 503, 504):
+            rel_calls = []
+
+            def status_transport(method, url, headers, body, timeout):
+                if url.endswith("/v1.0/removebg/ticket"):
+                    return (
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps(
+                            {
+                                "data": {
+                                    "ticket": f"t_{status}",
+                                    "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                                    "holdId": f"h_{status}",
+                                    "releaseToken": f"r_{status}",
+                                }
+                            }
+                        ).encode("utf-8"),
+                    )
+                if url.endswith("/v1.0/removebg/ticket/release"):
+                    rel_calls.append(json.loads(body.decode("utf-8")))
+                    return 200, {"content-type": "application/json"}, b'{"ok":true}'
+                return status, {"content-type": "application/json"}, b'{"errors":[{"code":"err"}]}'
+
+            tc = RemoveAcClient(
+                api_key="rac_live_py_hold",
+                transport=status_transport,
+                resolver=lambda _h: ["93.184.216.34"],
+            )
+            with self.assertRaises(RemoveAcError) as st_ctx:
+                tc.remove_background(b"abc", direct=True)
+            self.assertEqual(st_ctx.exception.status_code, status)
+            self.assertEqual(
+                rel_calls,
+                [{"holdId": f"h_{status}", "releaseToken": f"r_{status}"}],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,8 @@ const path = require("node:path");
 const DEFAULT_BASE_URL = "https://remove.ac";
 const MAX_INPUT_BYTES = 25 * 1024 * 1024; // 25 MB
 const MAX_INPUT_PIXELS = 50_000_000; // 50 MP
+const MAX_PREVIEW_FILE_BYTES = 90 * 1024 * 1024; // 90 MB (50 MP lossless RGBA PNG cutouts)
+const MAX_PREVIEW_FALLBACK_BYTES = 35 * 1024 * 1024; // 35 MB (50 MP WebP cutouts / 25 MB WebP inputs)
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024; // 4 MB Vercel payload threshold
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
@@ -1253,10 +1255,69 @@ async function runBatchQueue(items, workerFn, options = {}) {
   return summary;
 }
 
+async function readPreviewDataUrlPayload(
+  rawFilePath,
+  {
+    allowedFilePaths,
+    nativeImageImpl,
+    maxStatBytes = MAX_PREVIEW_FILE_BYTES,
+    maxFallbackBytes = MAX_PREVIEW_FALLBACK_BYTES,
+  } = {}
+) {
+  const resolved = path.resolve(String(rawFilePath || ""));
+  if (!allowedFilePaths || !allowedFilePaths.has(resolved)) {
+    return { ok: false, code: "forbidden_path", message: "Preview path is not authorized" };
+  }
+  const ext = path.extname(resolved).toLowerCase();
+  if (ext === ".zip") {
+    return { ok: false, code: "zip_no_preview", message: "ZIP archive cannot be previewed inline" };
+  }
+  try {
+    const st = await fs.promises.stat(resolved);
+    if (!st.isFile() || st.size <= 0 || st.size > maxStatBytes) {
+      return { ok: false, code: "invalid_preview_size", message: "Preview unavailable" };
+    }
+    if (nativeImageImpl && typeof nativeImageImpl.createFromPath === "function") {
+      const img = nativeImageImpl.createFromPath(resolved);
+      if (img && !img.isEmpty()) {
+        const sz = img.getSize();
+        const previewImg = sz.width > 960 ? img.resize({ width: 960, quality: "good" }) : img;
+        return {
+          ok: true,
+          dataUrl: previewImg.toDataURL(),
+          width: sz.width,
+          height: sz.height,
+        };
+      }
+    }
+    if (st.size <= maxFallbackBytes) {
+      const buf = await fs.promises.readFile(resolved);
+      const dims = parseImageDimensions(buf);
+      const mime =
+        ext === ".webp"
+          ? "image/webp"
+          : ext === ".jpg" || ext === ".jpeg"
+            ? "image/jpeg"
+            : "image/png";
+      return {
+        ok: true,
+        dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
+        width: dims ? dims.width : 0,
+        height: dims ? dims.height : 0,
+      };
+    }
+    return { ok: false, code: "decode_failed", message: "Preview unavailable" };
+  } catch {
+    return { ok: false, code: "read_error", message: "Preview unavailable" };
+  }
+}
+
 module.exports = {
   DEFAULT_BASE_URL,
   MAX_INPUT_BYTES,
   MAX_INPUT_PIXELS,
+  MAX_PREVIEW_FILE_BYTES,
+  MAX_PREVIEW_FALLBACK_BYTES,
   DIRECT_THRESHOLD_BYTES,
   SUPPORTED_INPUT_EXTENSIONS,
   ALLOWED_SIZES,
@@ -1275,6 +1336,7 @@ module.exports = {
   collectInputItems,
   resolveOutputTarget,
   writeFileAtomically,
+  readPreviewDataUrlPayload,
   CredentialManager,
   DesktopApiClient,
   runBatchQueue,

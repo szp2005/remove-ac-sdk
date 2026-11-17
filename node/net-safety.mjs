@@ -127,7 +127,7 @@ export function isDisallowedRemoteUrl(rawUrl) {
     return "URLs with embedded credentials are not permitted";
   }
   const rawHost = parsed.hostname.toLowerCase();
-  const host = rawHost.replace(/^\[|\]$/g, "");
+  const host = rawHost.replace(/^\[|\]$/g, "").replace(/\.+$/, "");
   if (
     !host ||
     host === "localhost" ||
@@ -150,7 +150,12 @@ export function isDisallowedRemoteUrl(rawUrl) {
     }
     return null;
   }
-  if (!host.includes(".") || /^\d+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) {
+  const labels = host.split(".");
+  if (
+    labels.length < 2 ||
+    labels.some((lbl) => !lbl) ||
+    labels.every((lbl) => /^\d+$/.test(lbl) || /^0x[0-9a-f]+$/i.test(lbl))
+  ) {
     return "Single-label or non-standard numeric hostnames are not permitted";
   }
   return null;
@@ -165,7 +170,7 @@ function isRfc2544BenchmarkIpv4(ip) {
 
 function isFirstPartyRemoveAcHttps(parsedUrl) {
   if (!parsedUrl || parsedUrl.protocol !== "https:") return false;
-  const host = parsedUrl.hostname.toLowerCase();
+  const host = parsedUrl.hostname.toLowerCase().replace(/\.+$/, "");
   return host === "remove.ac" || host.endsWith(".remove.ac");
 }
 
@@ -174,14 +179,16 @@ export async function validateRemoteImageUrl(rawUrl, lookupFn = dns.promises.loo
   if (syncErr) return syncErr;
 
   const parsed = new URL(String(rawUrl));
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
   if (net.isIPv4(host) || host.includes(":")) {
     return null;
   }
 
+  const isDefaultLookup = !lookupFn || lookupFn === dns.promises.lookup;
+  const effectiveLookup = lookupFn || dns.promises.lookup;
   let records;
   try {
-    records = await lookupFn(host, { all: true, verbatim: true });
+    records = await effectiveLookup(host, { all: true, verbatim: true });
   } catch {
     return `Unable to resolve hostname '${host}'`;
   }
@@ -189,7 +196,7 @@ export async function validateRemoteImageUrl(rawUrl, lookupFn = dns.promises.loo
   if (list.length === 0) {
     return `Hostname '${host}' returned no DNS records`;
   }
-  const allowTunFakeIp = isFirstPartyRemoveAcHttps(parsed);
+  const allowTunFakeIp = isDefaultLookup || isFirstPartyRemoveAcHttps(parsed);
   for (const rec of list) {
     const addr = typeof rec === "string" ? rec : rec?.address;
     if (!addr) {
