@@ -9,8 +9,11 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const {
+  ALLOWED_SHADOW_TYPES,
+  ALLOWED_SIZES,
   CredentialManager,
   DesktopApiClient,
+  MAX_INPUT_PIXELS,
   areSameOrCaseCollidingPaths,
   collectInputItems,
   isPlausibleApiKey,
@@ -20,6 +23,7 @@ const {
   resolveOutputTarget,
   runBatchQueue,
   sanitizeSettings,
+  shouldPreFlightViaTicket,
   validateServiceEndpointUrl,
   writeFileAtomically,
 } = require("../src/core.cjs");
@@ -423,18 +427,59 @@ test("DesktopApiClient handles /v1.0/account, /v1.0/remove, 503 retries, 413 tic
       /Refused untrusted direct host/
     );
 
-    // 4. Rejects >40 MP image locally before touching network
+    // 4. Accepts 48 MP (<= 50 MP) via ticket and rejects >50 MP image locally before touching network
+    maliciousDirectUrl = false;
+    const png48Mp = makeFakeLargeHeaderPng(8000, 6000); // 48 MP
+    const r48 = await client.removeBackgroundBuffer(
+      png48Mp,
+      "48mp.png",
+      sanitizeSettings({ size: "50mp", format: "png", addShadow: true, shadowType: "reflection" })
+    );
+    assert.equal(r48.buffer.length, pngOut.length);
+
     const prevRemoveCalls = removeCalls;
     const prevTicketCalls = ticketCalls;
-    const hugePng = makeFakeLargeHeaderPng(8000, 6000); // 48 MP
+    const hugePng = makeFakeLargeHeaderPng(9000, 6000); // 54 MP
     await assert.rejects(
-      () => client.removeBackgroundBuffer(hugePng, "48mp.png", {}),
-      /exceeds 40 MP maximum/
+      () => client.removeBackgroundBuffer(hugePng, "54mp.png", {}),
+      /exceeds 50 MP maximum/
     );
     assert.equal(removeCalls, prevRemoveCalls);
     assert.equal(ticketCalls, prevTicketCalls);
   } finally {
     server.close();
+  }
+});
+
+test("Desktop v1.1.0 enforces 50 MP ceiling, full size/shadow parity, and accurate ticket preflight tiers", () => {
+  assert.equal(MAX_INPUT_PIXELS, 50_000_000);
+  assert.deepEqual(
+    ALLOWED_SIZES,
+    new Set(["auto", "full", "50mp", "25mp", "4k", "hd", "medium", "regular", "small", "preview"])
+  );
+  assert.ok(ALLOWED_SHADOW_TYPES.has("reflection") && ALLOWED_SHADOW_TYPES.has("none"));
+
+  assert.equal(sanitizeSettings({ size: "50mp" }).size, "50mp");
+  assert.equal(sanitizeSettings({ size: "25mp" }).size, "25mp");
+  assert.equal(sanitizeSettings({ size: "medium" }).size, "medium");
+  assert.equal(sanitizeSettings({ shadowType: "reflection" }).shadowType, "reflection");
+  assert.equal(sanitizeSettings({ shadowType: "none" }).shadowType, "none");
+
+  const png8Mp = makeFakeLargeHeaderPng(4000, 2000); // 8 MP
+  const png20Mp = makeFakeLargeHeaderPng(5000, 4000); // 20 MP
+  const png45Mp = makeFakeLargeHeaderPng(9000, 5000); // 45 MP
+
+  // Preview/small/regular/medium/hd stay <= 4 MP -> never preflight
+  for (const tier of ["preview", "small", "regular", "medium", "hd"]) {
+    assert.equal(shouldPreFlightViaTicket(png45Mp, tier, "png", false), false);
+  }
+  // 4k caps at 10 MP: 8 MP uncropped (>5 MP) preflights; 20 MP cropped (capped at 10 MP <= 10 MP) stays sync
+  assert.equal(shouldPreFlightViaTicket(png8Mp, "4k", "png", false), true);
+  assert.equal(shouldPreFlightViaTicket(png20Mp, "4k", "png", true), false);
+  // 25mp, 50mp, full, auto on 20 MP and 45 MP preflight via ticket
+  for (const hiTier of ["25mp", "50mp", "full", "auto"]) {
+    assert.equal(shouldPreFlightViaTicket(png20Mp, hiTier, "png", true), true);
+    assert.equal(shouldPreFlightViaTicket(png45Mp, hiTier, "png", true), true);
   }
 });
 

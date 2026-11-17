@@ -8,7 +8,7 @@ import {
   validateHttpsEndpointUrl,
 } from "./net-safety.mjs";
 
-export const SDK_VERSION = "1.2.0";
+export const SDK_VERSION = "1.3.0";
 export const USER_AGENT = `remove-ac-node-sdk/${SDK_VERSION}`;
 
 export const VALID_SIZES = Object.freeze([
@@ -52,8 +52,74 @@ const VALID_SHADOW_SET = new Set(VALID_SHADOW_TYPES);
 
 const DEFAULT_BASE_URL = "https://remove.ac";
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
+
+function toNodeBuffer(val) {
+  if (Buffer.isBuffer(val)) return val;
+  if (val instanceof Uint8Array) return Buffer.from(val.buffer, val.byteOffset, val.byteLength);
+  if (val instanceof ArrayBuffer) return Buffer.from(val);
+  return null;
+}
+
+function inferImageMimeType(bytes, fileName = "") {
+  if (bytes && bytes.byteLength >= 12) {
+    if (
+      bytes[0] === 0x89 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x4e &&
+      bytes[3] === 0x47
+    ) {
+      return "image/png";
+    }
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+      return "image/jpeg";
+    }
+    if (
+      bytes[0] === 0x52 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x46 &&
+      bytes[8] === 0x57 &&
+      bytes[9] === 0x45 &&
+      bytes[10] === 0x42 &&
+      bytes[11] === 0x50
+    ) {
+      return "image/webp";
+    }
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) {
+      return "image/gif";
+    }
+  }
+  const ext = path.extname(String(fileName || "")).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "application/octet-stream";
+}
+
+function decodeBase64Image(rawB64, label) {
+  const trimmed = String(rawB64 || "").trim();
+  const withoutPrefix = trimmed.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/i, "");
+  const compact = withoutPrefix.replace(/\s+/g, "");
+  if (!compact || compact.length % 4 === 1) {
+    throw new RemoveAcError(400, `Invalid ${label}: malformed base64 payload`);
+  }
+  const padded = compact.length % 4 === 0 ? compact : compact + "=".repeat(4 - (compact.length % 4));
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(padded)) {
+    throw new RemoveAcError(400, `Invalid ${label}: malformed base64 payload`);
+  }
+  const bytes = Buffer.from(padded, "base64");
+  if (bytes.byteLength === 0) {
+    throw new RemoveAcError(400, `${label} must not be empty`);
+  }
+  if (bytes.byteLength > MAX_UPLOAD_BYTES) {
+    throw new RemoveAcError(413, `${label} exceeds 25 MB maximum upload size (26214400 bytes)`);
+  }
+  return { cleanB64: trimmed, bytes };
+}
 
 export function parseImageDimensions(input) {
   const bytes =
@@ -279,6 +345,32 @@ export class RemoveAcClient {
       }
     }
 
+    const rawBgColor =
+      options.bgColor !== undefined && options.bgColor !== null ? String(options.bgColor).trim() : "";
+    const rawBgImageUrl =
+      options.bgImageUrl !== undefined && options.bgImageUrl !== null ? String(options.bgImageUrl).trim() : "";
+    const hasBgImageFile = options.bgImageFile !== undefined && options.bgImageFile !== null;
+    const hasBgImageFileB64Arg = options.bgImageFileB64 !== undefined && options.bgImageFileB64 !== null;
+    if (hasBgImageFileB64Arg && typeof options.bgImageFileB64 !== "string") {
+      throw new RemoveAcError(400, "bgImageFileB64 must be a base64 string");
+    }
+    const rawBgImageFileB64 = hasBgImageFileB64Arg ? options.bgImageFileB64.trim() : "";
+    if (hasBgImageFileB64Arg && !rawBgImageFileB64) {
+      throw new RemoveAcError(400, "bgImageFileB64 must not be empty");
+    }
+
+    const bgSourceCount =
+      (rawBgColor ? 1 : 0) +
+      (rawBgImageUrl ? 1 : 0) +
+      (hasBgImageFile ? 1 : 0) +
+      (rawBgImageFileB64 ? 1 : 0);
+    if (bgSourceCount > 1) {
+      throw new RemoveAcError(
+        400,
+        "Specify at most one of bgColor, bgImageUrl, bgImageFile, or bgImageFileB64",
+      );
+    }
+
     if (options.idempotencyKey !== undefined) {
       const trimmedIdem = String(options.idempotencyKey).trim();
       if (!trimmedIdem || trimmedIdem.length > 255) {
@@ -286,6 +378,50 @@ export class RemoveAcClient {
       }
     }
     const idem = options.idempotencyKey ? String(options.idempotencyKey).trim() : `sdk-${crypto.randomUUID()}`;
+
+    let bgFileBytes = null;
+    let bgFileName = "bg-image.png";
+    let bgFileMime = "application/octet-stream";
+    let bgB64Clean = "";
+    let bgB64DecodedBytes = null;
+
+    if (hasBgImageFile) {
+      if (typeof options.bgImageFile === "string") {
+        const trimmedBgPath = options.bgImageFile.trim();
+        if (!trimmedBgPath || trimmedBgPath.includes("\0")) {
+          throw new RemoveAcError(400, "bgImageFile path must not be empty");
+        }
+        if (/^https?:\/\//i.test(trimmedBgPath)) {
+          throw new RemoveAcError(
+            400,
+            "bgImageFile expects a local file path or byte buffer; use bgImageUrl for remote URLs",
+          );
+        }
+        bgFileBytes = await fs.promises.readFile(trimmedBgPath);
+        bgFileName = path.basename(trimmedBgPath) || "bg-image.png";
+      } else {
+        const convertedBg = toNodeBuffer(options.bgImageFile);
+        if (!convertedBg) {
+          throw new RemoveAcError(
+            400,
+            "Unsupported bgImageFile source; expected file path string, Buffer, Uint8Array, or ArrayBuffer",
+          );
+        }
+        bgFileBytes = convertedBg;
+      }
+      if (bgFileBytes.byteLength === 0) {
+        throw new RemoveAcError(400, "bgImageFile must not be empty");
+      }
+      if (bgFileBytes.byteLength > MAX_UPLOAD_BYTES) {
+        throw new RemoveAcError(413, "bgImageFile exceeds 25 MB maximum upload size (26214400 bytes)");
+      }
+      bgFileMime = inferImageMimeType(bgFileBytes, bgFileName);
+    } else if (rawBgImageFileB64) {
+      const decodedBg = decodeBase64Image(rawBgImageFileB64, "bgImageFileB64");
+      bgB64Clean = decodedBg.cleanB64;
+      bgB64DecodedBytes = decodedBg.bytes;
+      bgFileMime = inferImageMimeType(bgB64DecodedBytes, bgFileName);
+    }
 
     let sourceBytes = null;
     let sourceName = "image.png";
@@ -298,13 +434,16 @@ export class RemoveAcClient {
         sourceBytes = fs.readFileSync(input);
         sourceName = path.basename(input);
       }
-    } else if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
-      sourceBytes = Buffer.from(input);
-    } else if (input instanceof ArrayBuffer) {
-      sourceBytes = Buffer.from(input);
     } else {
-      throw new RemoveAcError(400, "Unsupported input source");
+      const convertedInput = toNodeBuffer(input);
+      if (convertedInput) {
+        sourceBytes = convertedInput;
+      } else {
+        throw new RemoveAcError(400, "Unsupported input source");
+      }
     }
+
+    const ticketBgBytes = bgFileBytes || bgB64DecodedBytes;
 
     const runViaTicket = async (suffix) => {
       if (!sourceBytes) throw new RemoveAcError(413, "Ticket mode requires binary input");
@@ -319,8 +458,14 @@ export class RemoveAcClient {
         ...(options.roi ? { roi: options.roi } : {}),
         ...(options.scale ? { scale: options.scale } : {}),
         ...(options.position ? { position: options.position } : {}),
-        ...(options.bgColor ? { bg_color: options.bgColor } : {}),
-        ...(options.bgImageUrl ? { bg_image_url: options.bgImageUrl } : {}),
+        ...(rawBgColor ? { bg_color: rawBgColor } : {}),
+        ...(rawBgImageUrl ? { bg_image_url: rawBgImageUrl } : {}),
+        ...(ticketBgBytes
+          ? {
+              bgImageSha256: sha256Hex(ticketBgBytes),
+              bgImageByteLength: ticketBgBytes.byteLength,
+            }
+          : {}),
         ...(options.crop !== undefined ? { crop: options.crop } : {}),
         ...(options.cropMargin ? { crop_margin: options.cropMargin } : {}),
         ...(options.addShadow !== undefined ? { add_shadow: options.addShadow } : {}),
@@ -367,6 +512,9 @@ export class RemoveAcClient {
       }
       const fd = new FormData();
       fd.set("image_file", new Blob([sourceBytes]), sourceName);
+      if (ticketBgBytes) {
+        fd.set("bg_image_file", new Blob([ticketBgBytes], { type: bgFileMime }), bgFileName);
+      }
       let dRes;
       try {
         dRes = await this._request(directEndpoint, {
@@ -393,10 +541,18 @@ export class RemoveAcClient {
       };
     };
 
+    const syncBgWireBytes = bgFileBytes
+      ? bgFileBytes.byteLength
+      : bgB64Clean
+        ? Buffer.byteLength(bgB64Clean, "utf8")
+        : 0;
+
     if (
       sourceBytes &&
       (options.direct ||
         sourceBytes.byteLength > DIRECT_THRESHOLD_BYTES ||
+        (ticketBgBytes && ticketBgBytes.byteLength > DIRECT_THRESHOLD_BYTES) ||
+        sourceBytes.byteLength + syncBgWireBytes > DIRECT_THRESHOLD_BYTES ||
         shouldPreFlightViaTicket(sourceBytes, size, format, channels, Boolean(options.crop)))
     ) {
       return runViaTicket("direct");
@@ -414,8 +570,12 @@ export class RemoveAcClient {
       if (options.roi) fd.set("roi", options.roi);
       if (options.scale) fd.set("scale", options.scale);
       if (options.position) fd.set("position", options.position);
-      if (options.bgColor) fd.set("bg_color", options.bgColor);
-      if (options.bgImageUrl) fd.set("bg_image_url", options.bgImageUrl);
+      if (rawBgColor) fd.set("bg_color", rawBgColor);
+      if (rawBgImageUrl) fd.set("bg_image_url", rawBgImageUrl);
+      if (bgFileBytes) {
+        fd.set("bg_image_file", new Blob([bgFileBytes], { type: bgFileMime }), bgFileName);
+      }
+      if (bgB64Clean) fd.set("bg_image_file_b64", bgB64Clean);
       if (options.crop !== undefined) fd.set("crop", String(options.crop));
       if (options.cropMargin) fd.set("crop_margin", options.cropMargin);
       if (options.addShadow !== undefined) fd.set("add_shadow", String(options.addShadow));
@@ -452,6 +612,85 @@ export class RemoveAcClient {
       height: Number.parseInt(res.headers.get("X-Height") || "0", 10),
       creditsCharged: Number.parseFloat(res.headers.get("X-Credits-Charged") || "0"),
       mediaType: res.headers.get("Content-Type") || "image/png",
+    };
+  }
+
+  async submitImprove(input, options = {}) {
+    if (!this.apiKey) throw new RemoveAcError(403, "Missing remove.ac API key");
+    const opts = options && typeof options === "object" ? options : {};
+    let imageBytes = null;
+    let imageName =
+      typeof opts.filename === "string" && opts.filename.trim()
+        ? path.basename(opts.filename.trim())
+        : "image.png";
+    let imageUrl = null;
+
+    if (typeof input === "string") {
+      const trimmed = input.trim();
+      if (!trimmed || trimmed.includes("\0")) {
+        throw new RemoveAcError(400, "Unsupported input source");
+      }
+      if (/^https?:\/\//i.test(trimmed)) {
+        imageUrl = trimmed;
+      } else {
+        imageBytes = await fs.promises.readFile(trimmed);
+        if (!(typeof opts.filename === "string" && opts.filename.trim())) {
+          imageName = path.basename(trimmed) || "image.png";
+        }
+      }
+    } else {
+      const converted = toNodeBuffer(input);
+      if (!converted) {
+        throw new RemoveAcError(400, "Unsupported input source");
+      }
+      imageBytes = converted;
+    }
+
+    if (imageBytes !== null) {
+      if (imageBytes.byteLength === 0) {
+        throw new RemoveAcError(400, "Image input must not be empty");
+      }
+      if (imageBytes.byteLength > MAX_UPLOAD_BYTES) {
+        throw new RemoveAcError(413, "Image input exceeds 25 MB maximum upload size (26214400 bytes)");
+      }
+    }
+
+    const fd = new FormData();
+    if (imageUrl) {
+      fd.set("image_url", imageUrl);
+    } else {
+      fd.set(
+        "image_file",
+        new Blob([imageBytes], { type: inferImageMimeType(imageBytes, imageName) }),
+        imageName,
+      );
+    }
+    if (opts.tag !== undefined && opts.tag !== null && String(opts.tag).trim() !== "") {
+      fd.set("tag", String(opts.tag).trim());
+    }
+    if (
+      opts.description !== undefined &&
+      opts.description !== null &&
+      String(opts.description).trim() !== ""
+    ) {
+      fd.set("description", String(opts.description).trim());
+    }
+
+    const res = await this._request(`${this.baseUrl}/v1.0/improve`, {
+      method: "POST",
+      headers: { "X-Api-Key": this.apiKey },
+      body: fd,
+    });
+    if (!res.ok) throw new RemoveAcError(res.status, await res.text());
+    const json = await res.json();
+    const unwrapped =
+      json && typeof json === "object" && json.data && typeof json.data === "object"
+        ? json.data
+        : json;
+    return {
+      ...(unwrapped && typeof unwrapped === "object" ? unwrapped : {}),
+      id: String(unwrapped?.id ?? ""),
+      status: String(unwrapped?.status ?? "submitted"),
     };
   }
 }

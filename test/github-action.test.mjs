@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  ACTION_VERSION,
   resolveSafeActionPath,
   runGithubAction,
   validateActionBaseUrl,
@@ -14,9 +15,12 @@ const TINY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
   "base64"
 );
+const TEMP_ROOT = fs.existsSync("/Volumes/Expansion/dev-tools/build-temp")
+  ? "/Volumes/Expansion/dev-tools/build-temp"
+  : os.tmpdir();
 
 function createTempWorkspace(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remove-ac-gha-test-"));
+  const dir = fs.mkdtempSync(path.join(TEMP_ROOT, "remove-ac-gha-test-"));
   t.after(() => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -176,7 +180,7 @@ test("GitHub Action blocks SSRF on image_url and non-HTTPS or private base_url",
 
 test("GitHub Action blocks workspace traversal, symlinks, and runner control file overwrites", (t) => {
   const ws = createTempWorkspace(t);
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "remove-ac-outside-"));
+  const outside = fs.mkdtempSync(path.join(TEMP_ROOT, "remove-ac-outside-"));
   t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
 
   const envFile = path.join(ws, "_github_env");
@@ -220,7 +224,7 @@ test("writeGithubOutputs safely wraps multiline values without delimiter injecti
 
 test("MF-3 & MF-4: GitHub Action protects GITHUB_STATE, uncreated runner files under symlinked dirs, dangling symlink ancestors (0 API calls), and exact shadow_type allowlist", async (t) => {
   const ws = createTempWorkspace(t);
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "remove-ac-outside-mf3-"));
+  const outside = fs.mkdtempSync(path.join(TEMP_ROOT, "remove-ac-outside-mf3-"));
   t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
 
   // 1) GITHUB_STATE must be protected even if not yet created on disk
@@ -351,4 +355,95 @@ test("MF-3 & MF-4: GitHub Action protects GITHUB_STATE, uncreated runner files u
     });
     assert.equal(res.processed_count, "1");
   }
+});
+
+test("v1.3.0 GitHub Action supports bg-image-file and bg-image-url and blocks traversal/SSRF/conflicts", async (t) => {
+  assert.equal(ACTION_VERSION, "1.3.0");
+  const ws = createTempWorkspace(t);
+  const fgFile = path.join(ws, "subject.png");
+  const bgFile = path.join(ws, "backdrop.png");
+  fs.writeFileSync(fgFile, TINY_PNG);
+  fs.writeFileSync(bgFile, TINY_PNG);
+
+  // 1. Hyphenated INPUT_BG-IMAGE-FILE works even when INPUT_BG_IMAGE_FILE="" default is set by runner
+  let seenBgBlob = null;
+  const rFile = await runGithubAction({
+    env: {
+      GITHUB_WORKSPACE: ws,
+      INPUT_API_KEY: "rac_live_test",
+      INPUT_INPUT_PATH: "subject.png",
+      INPUT_OUTPUT_PATH: "subject-bg-file.png",
+      INPUT_BG_IMAGE_FILE: "",
+      "INPUT_BG-IMAGE-FILE": "backdrop.png",
+      INPUT_BASE_URL: "http://127.0.0.1:8787",
+    },
+    cwd: ws,
+    stdout: { write() {} },
+    allowLoopbackBaseUrlForTest: true,
+    fetchImpl: async (_url, init) => {
+      seenBgBlob = init.body.get("bg_image_file");
+      return new Response(TINY_PNG, {
+        status: 200,
+        headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+      });
+    },
+  });
+  assert.equal(rFile.processed_count, "1");
+  assert.ok(seenBgBlob instanceof Blob);
+  assert.equal(seenBgBlob.name, "backdrop.png");
+
+  // 2. bg-image-url passes SSRF check for public host and sends bg_image_url
+  let seenBgUrl = null;
+  const rUrl = await runGithubAction({
+    env: {
+      GITHUB_WORKSPACE: ws,
+      INPUT_API_KEY: "rac_live_test",
+      INPUT_INPUT_PATH: "subject.png",
+      INPUT_OUTPUT_PATH: "subject-bg-url.png",
+      "INPUT_BG-IMAGE-URL": "https://cdn.example.com/bg.jpg",
+      INPUT_BASE_URL: "http://127.0.0.1:8787",
+    },
+    cwd: ws,
+    stdout: { write() {} },
+    allowLoopbackBaseUrlForTest: true,
+    lookupFn: async () => [{ address: "93.184.216.34", family: 4 }],
+    fetchImpl: async (_url, init) => {
+      seenBgUrl = init.body.get("bg_image_url");
+      return new Response(TINY_PNG, {
+        status: 200,
+        headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+      });
+    },
+  });
+  assert.equal(rUrl.processed_count, "1");
+  assert.equal(seenBgUrl, "https://cdn.example.com/bg.jpg");
+
+  // 3. Rejects outside-workspace bg-image-file, private bg-image-url, and mutual exclusion with 0 HTTP calls
+  let blockedHits = 0;
+  for (const badEnv of [
+    { "INPUT_BG-IMAGE-FILE": "../outside.png" },
+    { "INPUT_BG-IMAGE-URL": "http://127.0.0.1:8080/internal-bg.png" },
+    { INPUT_BG_COLOR: "FFFFFF", "INPUT_BG-IMAGE-FILE": "backdrop.png" },
+  ]) {
+    await assert.rejects(() =>
+      runGithubAction({
+        env: {
+          GITHUB_WORKSPACE: ws,
+          INPUT_API_KEY: "rac_live_test",
+          INPUT_INPUT_PATH: "subject.png",
+          INPUT_OUTPUT_PATH: "unused.png",
+          INPUT_BASE_URL: "http://127.0.0.1:8787",
+          ...badEnv,
+        },
+        cwd: ws,
+        stdout: { write() {} },
+        allowLoopbackBaseUrlForTest: true,
+        fetchImpl: async () => {
+          blockedHits += 1;
+          return new Response(TINY_PNG, { status: 200 });
+        },
+      })
+    );
+  }
+  assert.equal(blockedHits, 0);
 });

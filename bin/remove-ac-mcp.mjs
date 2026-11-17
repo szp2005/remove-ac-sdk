@@ -37,8 +37,9 @@ export {
 };
 
 export const SERVER_NAME = "remove-ac-mcp";
-export const SERVER_VERSION = "1.2.0";
+export const SERVER_VERSION = "1.3.0";
 export const MAX_MCP_MESSAGE_BYTES = 8 * 1024 * 1024;
+const MAX_BG_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_MCP_HEADER_BYTES = 16 * 1024;
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 const SUPPORTED_PROTOCOLS = new Set([
@@ -98,6 +99,26 @@ const SHARED_CUTOUT_PROPERTIES = {
   bgColor: {
     type: "string",
     description: "Optional solid background hex color (e.g. 'FFFFFF') instead of transparency.",
+  },
+  bgImagePath: {
+    type: "string",
+    description:
+      "Optional local background image file path (.png, .jpg, .jpeg, .webp, up to 25 MB / 50 MP) to composite behind the cutout.",
+  },
+  bgImageUrl: {
+    type: "string",
+    description:
+      "Optional public http(s) background image URL to composite behind the cutout.",
+  },
+  bg_image_path: {
+    type: "string",
+    description:
+      "Alias for bgImagePath: local background image file path (.png, .jpg, .jpeg, .webp, up to 25 MB / 50 MP).",
+  },
+  bg_image_url: {
+    type: "string",
+    description:
+      "Alias for bgImageUrl: public http(s) background image URL.",
   },
   crop: {
     type: "boolean",
@@ -401,15 +422,96 @@ export function mapToolCutoutOptions(args = {}) {
     }
   }
 
+  if (args.bgImagePath !== undefined && typeof args.bgImagePath !== "string") {
+    throw new Error("Invalid 'bgImagePath': expected string");
+  }
+  if (args.bg_image_path !== undefined && typeof args.bg_image_path !== "string") {
+    throw new Error("Invalid 'bg_image_path': expected string");
+  }
+  const camelBgPath = typeof args.bgImagePath === "string" ? args.bgImagePath.trim() : "";
+  const snakeBgPath = typeof args.bg_image_path === "string" ? args.bg_image_path.trim() : "";
+  if ((args.bgImagePath !== undefined && !camelBgPath) || (args.bg_image_path !== undefined && !snakeBgPath)) {
+    throw new Error("Invalid 'bg_image_path': expected non-empty file path string");
+  }
+  if (camelBgPath && snakeBgPath && camelBgPath !== snakeBgPath) {
+    throw new Error("Conflicting 'bgImagePath' and 'bg_image_path' arguments");
+  }
+  const bgImageFile = camelBgPath || snakeBgPath;
+  if (bgImageFile.includes("\0")) {
+    throw new Error("Invalid 'bg_image_path' value");
+  }
+  if (bgImageFile && /^https?:\/\//i.test(bgImageFile)) {
+    throw new Error("'bg_image_path' must be a local file path; use 'bg_image_url' for remote URLs");
+  }
+
+  if (args.bgImageUrl !== undefined && typeof args.bgImageUrl !== "string") {
+    throw new Error("Invalid 'bgImageUrl': expected string");
+  }
+  if (args.bg_image_url !== undefined && typeof args.bg_image_url !== "string") {
+    throw new Error("Invalid 'bg_image_url': expected string");
+  }
+  const camelBgUrl = typeof args.bgImageUrl === "string" ? args.bgImageUrl.trim() : "";
+  const snakeBgUrl = typeof args.bg_image_url === "string" ? args.bg_image_url.trim() : "";
+  if ((args.bgImageUrl !== undefined && !camelBgUrl) || (args.bg_image_url !== undefined && !snakeBgUrl)) {
+    throw new Error("Invalid 'bg_image_url': expected non-empty URL string");
+  }
+  if (camelBgUrl && snakeBgUrl && camelBgUrl !== snakeBgUrl) {
+    throw new Error("Conflicting 'bgImageUrl' and 'bg_image_url' arguments");
+  }
+  const bgImageUrl = camelBgUrl || snakeBgUrl;
+  if (bgImageUrl.includes("\0")) {
+    throw new Error("Invalid 'bg_image_url' value");
+  }
+
+  const bgCount = (bgColor ? 1 : 0) + (bgImageFile ? 1 : 0) + (bgImageUrl ? 1 : 0);
+  if (bgCount > 1) {
+    throw new Error(
+      "Specify at most one background option among 'bgColor', 'bg_image_path'/'bgImagePath', or 'bg_image_url'/'bgImageUrl'",
+    );
+  }
+
   return {
     size,
     format,
     ...(bgColor ? { bgColor } : {}),
+    ...(bgImageFile ? { bgImageFile } : {}),
+    ...(bgImageUrl ? { bgImageUrl } : {}),
     ...(typeof args.crop === "boolean" ? { crop: args.crop } : {}),
     ...(fgType ? { type: fgType } : {}),
     ...(typeof args.addShadow === "boolean" ? { addShadow: args.addShadow } : {}),
     ...(shadowType ? { shadowType } : {}),
   };
+}
+
+async function prepareValidatedCutoutOptions(cutoutOpts, lookupFn) {
+  const prepared = { ...cutoutOpts };
+  if (prepared.bgImageFile) {
+    const resolvedBg = path.resolve(prepared.bgImageFile);
+    validateNoSymlinkPathChain(resolvedBg, "bg_image_path");
+    let bgStat = null;
+    try {
+      bgStat = fs.lstatSync(resolvedBg);
+    } catch (stErr) {
+      if (!stErr || stErr.code !== "ENOENT") throw stErr;
+    }
+    if (!bgStat || !bgStat.isFile()) {
+      throw new Error(`Background image file not found: ${resolvedBg}`);
+    }
+    if (bgStat.size <= 0) {
+      throw new Error(`Background image file is empty: ${resolvedBg}`);
+    }
+    if (bgStat.size > MAX_BG_IMAGE_BYTES) {
+      throw new Error(`Background image file exceeds 25 MB limit: ${resolvedBg}`);
+    }
+    prepared.bgImageFile = resolvedBg;
+  }
+  if (prepared.bgImageUrl) {
+    const bgUrlErr = await validateRemoteImageUrl(prepared.bgImageUrl, lookupFn);
+    if (bgUrlErr) {
+      throw new Error(bgUrlErr);
+    }
+  }
+  return prepared;
 }
 
 function toolSuccess(payload) {
@@ -513,7 +615,7 @@ export async function handleMcpRequest(
 
       if (toolName === "remove_background_file") {
         validateAllowedArguments(toolName, args);
-        const cutoutOpts = mapToolCutoutOptions(args);
+        const rawCutoutOpts = mapToolCutoutOptions(args);
         if (!args.inputPath || typeof args.inputPath !== "string" || args.inputPath.includes("\0")) {
           return {
             jsonrpc: "2.0",
@@ -537,12 +639,19 @@ export async function handleMcpRequest(
           };
         }
 
+        const cutoutOpts = await prepareValidatedCutoutOptions(rawCutoutOpts, options.lookup);
+
         const rawOut =
           typeof args.outputPath === "string" && args.outputPath.trim()
             ? args.outputPath
             : resolveDefaultOutputPath(resolvedInput, cutoutOpts.format);
         const overwrite = Boolean(args.overwrite);
         const resolvedOutput = ensureSafeWriteTarget(rawOut, overwrite, resolvedInput);
+        if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile && !overwrite) {
+          throw new Error(
+            "outputPath resolves to bg_image_path; specify a separate outputPath or set overwrite: true",
+          );
+        }
 
         const client = effectiveClientFactory();
         const res = await client.removeBackground(resolvedInput, cutoutOpts);
@@ -565,7 +674,7 @@ export async function handleMcpRequest(
 
       if (toolName === "remove_background_url") {
         validateAllowedArguments(toolName, args);
-        const cutoutOpts = mapToolCutoutOptions(args);
+        const rawCutoutOpts = mapToolCutoutOptions(args);
         if (!args.imageUrl || typeof args.imageUrl !== "string") {
           return {
             jsonrpc: "2.0",
@@ -584,8 +693,14 @@ export async function handleMcpRequest(
         if (urlErr) {
           return { jsonrpc: "2.0", id, result: toolFailure(urlErr) };
         }
+        const cutoutOpts = await prepareValidatedCutoutOptions(rawCutoutOpts, options.lookup);
         const overwrite = Boolean(args.overwrite);
         const resolvedOutput = ensureSafeWriteTarget(args.outputPath, overwrite);
+        if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile && !overwrite) {
+          throw new Error(
+            "outputPath resolves to bg_image_path; specify a separate outputPath or set overwrite: true",
+          );
+        }
 
         const client = effectiveClientFactory();
         const res = await client.removeBackground(args.imageUrl, cutoutOpts);

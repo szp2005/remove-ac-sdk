@@ -14,12 +14,13 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 SDK_VERSION = __version__
 USER_AGENT = f"remove-ac-python-sdk/{SDK_VERSION}"
 
 DEFAULT_BASE_URL = "https://remove.ac"
 DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 DIRECT_RGBA_PNG_PIXELS = 5_000_000
 DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000
 
@@ -172,23 +173,76 @@ def derive_sub_idempotency_key(idem: str, suffix: str) -> str:
     return f"{trimmed[:180]}:{digest}:{suffix}"
 
 
+def _infer_mime_type(data: bytes, filename: str = "") -> str:
+    if data and len(data) >= 12:
+        if data[:4] == b"\x89PNG":
+            return "image/png"
+        if data[:2] == b"\xff\xd8":
+            return "image/jpeg"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        if data[:4] == b"GIF8":
+            return "image/gif"
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext == ".png":
+        return "image/png"
+    if ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if ext == ".webp":
+        return "image/webp"
+    if ext == ".gif":
+        return "image/gif"
+    return "application/octet-stream"
+
+
+def _decode_base64_image(raw_b64: str, label: str) -> Tuple[str, bytes]:
+    trimmed = (raw_b64 or "").strip()
+    payload = trimmed
+    if payload.lower().startswith("data:image/"):
+        comma_idx = payload.find(",")
+        if comma_idx == -1 or ";base64" not in payload[:comma_idx].lower():
+            raise RemoveAcError(400, f"Invalid {label}: malformed data URI")
+        payload = payload[comma_idx + 1 :]
+    compact = "".join(payload.split())
+    if not compact or len(compact) % 4 == 1:
+        raise RemoveAcError(400, f"Invalid {label}: malformed base64 payload")
+    padded = compact if len(compact) % 4 == 0 else compact + ("=" * (4 - (len(compact) % 4)))
+    try:
+        decoded = base64.b64decode(padded, validate=True)
+    except Exception as exc:
+        raise RemoveAcError(400, f"Invalid {label}: malformed base64 payload") from exc
+    if len(decoded) == 0:
+        raise RemoveAcError(400, f"{label} must not be empty")
+    if len(decoded) > MAX_UPLOAD_BYTES:
+        raise RemoveAcError(413, f"{label} exceeds 25 MB maximum upload size (26214400 bytes)")
+    return trimmed, decoded
+
+
 def _encode_multipart(
     fields: Dict[str, str],
     file_tuple: Optional[Tuple[str, str, bytes]] = None,
+    extra_files: Optional[Sequence[Tuple[str, str, bytes]]] = None,
 ) -> Tuple[bytes, str]:
     boundary = f"----RemoveAcBoundary{uuid.uuid4().hex}"
     chunks = []
     for key, val in fields.items():
+        safe_key = str(key).replace('"', "_").replace("\r", "_").replace("\n", "_")
         chunks.append(f"--{boundary}\r\n".encode("utf-8"))
-        chunks.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{safe_key}"\r\n\r\n'.encode("utf-8"))
         chunks.append(f"{val}\r\n".encode("utf-8"))
+    all_files: List[Tuple[str, str, bytes]] = []
     if file_tuple is not None:
-        field_name, filename, raw_bytes = file_tuple
-        safe_name = filename.replace('"', "_")
+        all_files.append(file_tuple)
+    if extra_files:
+        all_files.extend(extra_files)
+    for field_name, filename, raw_bytes in all_files:
+        safe_field = str(field_name).replace('"', "_").replace("\r", "_").replace("\n", "_")
+        safe_name = str(filename).replace('"', "_").replace("\r", "_").replace("\n", "_")
+        mime = _infer_mime_type(raw_bytes, safe_name)
         chunks.append(f"--{boundary}\r\n".encode("utf-8"))
         chunks.append(
-            f'Content-Disposition: form-data; name="{field_name}"; filename="{safe_name}"\r\n'
-            f"Content-Type: application/octet-stream\r\n\r\n".encode("utf-8")
+            f'Content-Disposition: form-data; name="{safe_field}"; filename="{safe_name}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n".encode("utf-8")
         )
         chunks.append(raw_bytes)
         chunks.append(b"\r\n")
@@ -433,7 +487,7 @@ class RemoveAcClient:
 
     def remove_background(
         self,
-        image: Union[str, bytes],
+        image: Union[str, bytes, bytearray, os.PathLike],
         *,
         size: Union[SizeLiteral, str] = "auto",
         format: str = "png",
@@ -445,6 +499,8 @@ class RemoveAcClient:
         position: Optional[str] = None,
         bg_color: Optional[str] = None,
         bg_image_url: Optional[str] = None,
+        bg_image_file: Optional[Union[str, bytes, bytearray, os.PathLike]] = None,
+        bg_image_file_b64: Optional[str] = None,
         crop: bool = False,
         crop_margin: Optional[str] = None,
         add_shadow: bool = False,
@@ -487,6 +543,27 @@ class RemoveAcClient:
                     f"Unsupported shadow_type '{shadow_type}'. Expected one of: {', '.join(VALID_SHADOW_TYPES)}",
                 )
 
+        clean_bg_color = str(bg_color).strip() if bg_color is not None else ""
+        clean_bg_url = str(bg_image_url).strip() if bg_image_url is not None else ""
+        has_bg_file = bg_image_file is not None
+        if bg_image_file_b64 is not None and not isinstance(bg_image_file_b64, str):
+            raise RemoveAcError(400, "bg_image_file_b64 must be a base64 string")
+        clean_bg_b64_input = bg_image_file_b64.strip() if bg_image_file_b64 is not None else ""
+        if bg_image_file_b64 is not None and not clean_bg_b64_input:
+            raise RemoveAcError(400, "bg_image_file_b64 must not be empty")
+
+        bg_source_count = (
+            (1 if clean_bg_color else 0)
+            + (1 if clean_bg_url else 0)
+            + (1 if has_bg_file else 0)
+            + (1 if clean_bg_b64_input else 0)
+        )
+        if bg_source_count > 1:
+            raise RemoveAcError(
+                400,
+                "Specify at most one of bg_color, bg_image_url, bg_image_file, or bg_image_file_b64",
+            )
+
         if idempotency_key is not None:
             trimmed_idem = idempotency_key.strip()
             if not trimmed_idem or len(trimmed_idem) > 255:
@@ -494,6 +571,45 @@ class RemoveAcClient:
             idem = trimmed_idem
         else:
             idem = f"pysdk-{uuid.uuid4()}"
+
+        bg_bytes: Optional[bytes] = None
+        bg_name = "bg-image.png"
+        bg_b64_clean = ""
+        bg_b64_decoded: Optional[bytes] = None
+
+        if has_bg_file:
+            if isinstance(bg_image_file, (bytes, bytearray)):
+                bg_bytes = bytes(bg_image_file)
+            elif isinstance(bg_image_file, (str, os.PathLike)):
+                bg_path_str = os.fspath(bg_image_file)
+                if not isinstance(bg_path_str, str):
+                    bg_path_str = os.fsdecode(bg_path_str)
+                trimmed_bg_path = bg_path_str.strip()
+                if not trimmed_bg_path or "\x00" in trimmed_bg_path:
+                    raise RemoveAcError(400, "bg_image_file path must not be empty")
+                if isinstance(bg_image_file, str) and trimmed_bg_path.lower().startswith(
+                    ("http://", "https://")
+                ):
+                    raise RemoveAcError(
+                        400,
+                        "bg_image_file expects a local file path or bytes; use bg_image_url for remote URLs",
+                    )
+                bg_name = os.path.basename(trimmed_bg_path) or "bg-image.png"
+                with open(trimmed_bg_path, "rb") as bg_fh:
+                    bg_bytes = bg_fh.read()
+            else:
+                raise RemoveAcError(400, "Unsupported bg_image_file input")
+
+            if len(bg_bytes) == 0:
+                raise RemoveAcError(400, "bg_image_file must not be empty")
+            if len(bg_bytes) > MAX_UPLOAD_BYTES:
+                raise RemoveAcError(
+                    413, "bg_image_file exceeds 25 MB maximum upload size (26214400 bytes)"
+                )
+        elif clean_bg_b64_input:
+            bg_b64_clean, bg_b64_decoded = _decode_base64_image(
+                clean_bg_b64_input, "bg_image_file_b64"
+            )
 
         img_bytes: Optional[bytes] = None
         img_name = "image.png"
@@ -503,12 +619,17 @@ class RemoveAcClient:
             img_bytes = bytes(image)
         elif isinstance(image, str) and image.startswith(("http://", "https://")):
             img_url = image
-        elif isinstance(image, str):
-            img_name = os.path.basename(image)
-            with open(image, "rb") as fh:
+        elif isinstance(image, (str, os.PathLike)):
+            img_path_str = os.fspath(image)
+            if not isinstance(img_path_str, str):
+                img_path_str = os.fsdecode(img_path_str)
+            img_name = os.path.basename(img_path_str) or "image.png"
+            with open(img_path_str, "rb") as fh:
                 img_bytes = fh.read()
         else:
             raise RemoveAcError(400, "Unsupported image input")
+
+        ticket_bg_bytes = bg_bytes if bg_bytes is not None else bg_b64_decoded
 
         def _via_ticket(suffix: str) -> bytes:
             if img_bytes is None:
@@ -531,10 +652,13 @@ class RemoveAcClient:
                 payload["scale"] = scale
             if position:
                 payload["position"] = position
-            if bg_color:
-                payload["bg_color"] = bg_color
-            if bg_image_url:
-                payload["bg_image_url"] = bg_image_url
+            if clean_bg_color:
+                payload["bg_color"] = clean_bg_color
+            if clean_bg_url:
+                payload["bg_image_url"] = clean_bg_url
+            if ticket_bg_bytes is not None:
+                payload["bgImageSha256"] = hashlib.sha256(ticket_bg_bytes).hexdigest()
+                payload["bgImageByteLength"] = len(ticket_bg_bytes)
             if crop:
                 payload["crop"] = True
             if crop_margin:
@@ -600,7 +724,12 @@ class RemoveAcClient:
             if ep_err:
                 self._release_ticket_hold(hold_id, release_tok)
                 raise RemoveAcError(502, ep_err)
-            mp_body, mp_ct = _encode_multipart({}, ("image_file", img_name, img_bytes))
+            direct_extra_files = (
+                [("bg_image_file", bg_name, ticket_bg_bytes)] if ticket_bg_bytes is not None else None
+            )
+            mp_body, mp_ct = _encode_multipart(
+                {}, ("image_file", img_name, img_bytes), direct_extra_files
+            )
             try:
                 d_status, _, d_body = self._transport(
                     "POST",
@@ -623,9 +752,17 @@ class RemoveAcClient:
                 raise RemoveAcError(d_status, d_body.decode("utf-8", errors="replace"))
             return d_body
 
+        sync_bg_wire_len = (
+            len(bg_bytes)
+            if bg_bytes is not None
+            else (len(bg_b64_clean.encode("utf-8")) if bg_b64_clean else 0)
+        )
+
         if img_bytes is not None and (
             direct
             or len(img_bytes) > DIRECT_THRESHOLD_BYTES
+            or (ticket_bg_bytes is not None and len(ticket_bg_bytes) > DIRECT_THRESHOLD_BYTES)
+            or (len(img_bytes) + sync_bg_wire_len > DIRECT_THRESHOLD_BYTES)
             or _should_preflight_via_ticket(img_bytes, norm_size, norm_format, norm_channels, crop)
         ):
             return _via_ticket("direct")
@@ -648,10 +785,12 @@ class RemoveAcClient:
             fields["scale"] = scale
         if position:
             fields["position"] = position
-        if bg_color:
-            fields["bg_color"] = bg_color
-        if bg_image_url:
-            fields["bg_image_url"] = bg_image_url
+        if clean_bg_color:
+            fields["bg_color"] = clean_bg_color
+        if clean_bg_url:
+            fields["bg_image_url"] = clean_bg_url
+        if bg_b64_clean:
+            fields["bg_image_file_b64"] = bg_b64_clean
         if crop:
             fields["crop"] = "true"
         if crop_margin:
@@ -664,7 +803,8 @@ class RemoveAcClient:
             fields["shadow_opacity"] = str(shadow_opacity)
 
         file_tuple = ("image_file", img_name, img_bytes) if img_bytes is not None else None
-        mp_body, mp_ct = _encode_multipart(fields, file_tuple)
+        extra_files = [("bg_image_file", bg_name, bg_bytes)] if bg_bytes is not None else None
+        mp_body, mp_ct = _encode_multipart(fields, file_tuple, extra_files)
         status, _, body = self._transport(
             "POST",
             f"{self.base_url}/v1.0/removebg",
@@ -702,6 +842,77 @@ class RemoveAcClient:
             raise RemoveAcError(status, body.decode("utf-8", errors="replace"))
         return body
 
+    def submit_improve(
+        self,
+        image: Union[str, bytes, bytearray, os.PathLike],
+        *,
+        tag: Optional[str] = None,
+        description: Optional[str] = None,
+        filename: Optional[str] = None,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        if not self.api_key:
+            raise RemoveAcError(403, "Missing remove.ac API key")
+
+        img_bytes: Optional[bytes] = None
+        img_name = os.path.basename(filename.strip()) if filename and filename.strip() else "image.png"
+        img_url: Optional[str] = None
+
+        if isinstance(image, (bytes, bytearray)):
+            img_bytes = bytes(image)
+        elif isinstance(image, str) and image.strip().startswith(("http://", "https://")):
+            img_url = image.strip()
+        elif isinstance(image, (str, os.PathLike)):
+            img_path_str = os.fspath(image)
+            if not isinstance(img_path_str, str):
+                img_path_str = os.fsdecode(img_path_str)
+            trimmed_path = img_path_str.strip()
+            if not trimmed_path or "\x00" in trimmed_path:
+                raise RemoveAcError(400, "Unsupported image input")
+            if not (filename and filename.strip()):
+                img_name = os.path.basename(trimmed_path) or "image.png"
+            with open(trimmed_path, "rb") as fh:
+                img_bytes = fh.read()
+        else:
+            raise RemoveAcError(400, "Unsupported image input")
+
+        if img_bytes is not None:
+            if len(img_bytes) == 0:
+                raise RemoveAcError(400, "Image input must not be empty")
+            if len(img_bytes) > MAX_UPLOAD_BYTES:
+                raise RemoveAcError(
+                    413, "Image input exceeds 25 MB maximum upload size (26214400 bytes)"
+                )
+
+        fields: Dict[str, str] = {}
+        if img_url:
+            fields["image_url"] = img_url
+        if tag is not None and str(tag).strip():
+            fields["tag"] = str(tag).strip()
+        if description is not None and str(description).strip():
+            fields["description"] = str(description).strip()
+
+        file_tuple = ("image_file", img_name, img_bytes) if img_bytes is not None else None
+        mp_body, mp_ct = _encode_multipart(fields, file_tuple)
+        status, _, body = self._transport(
+            "POST",
+            f"{self.base_url}/v1.0/improve",
+            _ensure_user_agent(
+                {
+                    "X-Api-Key": self.api_key,
+                    "Content-Type": mp_ct,
+                }
+            ),
+            mp_body,
+            timeout,
+        )
+        if status < 200 or status >= 300:
+            raise RemoveAcError(status, body.decode("utf-8", errors="replace"))
+        parsed = json.loads(body.decode("utf-8"))
+        if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict) and "id" not in parsed:
+            return dict(parsed["data"])
+        return parsed
+
 
 class RemoveBg:
     """1:1 drop-in replacement for brilam/remove-bg Python package."""
@@ -724,12 +935,24 @@ class RemoveBg:
 
     def remove_background_from_img_file(
         self,
-        img_file_path: str,
+        img_file_path: Union[str, os.PathLike],
         size: str = "regular",
         new_file_name: str = "no-bg.png",
+        bg_color: Optional[str] = None,
+        bg_image_file: Optional[Union[str, bytes, bytearray, os.PathLike]] = None,
+        bg_image_url: Optional[str] = None,
+        bg_image_file_b64: Optional[str] = None,
         **kwargs: Any,
     ) -> bytes:
-        out = self.client.remove_background(img_file_path, size=size, **kwargs)
+        out = self.client.remove_background(
+            img_file_path,
+            size=size,
+            bg_color=bg_color,
+            bg_image_file=bg_image_file,
+            bg_image_url=bg_image_url,
+            bg_image_file_b64=bg_image_file_b64,
+            **kwargs,
+        )
         if new_file_name:
             with open(new_file_name, "wb") as fh:
                 fh.write(out)
@@ -740,9 +963,21 @@ class RemoveBg:
         img_url: str,
         size: str = "regular",
         new_file_name: str = "no-bg.png",
+        bg_color: Optional[str] = None,
+        bg_image_file: Optional[Union[str, bytes, bytearray, os.PathLike]] = None,
+        bg_image_url: Optional[str] = None,
+        bg_image_file_b64: Optional[str] = None,
         **kwargs: Any,
     ) -> bytes:
-        out = self.client.remove_background(img_url, size=size, **kwargs)
+        out = self.client.remove_background(
+            img_url,
+            size=size,
+            bg_color=bg_color,
+            bg_image_file=bg_image_file,
+            bg_image_url=bg_image_url,
+            bg_image_file_b64=bg_image_file_b64,
+            **kwargs,
+        )
         if new_file_name:
             with open(new_file_name, "wb") as fh:
                 fh.write(out)
@@ -753,9 +988,21 @@ class RemoveBg:
         base64_img: str,
         size: str = "regular",
         new_file_name: str = "no-bg.png",
+        bg_color: Optional[str] = None,
+        bg_image_file: Optional[Union[str, bytes, bytearray, os.PathLike]] = None,
+        bg_image_url: Optional[str] = None,
+        bg_image_file_b64: Optional[str] = None,
         **kwargs: Any,
     ) -> bytes:
-        out = self.client.remove_background(base64.b64decode(base64_img), size=size, **kwargs)
+        out = self.client.remove_background(
+            base64.b64decode(base64_img),
+            size=size,
+            bg_color=bg_color,
+            bg_image_file=bg_image_file,
+            bg_image_url=bg_image_url,
+            bg_image_file_b64=bg_image_file_b64,
+            **kwargs,
+        )
         if new_file_name:
             with open(new_file_name, "wb") as fh:
                 fh.write(out)

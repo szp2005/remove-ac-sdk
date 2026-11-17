@@ -275,14 +275,14 @@ class PythonSdkTest(unittest.TestCase):
         import http.server
         import threading
 
-        self.assertEqual(__version__, "1.2.0")
-        self.assertEqual(SDK_VERSION, "1.2.0")
-        self.assertEqual(USER_AGENT, "remove-ac-python-sdk/1.2.0")
+        self.assertEqual(__version__, "1.3.0")
+        self.assertEqual(SDK_VERSION, "1.3.0")
+        self.assertEqual(USER_AGENT, "remove-ac-python-sdk/1.3.0")
         self.assertIn("25mp", VALID_SIZES)
         self.assertIn("50mp", VALID_SIZES)
         self.assertIsNotNone(SizeLiteral)
 
-        # Verify real urllib _default_transport sends remove-ac-python-sdk/1.2.0 User-Agent (not Python-urllib)
+        # Verify real urllib _default_transport sends remove-ac-python-sdk/1.3.0 User-Agent (not Python-urllib)
         captured_uas = []
 
         class UaHandler(http.server.BaseHTTPRequestHandler):
@@ -306,7 +306,7 @@ class PythonSdkTest(unittest.TestCase):
             )
             acct = real_client.get_account(timeout=5)
             self.assertEqual(acct["data"]["attributes"]["credits"]["total"], 5)
-            self.assertEqual(captured_uas, ["remove-ac-python-sdk/1.2.0"])
+            self.assertEqual(captured_uas, ["remove-ac-python-sdk/1.3.0"])
         finally:
             ua_srv.shutdown()
             ua_srv.server_close()
@@ -333,7 +333,7 @@ class PythonSdkTest(unittest.TestCase):
         released_bodies = []
 
         def hold_release_transport(method, url, headers, body, timeout):
-            self.assertEqual(headers.get("User-Agent"), "remove-ac-python-sdk/1.2.0")
+            self.assertEqual(headers.get("User-Agent"), "remove-ac-python-sdk/1.3.0")
             if url.endswith("/v1.0/removebg/ticket"):
                 return (
                     200,
@@ -365,6 +365,150 @@ class PythonSdkTest(unittest.TestCase):
             released_bodies,
             [{"holdId": "hold_py_1", "releaseToken": "rel_py_secret_1"}],
         )
+
+    def test_v130_bg_image_file_multipart_ticket_removebg_shim_and_submit_improve(self):
+        import hashlib
+        import os
+        import pathlib
+        import tempfile
+
+        temp_root = (
+            "/Volumes/Expansion/dev-tools/build-temp"
+            if os.path.isdir("/Volumes/Expansion/dev-tools/build-temp")
+            else None
+        )
+        with tempfile.TemporaryDirectory(dir=temp_root, prefix="rac-py-v130-") as tmp_dir:
+            fg_path = pathlib.Path(tmp_dir) / "fg.png"
+            bg_path = pathlib.Path(tmp_dir) / "studio-bg.png"
+            fg_bytes = b"\x89PNG\r\n\x1a\nFG_PAYLOAD"
+            bg_bytes = b"\x89PNG\r\n\x1a\nBG_PAYLOAD"
+            fg_path.write_bytes(fg_bytes)
+            bg_path.write_bytes(bg_bytes)
+
+            # 1. Mutual exclusion & empty/oversized guards (0 HTTP calls)
+            guard_hits = []
+            guard_client = RemoveAcClient(
+                api_key="rac_live_py_guard",
+                transport=lambda m, u, h, b, t: guard_hits.append(u) or (200, {}, b"OK"),
+            )
+            for bad_kw in (
+                {"bg_color": "FFFFFF", "bg_image_file": bg_bytes},
+                {"bg_image_url": "https://example.com/bg.png", "bg_image_file": str(bg_path)},
+                {"bg_image_file": bg_bytes, "bg_image_file_b64": base64.b64encode(bg_bytes).decode("ascii")},
+                {"bg_image_file": b""},
+                {"bg_image_file": "   "},
+                {"bg_image_file": "https://example.com/not-local.png"},
+                {"bg_image_file_b64": ""},
+                {"bg_image_file_b64": "%%%invalid%%%"},
+            ):
+                with self.assertRaises(RemoveAcError) as ctx:
+                    guard_client.remove_background(fg_bytes, **bad_kw)
+                self.assertEqual(ctx.exception.status_code, 400)
+
+            with self.assertRaises(RemoveAcError) as big_ctx:
+                guard_client.remove_background(
+                    fg_bytes, bg_image_file=b"x" * (25 * 1024 * 1024 + 1)
+                )
+            self.assertEqual(big_ctx.exception.status_code, 413)
+            self.assertEqual(len(guard_hits), 0)
+
+            # 2. Sync /v1.0/removebg encodes both image_file and bg_image_file cleanly + RemoveBg shim
+            sync_bodies = []
+
+            def sync_transport(method, url, headers, body, timeout):
+                self.assertEqual(url, "https://remove.ac/v1.0/removebg")
+                sync_bodies.append(body)
+                return 200, {"content-type": "image/png"}, b"COMPOSITED_PNG"
+
+            sync_client = RemoveAcClient(api_key="rac_live_py_sync", transport=sync_transport)
+            out1 = sync_client.remove_background(fg_path, bg_image_file=bg_path)
+            self.assertEqual(out1, b"COMPOSITED_PNG")
+            self.assertIn(b'name="image_file"; filename="fg.png"', sync_bodies[0])
+            self.assertIn(fg_bytes, sync_bodies[0])
+            self.assertIn(b'name="bg_image_file"; filename="studio-bg.png"', sync_bodies[0])
+            self.assertIn(bg_bytes, sync_bodies[0])
+
+            rmbg = RemoveBg("rac_live_py_shim", transport=sync_transport)
+            out_shim = rmbg.remove_background_from_img_file(
+                str(fg_path),
+                size="full",
+                new_file_name="",
+                bg_image_file=bytearray(bg_bytes),
+            )
+            self.assertEqual(out_shim, b"COMPOSITED_PNG")
+            self.assertIn(b'name="bg_image_file"', sync_bodies[1])
+            self.assertIn(bg_bytes, sync_bodies[1])
+
+            out_b64 = rmbg.remove_background_from_base64_img(
+                base64.b64encode(fg_bytes).decode("ascii"),
+                new_file_name="",
+                bg_image_file_b64=base64.b64encode(bg_bytes).decode("ascii"),
+            )
+            self.assertEqual(out_b64, b"COMPOSITED_PNG")
+            self.assertIn(b'name="bg_image_file_b64"', sync_bodies[2])
+
+            # 3. Combined >4 MB (2.5 MB fg + 2.5 MB bg) upgrades to /v1.0/removebg/ticket with bgImageSha256
+            fg_25 = b"A" * int(2.5 * 1024 * 1024)
+            bg_25 = b"B" * int(2.5 * 1024 * 1024)
+            ticket_calls = []
+
+            def ticket_transport(method, url, headers, body, timeout):
+                ticket_calls.append((url, body))
+                if url.endswith("/v1.0/removebg/ticket"):
+                    return (
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps(
+                            {
+                                "data": {
+                                    "ticket": "tkt_py_bg",
+                                    "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                                }
+                            }
+                        ).encode("utf-8"),
+                    )
+                return 200, {"content-type": "image/png"}, b"TICKET_BG_OK"
+
+            t_client = RemoveAcClient(
+                api_key="rac_live_py_ticket",
+                transport=ticket_transport,
+                resolver=lambda _h: ["93.184.216.34"],
+            )
+            t_res = t_client.remove_background(fg_25, bg_image_file=bg_25, size="50mp")
+            self.assertEqual(t_res, b"TICKET_BG_OK")
+            self.assertEqual(len(ticket_calls), 2)
+            t_json = json.loads(ticket_calls[0][1].decode("utf-8"))
+            self.assertEqual(t_json["bgImageSha256"], hashlib.sha256(bg_25).hexdigest())
+            self.assertEqual(t_json["bgImageByteLength"], len(bg_25))
+            self.assertIn(b'name="image_file"', ticket_calls[1][1])
+            self.assertIn(b'name="bg_image_file"', ticket_calls[1][1])
+
+            # 4. submit_improve supports PathLike/bytes and image_url with tag & description
+            improve_reqs = []
+
+            def improve_transport(method, url, headers, body, timeout):
+                improve_reqs.append((method, url, headers, body))
+                return (
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps({"data": {"id": f"imp_{len(improve_reqs)}", "status": "received"}}).encode(
+                        "utf-8"
+                    ),
+                )
+
+            imp_client = RemoveAcClient(api_key="rac_live_py_imp", transport=improve_transport)
+            imp1 = imp_client.submit_improve(
+                fg_path, tag="fur", description="Golden retriever fur edge"
+            )
+            self.assertEqual(imp1["id"], "imp_1")
+            self.assertEqual(imp1["status"], "received")
+            self.assertEqual(improve_reqs[0][1], "https://remove.ac/v1.0/improve")
+            self.assertIn(b'name="image_file"; filename="fg.png"', improve_reqs[0][3])
+            self.assertIn(b'name="tag"\r\n\r\nfur', improve_reqs[0][3])
+
+            imp2 = imp_client.submit_improve("https://example.com/item.jpg", tag="shadow")
+            self.assertEqual(imp2["id"], "imp_2")
+            self.assertIn(b'name="image_url"\r\n\r\nhttps://example.com/item.jpg', improve_reqs[1][3])
 
 
 if __name__ == "__main__":

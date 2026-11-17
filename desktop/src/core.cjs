@@ -6,7 +6,7 @@ const path = require("node:path");
 
 const DEFAULT_BASE_URL = "https://remove.ac";
 const MAX_INPUT_BYTES = 25 * 1024 * 1024; // 25 MB
-const MAX_INPUT_PIXELS = 40_000_000; // 40 MP
+const MAX_INPUT_PIXELS = 50_000_000; // 50 MP
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024; // 4 MB Vercel payload threshold
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
@@ -14,11 +14,30 @@ const SUPPORTED_INPUT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 const IGNORED_FILENAMES = new Set(["thumbs.db", "desktop.ini", ".ds_store"]);
 const PLAUSIBLE_API_KEY_RE = /^rac_live_[A-Za-z0-9_-]{4,128}$/;
 
-const ALLOWED_SIZES = new Set(["auto", "full", "preview", "hd", "4k"]);
+const ALLOWED_SIZES = new Set([
+  "auto",
+  "full",
+  "50mp",
+  "25mp",
+  "4k",
+  "hd",
+  "medium",
+  "regular",
+  "small",
+  "preview",
+]);
 const ALLOWED_FORMATS = new Set(["png", "webp", "jpg", "zip"]);
 const ALLOWED_BG_MODES = new Set(["transparent", "white", "color", "zip"]);
 const ALLOWED_CROP_MARGINS = new Set(["0%", "5%", "10%", "15%"]);
-const ALLOWED_SHADOW_TYPES = new Set(["auto", "drop", "car", "soft", "contact"]);
+const ALLOWED_SHADOW_TYPES = new Set([
+  "auto",
+  "drop",
+  "car",
+  "soft",
+  "contact",
+  "reflection",
+  "none",
+]);
 const ALLOWED_LANGUAGES = new Set(["auto", "zh-CN", "en"]);
 
 class DesktopAppError extends Error {
@@ -238,10 +257,12 @@ function shouldPreFlightViaTicket(bytes, size, format, crop) {
   if (!dims) return false;
   const inputPixels = dims.width * dims.height;
   let effectivePixels = inputPixels;
-  if (size === "preview") effectivePixels = Math.min(inputPixels, 250_000);
+  if (size === "preview" || size === "small" || size === "regular") effectivePixels = Math.min(inputPixels, 250_000);
+  else if (size === "medium") effectivePixels = Math.min(inputPixels, 1_500_000);
   else if (size === "hd") effectivePixels = Math.min(inputPixels, 4_000_000);
   else if (size === "4k") effectivePixels = Math.min(inputPixels, 10_000_000);
-  else effectivePixels = Math.min(inputPixels, 25_000_000);
+  else if (size === "25mp") effectivePixels = Math.min(inputPixels, 25_000_000);
+  else effectivePixels = Math.min(inputPixels, 50_000_000);
   return effectivePixels > (crop ? DIRECT_CROPPED_RGBA_PNG_PIXELS : DIRECT_RGBA_PNG_PIXELS);
 }
 
@@ -794,7 +815,7 @@ class DesktopApiClient {
   async _fetchNoRedirect(url, init = {}) {
     const headers = new Headers(init.headers || {});
     if (!headers.has("User-Agent")) {
-      headers.set("User-Agent", "RemoveAcDesktop/1.0.0");
+      headers.set("User-Agent", "RemoveAcDesktop/1.1.0");
     }
     try {
       return await this.fetchImpl(url, {
@@ -896,7 +917,7 @@ class DesktopApiClient {
       throw new DesktopAppError(
         400,
         "resolution_too_large",
-        `Image resolution ${dims.width}x${dims.height} (${mp} MP) exceeds 40 MP maximum`
+        `Image resolution ${dims.width}x${dims.height} (${mp} MP) exceeds 50 MP maximum`
       );
     }
 
@@ -925,7 +946,12 @@ class DesktopApiClient {
         channels: "rgba",
         ...(bgColor ? { bg_color: bgColor } : {}),
         ...(settings.crop ? { crop: true, crop_margin: settings.cropMargin } : {}),
-        ...(settings.addShadow ? { add_shadow: true, shadow_type: settings.shadowType } : {}),
+        ...(settings.addShadow
+          ? {
+              add_shadow: settings.shadowType !== "none",
+              shadow_type: settings.shadowType,
+            }
+          : {}),
       };
       const tRes = await this._fetchNoRedirect(`${this.baseUrl}/v1.0/remove/ticket`, {
         method: "POST",
@@ -1028,7 +1054,7 @@ class DesktopApiClient {
             fd.set("crop_margin", settings.cropMargin);
           }
           if (settings.addShadow) {
-            fd.set("add_shadow", "true");
+            fd.set("add_shadow", settings.shadowType === "none" ? "false" : "true");
             fd.set("shadow_type", settings.shadowType);
           }
           return fd;
@@ -1233,12 +1259,15 @@ module.exports = {
   MAX_INPUT_PIXELS,
   DIRECT_THRESHOLD_BYTES,
   SUPPORTED_INPUT_EXTENSIONS,
+  ALLOWED_SIZES,
+  ALLOWED_SHADOW_TYPES,
   DesktopAppError,
   isPlausibleApiKey,
   maskApiKey,
   normalizeHexColor,
   sanitizeSettings,
   parseImageDimensions,
+  shouldPreFlightViaTicket,
   validateServiceEndpointUrl,
   deriveSubIdempotencyKey,
   parseRetryAfterMs,

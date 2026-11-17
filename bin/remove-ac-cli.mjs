@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * remove.ac Official Zero-Dependency CLI v1.2.0 (Node.js >= 18)
+ * remove.ac Official Zero-Dependency CLI v1.3.0 (Node.js >= 18)
  * Compatible with POST https://remove.ac/v1.0/removebg, POST /v1.0/removebg/ticket, & GET /v1.0/account
  *
  * Usage:
@@ -21,7 +21,7 @@ import {
   validateHttpsEndpointUrl,
 } from "../node/net-safety.mjs";
 
-export const CLI_VERSION = "1.2.0";
+export const CLI_VERSION = "1.3.0";
 export const USER_AGENT = `remove-ac-cli/${CLI_VERSION}`;
 export const VALID_SIZES = Object.freeze([
   "auto",
@@ -634,7 +634,9 @@ export async function processImageBuffer({
   const needsDirect =
     validatedOpts.direct ||
     bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES ||
-    (bgInput?.kind === "file" && bgInput.bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES) ||
+    (bgInput?.kind === "file" &&
+      (bgInput.bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES ||
+        bytes.byteLength + bgInput.bytes.byteLength > DIRECT_STREAM_THRESHOLD_BYTES)) ||
     shouldPreFlightViaTicket(
       bytes,
       validatedOpts.size,

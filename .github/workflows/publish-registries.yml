@@ -37,13 +37,13 @@ jobs:
             import fs from "node:fs";
             import { SERVER_VERSION } from "./bin/remove-ac-mcp.mjs";
             import { CLI_VERSION } from "./bin/remove-ac-cli.mjs";
+            import { ACTION_VERSION } from "./bin/remove-ac-action.mjs";
             import { SDK_VERSION } from "./node/index.mjs";
 
             const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
             const srv = JSON.parse(fs.readFileSync("server.json", "utf8"));
             const pyproject = fs.readFileSync("pyproject.toml", "utf8");
-            const pyMatch = pyproject.match(/^version\s*=\s*"([^"]+)"/m);
-            const pyVer = pyMatch ? pyMatch[1] : "";
+            const pyVer = (pyproject.match(/^version\s*=\s*"([^"]+)"/m) || [])[1] || "";
 
             const versions = {
               "package.json": pkg.version,
@@ -52,6 +52,7 @@ jobs:
               "server.json.packages[0]": srv.packages?.[0]?.version,
               "bin/remove-ac-mcp.mjs": SERVER_VERSION,
               "bin/remove-ac-cli.mjs": CLI_VERSION,
+              "bin/remove-ac-action.mjs": ACTION_VERSION,
               "node/index.mjs": SDK_VERSION,
             };
             for (const [k, v] of Object.entries(versions)) {

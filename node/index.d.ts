@@ -29,7 +29,7 @@ export type RemoveBgShadowType =
   | "reflection"
   | "none";
 
-export declare const SDK_VERSION: "1.2.0";
+export declare const SDK_VERSION: "1.3.0";
 export declare const USER_AGENT: string;
 export declare const VALID_SIZES: readonly RemoveBgSize[];
 export declare const VALID_FORMATS: readonly RemoveBgFormat[];
@@ -48,6 +48,8 @@ export interface RemoveBackgroundOptions {
   position?: string;
   bgColor?: string;
   bgImageUrl?: string;
+  bgImageFile?: string | Buffer | Uint8Array | ArrayBuffer;
+  bgImageFileB64?: string;
   crop?: boolean;
   cropMargin?: string;
   addShadow?: boolean;
@@ -64,6 +66,18 @@ export interface RemoveBackgroundResult {
   height: number;
   creditsCharged: number;
   mediaType: string;
+}
+
+export interface SubmitImproveOptions {
+  tag?: string;
+  description?: string;
+  filename?: string;
+}
+
+export interface SubmitImproveResult {
+  id: string;
+  status: string;
+  [key: string]: unknown;
 }
 
 export declare function parseImageDimensions(
@@ -84,6 +98,10 @@ export declare class RemoveAcClient {
     input: string | Buffer | Uint8Array | ArrayBuffer,
     options?: RemoveBackgroundOptions,
   ): Promise<RemoveBackgroundResult>;
+  submitImprove(
+    input: string | Buffer | Uint8Array | ArrayBuffer,
+    options?: SubmitImproveOptions,
+  ): Promise<SubmitImproveResult>;
 }
 
 export declare function removeBackgroundFromImageFile(

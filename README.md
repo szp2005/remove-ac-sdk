@@ -1,4 +1,4 @@
-# remove.ac Official SDKs, CLI, GitHub Action & MCP Server (`v1.2.0`)
+# remove.ac Official SDKs, CLI, GitHub Action & MCP Server (`v1.3.0`)
 
 Zero-dependency official developer SDKs, hot-folder CLI, GitHub Action, and Model Context Protocol (`MCP`) server for **[remove.ac](https://remove.ac)** — the dual-mode background removal platform pairing a free on-device WebAssembly studio with a `remove.bg`-compatible Cloud GPU REST API (`POST https://remove.ac/v1.0/removebg`).
 
@@ -14,9 +14,9 @@ Zero-dependency official developer SDKs, hot-folder CLI, GitHub Action, and Mode
 
 ## Key Capabilities
 
-- **1:1 `remove.bg` v1.0 Field Compatibility:** Swap `https://api.remove.bg/v1.0/removebg` to `https://remove.ac/v1.0/removebg` using standard `X-Api-Key: rac_live_...` headers and form fields (`image_file`, `image_file_b64`, `image_url`, `size`, `format`, `channels`, `type`, `roi`, `crop`, `crop_margin`, `scale`, `position`, `bg_color`, `bg_image_url`, `add_shadow`, `shadow_type`, `shadow_opacity`, `semitransparency`).
-- **Up to 25 MB / 50 MP Zero-Disk Direct GPU Streaming:** Single-call `POST https://remove.ac/v1.0/removebg` uploads up to 25 MB / 50 MP (`size=25mp`, `size=50mp`, `size=full`, `size=auto`) stream transparently at the edge via 180-second single-use HMAC tickets (`POST /v1.0/removebg/ticket`) directly to ephemeral GPU RAM without disk or database blob persistence.
-- **Atomic Credit Holds (`Idempotency-Key`):** Upstream timeouts or errors automatically release held credits with zero charge. Every verified account starts with **1 free credit**; pay-as-you-go credit packs never expire.
+- **1:1 `remove.bg` v1.0 Field Compatibility:** Swap `https://api.remove.bg/v1.0/removebg` to `https://remove.ac/v1.0/removebg` using standard `X-Api-Key: rac_live_...` headers and form fields (`image_file`, `image_file_b64`, `image_url`, `size`, `format`, `channels`, `type`, `roi`, `crop`, `crop_margin`, `scale`, `position`, `bg_color`, `bg_image_file`, `bg_image_file_b64`, `bg_image_url`, `add_shadow`, `shadow_type`, `shadow_opacity`, `semitransparency`), plus `POST /v1.0/improve` (`submitImprove` / `submit_improve`) for hard-case feedback submissions.
+- **Up to 25 MB / 50 MP Zero-Disk Direct GPU Streaming:** Single-call `POST https://remove.ac/v1.0/removebg` uploads up to 25 MB / 50 MP (`size=25mp`, `size=50mp`, `size=full`, `size=auto`) — including custom local background images (`bgImageFile` / `bg_image_file`) — stream transparently at the edge via 180-second single-use HMAC tickets (`POST /v1.0/removebg/ticket`) directly to ephemeral GPU RAM without disk or database blob persistence.
+- **Atomic Credit Holds (`Idempotency-Key`):** Upstream timeouts or errors automatically release held credits with zero charge. Every verified account starts with **10 full-resolution welcome credits (valid 30 days)**; pay-as-you-go credit packs never expire.
 - **Zero External Runtime Dependencies:** The Node.js 18+ SDK, CLI, GitHub Action, MCP stdio server, and Python 3.8+ SDK run purely on standard library primitives (`fetch`/`crypto` in Node, `urllib` in Python).
 
 ---
@@ -55,10 +55,11 @@ const client = new RemoveAcClient({
   apiKey: process.env.REMOVE_AC_API_KEY, // rac_live_...
 });
 
-// Files > 4 MB (up to 25 MB) automatically use /v1.0/removebg/ticket zero-disk GPU streaming
+// Files > 4 MB (up to 25 MB / 50 MP) automatically use /v1.0/removebg/ticket zero-disk GPU streaming
 const result = await client.removeBackground("./studio-shot-18mb.png", {
   size: "full",
   format: "png",
+  bgImageFile: "./studio-backdrop.jpg", // optional path or Buffer/Uint8Array/ArrayBuffer
   shadowType: "contact",
 });
 
@@ -166,16 +167,16 @@ Automate storefront product cutouts or PR asset cleanup directly inside GitHub A
 
 ## 7. n8n Community Node (`n8n-nodes-remove-ac`)
 
-In self-hosted or desktop n8n, open **Settings → Community Nodes → Install** and enter `n8n-nodes-remove-ac` to replace deprecated `remove.bg` workflow steps with native binary and URL support up to `25 MB`.
+In self-hosted or desktop n8n, open **Settings → Community Nodes → Install** and enter `n8n-nodes-remove-ac` to replace deprecated `remove.bg` workflow steps with native binary and URL support up to `25 MB / 50 MP`.
 
 ---
 
 ## 8. Standalone Desktop App (`Windows .exe` · `macOS Universal .dmg` · `Linux .AppImage`)
 
-[`desktop/`](./desktop) contains the official standalone Electron desktop application (`Remove.ac`) for bulk folder and multi-thousand-photo background removal — requiring zero Node.js or Python installation on end-user machines:
+[`desktop/`](./desktop) contains the official standalone Electron desktop application (`Remove.ac`) for bulk folder and multi-thousand-photo background removal up to `25 MB / 50 MP` — requiring zero Node.js or Python installation on end-user machines:
 
 - **Direct Downloads:** https://remove.ac/plugins/desktop (or [GitHub Releases](https://github.com/szp2005/remove-ac-sdk/releases))
-- **Installers:** `remove-ac-for-windows-1.0.0.exe` (NSIS x64), `remove-ac-portable-1.0.0.exe` (zero-install portable x64), `remove-ac-for-macos-1.0.0.dmg` (Universal Apple Silicon + Intel), and `remove-ac-for-linux-1.0.0.AppImage` (x64)
+- **Installers:** `remove-ac-for-windows-1.1.0.exe` (NSIS x64), `remove-ac-portable-1.1.0.exe` (zero-install portable x64), `remove-ac-for-macos-1.1.0.dmg` (Universal Apple Silicon + Intel), and `remove-ac-for-linux-1.1.0.AppImage` (x64)
 
 ---
 
