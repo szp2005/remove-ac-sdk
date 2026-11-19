@@ -212,6 +212,9 @@ jobs:
     needs: [verify]
     if: needs.verify.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -219,16 +222,33 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build sdist/wheel and publish remove-ac to PyPI (when PYPI_API_TOKEN is configured)
+      - name: Build sdist/wheel and verify package metadata
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Select PyPI publish authentication mode (OIDC Trusted Publisher when PYPI_API_TOKEN is unset)
+        id: pypi_auth
+        env:
+          PYPI_TOKEN_OPT: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "${PYPI_TOKEN_OPT:-}" ]; then
+            echo "mode=token" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=oidc" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish remove-ac to PyPI via OIDC Trusted Publisher
+        if: steps.pypi_auth.outputs.mode == 'oidc'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+      - name: Publish remove-ac to PyPI via legacy PYPI_API_TOKEN fallback
+        if: steps.pypi_auth.outputs.mode == 'token'
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          if [ -z "${TWINE_PASSWORD:-}" ]; then
-            echo "Skipping PyPI publish: secrets.PYPI_API_TOKEN is not configured yet."
-            exit 0
-          fi
-          python -m pip install --upgrade build twine
-          python -m build
-          python -m twine check dist/*
           python -m twine upload --skip-existing dist/*
