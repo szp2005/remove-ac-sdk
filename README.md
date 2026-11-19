@@ -1,5 +1,7 @@
 # remove.ac Official SDKs, CLI, GitHub Action & MCP Server (`v1.3.0`)
 
+[![szp2005/remove-ac-sdk MCP server](https://glama.ai/mcp/servers/szp2005/remove-ac-sdk/badges/score.svg)](https://glama.ai/mcp/servers/szp2005/remove-ac-sdk)
+
 Zero-dependency official developer SDKs, hot-folder CLI, GitHub Action, and Model Context Protocol (`MCP`) server for **[remove.ac](https://remove.ac)** — the dual-mode background removal platform pairing a free on-device WebAssembly studio with a `remove.bg`-compatible Cloud GPU REST API (`POST https://remove.ac/v1.0/removebg`).
 
 - **Live Web Workbench (Free On-Device WASM + Batch 50 ZIP):** https://remove.ac
@@ -18,6 +20,7 @@ Zero-dependency official developer SDKs, hot-folder CLI, GitHub Action, and Mode
 - **Up to 25 MB / 50 MP Zero-Disk Direct GPU Streaming:** Single-call `POST https://remove.ac/v1.0/removebg` uploads up to 25 MB / 50 MP (`size=25mp`, `size=50mp`, `size=full`, `size=auto`) — including custom local background images (`bgImageFile` / `bg_image_file`) — stream transparently at the edge via 180-second single-use HMAC tickets (`POST /v1.0/removebg/ticket`) directly to ephemeral GPU RAM without disk or database blob persistence.
 - **Atomic Credit Holds (`Idempotency-Key`):** Upstream timeouts or errors automatically release held credits with zero charge. Every verified account starts with **10 full-resolution welcome credits (valid 30 days)**; pay-as-you-go credit packs never expire.
 - **Zero External Runtime Dependencies:** The Node.js 18+ SDK, CLI, GitHub Action, MCP stdio server, and Python 3.8+ SDK run purely on standard library primitives (`fetch`/`crypto` in Node, `urllib` in Python).
+- **Sub-2s Warm Cloud GPU Latency (Measured 2026-11-19 on Real AIM-500 Photos):** Full high-resolution matting and edge refinement finishes in **`0.88–1.04 s` on GPU (`1.58 s` end-to-end)** at 2.2 MP (`1696×1312`) and **`1.49–2.01 s` on GPU (`2.26 s` end-to-end)** at 4K (`3840×2160`); cold scale-from-zero 4K finishes in **`8.41 s` end-to-end**.
 
 ---
 
