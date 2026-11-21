@@ -21,6 +21,9 @@ Zero-dependency official developer SDKs, hot-folder CLI, GitHub Action, and Mode
 - **Atomic Credit Holds (`Idempotency-Key`):** Upstream timeouts or errors automatically release held credits with zero charge. Every verified account starts with **10 full-resolution welcome credits (valid 30 days)**; pay-as-you-go credit packs never expire.
 - **Zero External Runtime Dependencies:** The Node.js 18+ SDK, CLI, GitHub Action, MCP stdio server, and Python 3.8+ SDK run purely on standard library primitives (`fetch`/`crypto` in Node, `urllib` in Python).
 - **Sub-2s Warm Cloud GPU Latency (Measured 2026-11-19 on Real AIM-500 Photos):** Full high-resolution matting and edge refinement finishes in **`0.88–1.04 s` on GPU (`1.58 s` end-to-end)** at 2.2 MP (`1696×1312`) and **`1.49–2.01 s` on GPU (`2.26 s` end-to-end)** at 4K (`3840×2160`); cold scale-from-zero 4K finishes in **`8.41 s` end-to-end**.
+- **Free Interactive Cloud GPU Previews (`~612px`, `0` Credits):** In the web studio ([remove.ac/upload](https://remove.ac/upload)), inspect `~612px` (`~0.25 MP`) Cloud GPU cutouts for `0` credits (`5/day` on free accounts, `30/day` with paid credits; images already within preview dimensions deliver full original resolution free) before spending `1` credit to unlock full-resolution Max HD (up to `50 MP / 25 MB`, keeping background/shadow/crop edits).
+- **Dec 1 Migration Grant (`30%-50%` Off Through Dec 31, 2026) & `14`-Day Self-Serve Refund:** Self-serve checkout auto-applies `30%` off Starter (`10-75` PAYG, `40` mo/yr), `40%` off Growth (`200-500`), and `50%` off High-Volume (`1,200-5,000` PAYG/mo + `1,200` yr) on first `3` monthly cycles, first annual year up to `1,200`, or non-expiring PAYG packs (up to `3` orders/account, max `1` on `2,800`/`5,000`; Enterprise `2,800`/`5,000` annual concierge-verified via `support@remove.ac`). Initial orders include a `14`-day self-serve trial refund (`100%` if `0` credits used, or 1-click prorated refund if `<= 20%` and `<= 100` credits used, minus `$1` gateway fee, `1` prorated refund/account).
+- **Bug & Workflow Idea Credit Rewards:** Report bugs, cutout edge cases, or workflow ideas on the [remove.ac](https://remove.ac) homepage (up to `3` submissions per 24h) to earn `5-20` non-expiring Cloud GPU credits automatically once verified and accepted.
 
 ---
 
@@ -168,9 +171,9 @@ Automate storefront product cutouts or PR asset cleanup directly inside GitHub A
 
 ---
 
-## 7. n8n Community Node (`n8n-nodes-remove-ac`)
+## 7. n8n Community Node (`n8n-nodes-remove-ac` `v1.0.1`)
 
-In self-hosted or desktop n8n, open **Settings → Community Nodes → Install** and enter `n8n-nodes-remove-ac` to replace deprecated `remove.bg` workflow steps with native binary and URL support up to `25 MB / 50 MP`.
+In self-hosted or desktop n8n, open **Settings → Community Nodes → Install** and enter `n8n-nodes-remove-ac` (`v1.0.1`) to replace deprecated `remove.bg` workflow steps with native binary and URL support up to `25 MB / 50 MP`.
 
 ---
 
