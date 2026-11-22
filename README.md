@@ -1,4 +1,4 @@
-# remove.ac Official SDKs, CLI, GitHub Action & MCP Server (`v1.3.0`)
+# remove.ac Official SDKs, CLI, GitHub Action & MCP Server (`v1.3.1`)
 
 [![szp2005/remove-ac-sdk MCP server](https://glama.ai/mcp/servers/szp2005/remove-ac-sdk/badges/score.svg)](https://glama.ai/mcp/servers/szp2005/remove-ac-sdk)
 
@@ -135,7 +135,9 @@ rmbg.remove_background_from_img_file("car.jpg", size="full", new_file_name="car-
 - `remove_background_url` — remove background from a public `https://` image URL and save locally
 - `get_account_balance` — inspect remaining `remove.ac` API credits
 
-### Claude Desktop / Cursor Configuration
+For Cline and other AI coding agents, see [`./llms-install.md`](./llms-install.md) for deterministic step-by-step setup and a zero-key JSON-RPC handshake check.
+
+### Claude Desktop / Cursor / Cline Configuration
 
 ```json
 {
@@ -171,9 +173,9 @@ Automate storefront product cutouts or PR asset cleanup directly inside GitHub A
 
 ---
 
-## 7. n8n Community Node (`n8n-nodes-remove-ac` `v1.0.1`)
+## 7. n8n Community Node (`n8n-nodes-remove-ac` `v1.0.2`)
 
-In self-hosted or desktop n8n, open **Settings → Community Nodes → Install** and enter `n8n-nodes-remove-ac` (`v1.0.1`) to replace deprecated `remove.bg` workflow steps with native binary and URL support up to `25 MB / 50 MP`.
+In self-hosted or desktop n8n, open **Settings → Community Nodes → Install** and enter `n8n-nodes-remove-ac` (`v1.0.2`) to replace deprecated `remove.bg` workflow steps with native binary and URL support up to `25 MB / 50 MP`.
 
 ---
 
@@ -182,7 +184,7 @@ In self-hosted or desktop n8n, open **Settings → Community Nodes → Install**
 [`desktop/`](./desktop) contains the official standalone Electron desktop application (`Remove.ac`) for bulk folder and multi-thousand-photo background removal up to `25 MB / 50 MP` — requiring zero Node.js or Python installation on end-user machines:
 
 - **Direct Downloads:** https://remove.ac/plugins/desktop (or [GitHub Releases](https://github.com/szp2005/remove-ac-sdk/releases))
-- **Installers:** `remove-ac-for-windows-1.1.0.exe` (NSIS x64), `remove-ac-portable-1.1.0.exe` (zero-install portable x64), `remove-ac-for-macos-1.1.0.dmg` (Universal Apple Silicon + Intel), and `remove-ac-for-linux-1.1.0.AppImage` (x64)
+- **Installers:** `remove-ac-for-windows-1.1.1.exe` (NSIS x64), `remove-ac-portable-1.1.1.exe` (zero-install portable x64), `remove-ac-for-macos-1.1.1.dmg` (Universal Apple Silicon + Intel), and `remove-ac-for-linux-1.1.1.AppImage` (x64)
 
 ---
 
