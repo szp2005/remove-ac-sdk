@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import {
   fetchWithoutRedirects,
   isLoopbackTestOrigin,
+  validateDirectEndpointUrl,
   validateHttpsEndpointUrl,
   validateRemoteImageUrl,
 } from "../node/net-safety.mjs";
@@ -735,9 +736,9 @@ export async function processImageBuffer({
       await releaseTicketHold(holdId, releaseToken);
       return { ok: false, status: 502, errorText: "Missing ticket or directEndpoint in response" };
     }
-    const epErr = await validateHttpsEndpointUrl(directEndpoint, {
+    const epErr = await validateDirectEndpointUrl(directEndpoint, {
+      baseUrl,
       lookupFn,
-      allowLoopbackOrigin: isLoopbackTestOrigin(baseUrl),
       label: "directEndpoint",
     });
     if (epErr) {
@@ -778,6 +779,7 @@ export async function processImageBuffer({
     return {
       ok: true,
       buffer: Buffer.from(await directRes.arrayBuffer()),
+      contentType: directRes.headers.get("content-type") || "",
       charged:
         directRes.headers.get("x-credits-charged") ??
         String(tData?.creditsHeld ?? ticketJson?.creditsHeld ?? "?"),
@@ -884,28 +886,97 @@ export async function processImageBuffer({
   return {
     ok: true,
     buffer: Buffer.from(await res.arrayBuffer()),
+    contentType: res.headers.get("content-type") || "",
     charged: res.headers.get("x-credits-charged") ?? "?",
     via: "gateway",
   };
 }
 
-function resolveDestPath(filePath, opts) {
-  const outExt = opts.format === "auto" ? "png" : opts.format === "jpeg" ? "jpg" : opts.format;
+export function extensionFromContentType(contentType) {
+  const mime = String(contentType || "").split(";")[0].trim().toLowerCase();
+  if (mime === "image/jpeg" || mime === "image/jpg") return "jpg";
+  if (mime === "image/webp") return "webp";
+  if (mime === "application/zip" || mime === "application/x-zip-compressed") return "zip";
+  return "png";
+}
+
+export function resolveDestPath(filePath, opts, contentType = "") {
+  const outExt =
+    opts.format === "auto"
+      ? extensionFromContentType(contentType)
+      : opts.format === "jpeg"
+        ? "jpg"
+        : opts.format;
   const stem = path.basename(filePath, path.extname(filePath));
   return opts.output
     ? path.resolve(opts.output)
     : path.join(opts.outputDir ? path.resolve(opts.outputDir) : path.dirname(filePath), `${stem}-nobg.${outExt}`);
 }
 
-async function processSingleFile(filePath, opts, baseUrl, bgInput) {
-  const destPath = resolveDestPath(filePath, opts);
-  if (
-    bgInput?.kind === "file" &&
-    fs.existsSync(destPath) &&
-    fs.realpathSync(destPath) === fs.realpathSync(bgInput.path)
-  ) {
-    console.error(`[FAIL] ${path.basename(filePath)} -> Refusing to overwrite --bg-image file: ${destPath}`);
+export function assertSafeCliWriteTarget(destPath) {
+  const resolved = path.resolve(destPath);
+  let st = null;
+  try {
+    st = fs.lstatSync(resolved);
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") throw err;
+  }
+  if (st) {
+    if (st.isSymbolicLink()) {
+      throw new Error(`Refusing to overwrite symbolic link destination: ${resolved}`);
+    }
+    if (st.isDirectory()) {
+      throw new Error(`Destination path is a directory: ${resolved}`);
+    }
+  }
+  return resolved;
+}
+
+export function writeFileAtomicallyNoSymlink(destPath, buffer) {
+  const resolved = assertSafeCliWriteTarget(destPath);
+  const dir = path.dirname(resolved);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = path.join(
+    dir,
+    `.${path.basename(resolved)}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`,
+  );
+  try {
+    fs.writeFileSync(tmpPath, buffer, { flag: "wx", mode: 0o644 });
+    assertSafeCliWriteTarget(resolved);
+    fs.renameSync(tmpPath, resolved);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore temp cleanup failure
+    }
+    throw err;
+  }
+}
+
+function isSameRealBgFile(destPath, bgInput) {
+  if (bgInput?.kind !== "file") return false;
+  try {
+    if (!fs.existsSync(destPath)) return false;
+    return fs.realpathSync(destPath) === fs.realpathSync(bgInput.path);
+  } catch {
     return false;
+  }
+}
+
+export async function processSingleFile(filePath, opts, baseUrl, bgInput, runtimeDeps = {}) {
+  if (opts.output || opts.format !== "auto") {
+    const prelimDest = resolveDestPath(filePath, opts);
+    if (isSameRealBgFile(prelimDest, bgInput)) {
+      console.error(`[FAIL] ${path.basename(filePath)} -> Refusing to overwrite --bg-image file: ${prelimDest}`);
+      return false;
+    }
+    try {
+      assertSafeCliWriteTarget(prelimDest);
+    } catch (err) {
+      console.error(`[FAIL] ${path.basename(filePath)} -> ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
   }
   const st = fs.statSync(filePath);
   if (st.size <= 0) {
@@ -932,6 +1003,8 @@ async function processSingleFile(filePath, opts, baseUrl, bgInput) {
       opts,
       baseUrl,
       bgInput,
+      ...(runtimeDeps.fetchImpl ? { fetchImpl: runtimeDeps.fetchImpl } : {}),
+      ...(runtimeDeps.lookupFn ? { lookupFn: runtimeDeps.lookupFn } : {}),
     });
   } catch (err) {
     console.error(`[FAIL] ${path.basename(filePath)} -> ${err instanceof Error ? err.message : String(err)}`);
@@ -941,8 +1014,17 @@ async function processSingleFile(filePath, opts, baseUrl, bgInput) {
     console.error(`[FAIL] ${path.basename(filePath)} -> HTTP ${outcome.status}: ${outcome.errorText}`);
     return false;
   }
-  fs.mkdirSync(path.dirname(destPath), { recursive: true });
-  fs.writeFileSync(destPath, outcome.buffer);
+  const destPath = resolveDestPath(filePath, opts, outcome.contentType);
+  if (isSameRealBgFile(destPath, bgInput)) {
+    console.error(`[FAIL] ${path.basename(filePath)} -> Refusing to overwrite --bg-image file: ${destPath}`);
+    return false;
+  }
+  try {
+    writeFileAtomicallyNoSymlink(destPath, outcome.buffer);
+  } catch (err) {
+    console.error(`[FAIL] ${path.basename(filePath)} -> ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
   console.log(`[OK] ${path.basename(filePath)} -> ${destPath} (${outcome.charged} credits, ${outcome.via})`);
   return true;
 }

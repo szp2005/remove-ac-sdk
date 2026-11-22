@@ -13,11 +13,14 @@ const {
   ALLOWED_SIZES,
   CredentialManager,
   DesktopApiClient,
+  MAX_INPUT_DIMENSION,
   MAX_INPUT_PIXELS,
   MAX_PREVIEW_FALLBACK_BYTES,
   MAX_PREVIEW_FILE_BYTES,
   areSameOrCaseCollidingPaths,
   collectInputItems,
+  isAllowedDirectGpuHost,
+  isAllowedFirstPartyHost,
   isPlausibleApiKey,
   maskApiKey,
   parseImageDimensions,
@@ -92,24 +95,49 @@ test("parseImageDimensions parses PNG headers accurately", () => {
   assert.equal(parseImageDimensions(Buffer.from("not-an-image")), null);
 });
 
-test("validateServiceEndpointUrl enforces strict HTTPS and first-party/GPU host allowlist", () => {
+test("validateServiceEndpointUrl enforces strict HTTPS and first-party host allowlist (rejects *.modal.run)", () => {
+  assert.equal(isAllowedFirstPartyHost("remove.ac"), true);
+  assert.equal(isAllowedFirstPartyHost("api.remove.ac"), true);
+  assert.equal(isAllowedFirstPartyHost("evil-remove.ac"), false);
+  assert.equal(isAllowedDirectGpuHost("remove.ac"), true);
+  assert.equal(isAllowedDirectGpuHost("edge.remove.ac"), true);
+  assert.equal(isAllowedDirectGpuHost("worker.modal.run"), false);
+  assert.equal(isAllowedDirectGpuHost("tenant--gpu-app.modal.run"), false);
+  assert.equal(isAllowedDirectGpuHost("evil-remove.ac"), false);
+
   assert.equal(
     validateServiceEndpointUrl("https://remove.ac/anything", { kind: "base" }),
     "https://remove.ac"
   );
   assert.equal(
-    validateServiceEndpointUrl("https://worker.modal.run/cutout", { kind: "direct" }),
-    "https://worker.modal.run/cutout"
+    validateServiceEndpointUrl("https://remove.ac/v1.0/direct-cutout", { kind: "direct" }),
+    "https://remove.ac/v1.0/direct-cutout"
+  );
+  assert.equal(
+    validateServiceEndpointUrl("https://edge.remove.ac/v1.0/direct-cutout", { kind: "direct" }),
+    "https://edge.remove.ac/v1.0/direct-cutout"
   );
 
-  // Reject Modal host as base API URL (prevent sending X-Api-Key to non-remove.ac hosts)
+  // Reject wildcard *.modal.run on both base AND direct endpoints (P0-02 hardening)
   assert.throws(
     () => validateServiceEndpointUrl("https://worker.modal.run", { kind: "base" }),
     /Refused untrusted base host/
   );
+  assert.throws(
+    () => validateServiceEndpointUrl("https://worker.modal.run/cutout", { kind: "direct" }),
+    /Refused untrusted direct host/
+  );
+  assert.throws(
+    () => validateServiceEndpointUrl("https://evil.modal.run/v1.0/direct-cutout", { kind: "direct" }),
+    /Refused untrusted direct host/
+  );
   // Reject arbitrary HTTPS host on directEndpoint
   assert.throws(
     () => validateServiceEndpointUrl("https://evil.example.com/upload", { kind: "direct" }),
+    /Refused untrusted direct host/
+  );
+  assert.throws(
+    () => validateServiceEndpointUrl("https://evil-remove.ac/v1.0/direct-cutout", { kind: "direct" }),
     /Refused untrusted direct host/
   );
   // Reject plain HTTP unless loopback test flag is explicitly enabled
@@ -453,13 +481,28 @@ test("DesktopApiClient handles /v1.0/account, /v1.0/remove, 503 retries, 413 tic
     );
     assert.equal(removeCalls, prevRemoveCalls);
     assert.equal(ticketCalls, prevTicketCalls);
+
+    // 5. Rejects >50,000 px single-side panorama (even when total pixels <= 50 MP) locally with 0 network calls
+    const widePanorama = makeFakeLargeHeaderPng(60_000, 500); // 30 MP but width > 50,000 px
+    const tallPanorama = makeFakeLargeHeaderPng(500, 60_000); // 30 MP but height > 50,000 px
+    await assert.rejects(
+      () => client.removeBackgroundBuffer(widePanorama, "wide.png", {}),
+      (err) => err.statusCode === 400 && err.code === "resolution_too_large" && /50,000 px/.test(err.message)
+    );
+    await assert.rejects(
+      () => client.removeBackgroundBuffer(tallPanorama, "tall.png", {}),
+      (err) => err.statusCode === 400 && err.code === "resolution_too_large" && /50,000 px/.test(err.message)
+    );
+    assert.equal(removeCalls, prevRemoveCalls);
+    assert.equal(ticketCalls, prevTicketCalls);
   } finally {
     server.close();
   }
 });
 
-test("Desktop v1.1.0 enforces 50 MP ceiling, full size/shadow parity, and accurate ticket preflight tiers", () => {
+test("Desktop v1.1.0 enforces 50 MP / 50,000 px ceiling, full size/shadow parity, and accurate ticket preflight tiers", () => {
   assert.equal(MAX_INPUT_PIXELS, 50_000_000);
+  assert.equal(MAX_INPUT_DIMENSION, 50_000);
   assert.deepEqual(
     ALLOWED_SIZES,
     new Set(["auto", "full", "50mp", "25mp", "4k", "hd", "medium", "regular", "small", "preview"])
@@ -483,10 +526,11 @@ test("Desktop v1.1.0 enforces 50 MP ceiling, full size/shadow parity, and accura
   // 4k caps at 10 MP: 8 MP uncropped (>5 MP) preflights; 20 MP cropped (capped at 10 MP <= 10 MP) stays sync
   assert.equal(shouldPreFlightViaTicket(png8Mp, "4k", "png", false), true);
   assert.equal(shouldPreFlightViaTicket(png20Mp, "4k", "png", true), false);
-  // 25mp, 50mp, full, auto on 20 MP and 45 MP preflight via ticket
+  // 25mp, 50mp, full, auto on 20 MP and 45 MP preflight via ticket (including format="auto")
   for (const hiTier of ["25mp", "50mp", "full", "auto"]) {
     assert.equal(shouldPreFlightViaTicket(png20Mp, hiTier, "png", true), true);
     assert.equal(shouldPreFlightViaTicket(png45Mp, hiTier, "png", true), true);
+    assert.equal(shouldPreFlightViaTicket(png20Mp, hiTier, "auto", false), true);
   }
 });
 

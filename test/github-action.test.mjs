@@ -556,3 +556,101 @@ test("R2 MF-04 & MF-02: GitHub Action excludes bg-image-file from directory batc
   );
   assert.equal(overwriteApiCalls, 0);
 });
+
+test("M-P0-04 & M-P1-08: GitHub Action image_url recovers from HTTP 413 via ticket fallback and blocks untrusted directEndpoint (*.modal.run)", async (t) => {
+  const ws = createTempWorkspace(t);
+  const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
+  const calls = [];
+
+  const summary = await runGithubAction({
+    env: {
+      GITHUB_WORKSPACE: ws,
+      INPUT_API_KEY: "rac_live_gha_413",
+      INPUT_IMAGE_URL: "https://cdn.example.com/large-sku.png",
+      INPUT_OUTPUT_PATH: "cutout-413.png",
+      INPUT_BASE_URL: "http://127.0.0.1:8787",
+    },
+    cwd: ws,
+    stdout: { write() {} },
+    allowLoopbackBaseUrlForTest: true,
+    lookupFn: publicLookup,
+    fetchImpl: async (url, init = {}) => {
+      const u = String(url);
+      calls.push(u);
+      if (u === "http://127.0.0.1:8787/v1.0/removebg") {
+        return new Response(JSON.stringify({ errors: [{ code: "result_too_large" }] }), {
+          status: 413,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (u === "https://cdn.example.com/large-sku.png") {
+        assert.equal(init.redirect, "error");
+        return new Response(TINY_PNG, { status: 200, headers: { "Content-Type": "image/png" } });
+      }
+      if (u === "http://127.0.0.1:8787/v1.0/removebg/ticket") {
+        return Response.json({
+          data: {
+            ticket: "gha_tkt_413",
+            directEndpoint: "http://127.0.0.1:8787/v1.0/direct-cutout",
+          },
+        });
+      }
+      if (u === "http://127.0.0.1:8787/v1.0/direct-cutout") {
+        assert.equal(init.headers.Authorization, "Bearer gha_tkt_413");
+        return new Response(Buffer.from("GHA_413_OK"), {
+          status: 200,
+          headers: { "Content-Type": "image/png", "X-Credits-Charged": "1", "X-Width": "3000", "X-Height": "2000" },
+        });
+      }
+      return new Response("unexpected", { status: 500 });
+    },
+  });
+
+  assert.equal(summary.processed_count, "1");
+  assert.equal(summary.width, "3000");
+  assert.equal(fs.readFileSync(path.join(ws, "cutout-413.png"), "utf8"), "GHA_413_OK");
+  assert.deepEqual(calls, [
+    "http://127.0.0.1:8787/v1.0/removebg",
+    "https://cdn.example.com/large-sku.png",
+    "http://127.0.0.1:8787/v1.0/removebg/ticket",
+    "http://127.0.0.1:8787/v1.0/direct-cutout",
+  ]);
+
+  // Reject untrusted *.modal.run directEndpoint even in test loopback mode
+  let evilHits = 0;
+  await assert.rejects(
+    () =>
+      runGithubAction({
+        env: {
+          GITHUB_WORKSPACE: ws,
+          INPUT_API_KEY: "rac_live_gha_413",
+          INPUT_IMAGE_URL: "https://cdn.example.com/large-sku.png",
+          INPUT_OUTPUT_PATH: "blocked-413.png",
+          INPUT_BASE_URL: "http://127.0.0.1:8787",
+        },
+        cwd: ws,
+        stdout: { write() {} },
+        allowLoopbackBaseUrlForTest: true,
+        lookupFn: publicLookup,
+        fetchImpl: async (url) => {
+          const u = String(url);
+          if (u === "http://127.0.0.1:8787/v1.0/removebg") return new Response("too large", { status: 413 });
+          if (u === "https://cdn.example.com/large-sku.png") {
+            return new Response(TINY_PNG, { status: 200, headers: { "Content-Type": "image/png" } });
+          }
+          if (u === "http://127.0.0.1:8787/v1.0/removebg/ticket") {
+            return Response.json({
+              data: {
+                ticket: "gha_evil",
+                directEndpoint: "https://evil.modal.run/v1.0/direct-cutout",
+              },
+            });
+          }
+          evilHits += 1;
+          return new Response("BAD", { status: 200 });
+        },
+      }),
+    /untrusted host/i,
+  );
+  assert.equal(evilHits, 0);
+});

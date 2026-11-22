@@ -1,12 +1,11 @@
 import crypto from "node:crypto";
-import dns from "node:dns";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  fetchSafeRemoteImageBytes,
   fetchWithoutRedirects,
   isDisallowedRemoteUrl,
-  isLoopbackTestOrigin,
-  validateHttpsEndpointUrl,
+  validateDirectEndpointUrl,
   validateRemoteImageUrl,
 } from "./net-safety.mjs";
 
@@ -304,7 +303,7 @@ export class RemoveAcClient {
     this.baseUrl = (options.baseUrl || process.env.REMOVE_AC_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.apiKey = options.apiKey || process.env.REMOVE_AC_API_KEY || process.env.REMOVE_BG_API_KEY || "";
     this.fetchImpl = options.fetch || globalThis.fetch;
-    this.lookupImpl = options.lookup || dns.promises.lookup;
+    this.lookupImpl = options.lookup || null;
   }
 
   async _request(url, init = {}) {
@@ -423,7 +422,7 @@ export class RemoveAcClient {
     let bgB64DecodedBytes = null;
 
     if (rawBgImageUrl) {
-      const bgUrlErr = await validateRemoteImageUrl(rawBgImageUrl, this.lookupImpl);
+      const bgUrlErr = await validateRemoteImageUrl(rawBgImageUrl, this.lookupImpl || undefined);
       if (bgUrlErr) {
         throw new RemoveAcError(400, `Disallowed bgImageUrl (${bgUrlErr})`);
       }
@@ -473,7 +472,7 @@ export class RemoveAcClient {
         throw new RemoveAcError(400, "Unsupported input source");
       }
       if (looksLikeUrlCandidate(trimmedInput)) {
-        const srcUrlErr = await validateRemoteImageUrl(trimmedInput, this.lookupImpl);
+        const srcUrlErr = await validateRemoteImageUrl(trimmedInput, this.lookupImpl || undefined);
         if (srcUrlErr) {
           throw new RemoveAcError(400, `Disallowed image_url (${srcUrlErr})`);
         }
@@ -563,9 +562,9 @@ export class RemoveAcClient {
         await this._releaseTicketHold(holdId, releaseToken);
         throw new RemoveAcError(502, "Missing ticket or directEndpoint in /v1.0/removebg/ticket response");
       }
-      const epErr = await validateHttpsEndpointUrl(directEndpoint, {
-        lookupFn: this.lookupImpl,
-        allowLoopbackOrigin: isLoopbackTestOrigin(this.baseUrl),
+      const epErr = await validateDirectEndpointUrl(directEndpoint, {
+        baseUrl: this.baseUrl,
+        lookupFn: this.lookupImpl || undefined,
         label: "directEndpoint",
       });
       if (epErr) {
@@ -573,7 +572,11 @@ export class RemoveAcClient {
         throw new RemoveAcError(502, epErr);
       }
       const fd = new FormData();
-      fd.set("image_file", new Blob([sourceBytes]), sourceName);
+      fd.set(
+        "image_file",
+        new Blob([sourceBytes], { type: inferImageMimeType(sourceBytes, sourceName) }),
+        sourceName,
+      );
       if (ticketBgBytes) {
         fd.set("bg_image_file", new Blob([ticketBgBytes], { type: bgFileMime }), bgFileName);
       }
@@ -663,8 +666,39 @@ export class RemoveAcClient {
         throw new RemoveAcError(409, errBody);
       }
     }
-    if (res.status === 413 && sourceBytes) {
-      return runViaTicket("fallback413");
+    if (res.status === 413) {
+      if (!sourceBytes && sourceUrl) {
+        let fetched;
+        try {
+          fetched = await fetchSafeRemoteImageBytes(sourceUrl, {
+            fetchImpl: this.fetchImpl,
+            lookupFn: this.lookupImpl || undefined,
+            maxBytes: MAX_UPLOAD_BYTES,
+            userAgent: USER_AGENT,
+          });
+        } catch (err) {
+          if (err instanceof RemoveAcError) throw err;
+          const code = err && typeof err.statusCode === "number" ? err.statusCode : 502;
+          throw new RemoveAcError(code, err instanceof Error ? err.message : String(err));
+        }
+        sourceBytes = fetched.bytes;
+        if (fetched.fileName) {
+          sourceName = fetched.fileName;
+        }
+        assertValidBinaryEnvelope(sourceBytes, "Foreground image");
+        if (
+          ticketBgBytes !== null &&
+          sourceBytes.byteLength + ticketBgBytes.byteLength > MAX_COMBINED_UPLOAD_BYTES
+        ) {
+          throw new RemoveAcError(
+            413,
+            "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+          );
+        }
+      }
+      if (sourceBytes) {
+        return runViaTicket("fallback413");
+      }
     }
     if (!res.ok) throw new RemoveAcError(res.status, await res.text());
     return {
@@ -718,7 +752,7 @@ export class RemoveAcClient {
         throw new RemoveAcError(400, "Unsupported input source");
       }
       if (looksLikeUrlCandidate(trimmed)) {
-        const urlErr = await validateRemoteImageUrl(trimmed, this.lookupImpl);
+        const urlErr = await validateRemoteImageUrl(trimmed, this.lookupImpl || undefined);
         if (urlErr) {
           throw new RemoveAcError(400, `Disallowed image_url (${urlErr})`);
         }

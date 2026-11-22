@@ -7,6 +7,7 @@ const path = require("node:path");
 const DEFAULT_BASE_URL = "https://remove.ac";
 const MAX_INPUT_BYTES = 25 * 1024 * 1024; // 25 MB
 const MAX_INPUT_PIXELS = 50_000_000; // 50 MP
+const MAX_INPUT_DIMENSION = 50_000; // 50,000 px max single side
 const MAX_PREVIEW_FILE_BYTES = 90 * 1024 * 1024; // 90 MB (50 MP lossless RGBA PNG cutouts)
 const MAX_PREVIEW_FALLBACK_BYTES = 35 * 1024 * 1024; // 35 MB (50 MP WebP cutouts / 25 MB WebP inputs)
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024; // 4 MB Vercel payload threshold
@@ -254,7 +255,7 @@ function parseImageDimensions(input) {
 
 function shouldPreFlightViaTicket(bytes, size, format, crop) {
   if (!bytes) return false;
-  if (format !== "png" && format !== "zip") return false;
+  if (format !== "png" && format !== "auto" && format !== "zip") return false;
   const dims = parseImageDimensions(bytes);
   if (!dims) return false;
   const inputPixels = dims.width * dims.height;
@@ -269,11 +270,12 @@ function shouldPreFlightViaTicket(bytes, size, format, crop) {
 }
 
 function isAllowedFirstPartyHost(hostname) {
-  return hostname === "remove.ac" || hostname.endsWith(".remove.ac");
+  const normalized = String(hostname || "").trim().toLowerCase().replace(/\.+$/, "");
+  return normalized === "remove.ac" || normalized.endsWith(".remove.ac");
 }
 
 function isAllowedDirectGpuHost(hostname) {
-  return isAllowedFirstPartyHost(hostname) || hostname.endsWith(".modal.run");
+  return isAllowedFirstPartyHost(hostname);
 }
 
 function validateServiceEndpointUrl(rawUrl, options = {}) {
@@ -288,7 +290,7 @@ function validateServiceEndpointUrl(rawUrl, options = {}) {
   if (parsed.username || parsed.password) {
     throw new DesktopAppError(400, "invalid_endpoint", `Credentials are not allowed in ${kind} URL`);
   }
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
   if (
     allowLoopback &&
     parsed.protocol === "http:" &&
@@ -914,13 +916,22 @@ class DesktopApiClient {
     }
 
     const dims = parseImageDimensions(sourceBytes);
-    if (dims && dims.width * dims.height > MAX_INPUT_PIXELS) {
-      const mp = ((dims.width * dims.height) / 1_000_000).toFixed(1);
-      throw new DesktopAppError(
-        400,
-        "resolution_too_large",
-        `Image resolution ${dims.width}x${dims.height} (${mp} MP) exceeds 50 MP maximum`
-      );
+    if (dims) {
+      if (dims.width > MAX_INPUT_DIMENSION || dims.height > MAX_INPUT_DIMENSION) {
+        throw new DesktopAppError(
+          400,
+          "resolution_too_large",
+          `Image resolution ${dims.width}x${dims.height} exceeds 50,000 px per-side maximum`
+        );
+      }
+      if (dims.width * dims.height > MAX_INPUT_PIXELS) {
+        const mp = ((dims.width * dims.height) / 1_000_000).toFixed(1);
+        throw new DesktopAppError(
+          400,
+          "resolution_too_large",
+          `Image resolution ${dims.width}x${dims.height} (${mp} MP) exceeds 50 MP maximum`
+        );
+      }
     }
 
     const settings = sanitizeSettings(rawSettings);
@@ -1316,6 +1327,7 @@ module.exports = {
   DEFAULT_BASE_URL,
   MAX_INPUT_BYTES,
   MAX_INPUT_PIXELS,
+  MAX_INPUT_DIMENSION,
   MAX_PREVIEW_FILE_BYTES,
   MAX_PREVIEW_FALLBACK_BYTES,
   DIRECT_THRESHOLD_BYTES,
@@ -1323,6 +1335,8 @@ module.exports = {
   ALLOWED_SIZES,
   ALLOWED_SHADOW_TYPES,
   DesktopAppError,
+  isAllowedFirstPartyHost,
+  isAllowedDirectGpuHost,
   isPlausibleApiKey,
   maskApiKey,
   normalizeHexColor,
