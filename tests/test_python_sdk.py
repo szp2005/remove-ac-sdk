@@ -1,6 +1,7 @@
 import base64
 import json
 import unittest
+from unittest import mock
 
 from remove_ac import (
     SDK_VERSION,
@@ -13,7 +14,10 @@ from remove_ac import (
     __version__,
     derive_sub_idempotency_key,
     parse_image_dimensions,
+    validate_direct_endpoint_url,
+    validate_remote_image_url,
 )
+from remove_ac.client import _fetch_pinned_remote_bytes
 
 
 class PythonSdkTest(unittest.TestCase):
@@ -42,7 +46,7 @@ class PythonSdkTest(unittest.TestCase):
                     {
                         "data": {
                             "ticket": "tkt_123",
-                            "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                            "directEndpoint": "https://api.remove.ac/v1.0/direct-cutout",
                         }
                     }
                 ).encode("utf-8")
@@ -58,7 +62,7 @@ class PythonSdkTest(unittest.TestCase):
         self.assertEqual(out, b"\x89PNG_DIRECT")
         self.assertEqual(len(calls), 2)
         self.assertTrue(calls[0][1].endswith("/v1.0/removebg/ticket"))
-        self.assertEqual(calls[1][1], "https://gpu.example.invalid/v1.0/direct-cutout")
+        self.assertEqual(calls[1][1], "https://api.remove.ac/v1.0/direct-cutout")
         self.assertEqual(calls[1][2]["Authorization"], "Bearer tkt_123")
 
     def test_removebg_drop_in_shim_and_missing_key(self):
@@ -90,7 +94,7 @@ class PythonSdkTest(unittest.TestCase):
                     {
                         "data": {
                             "ticket": "tkt_py_24mp",
-                            "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                            "directEndpoint": "https://api.remove.ac/v1.0/direct-cutout",
                         }
                     }
                 ).encode("utf-8")
@@ -108,7 +112,7 @@ class PythonSdkTest(unittest.TestCase):
             calls,
             [
                 "https://remove.ac/v1.0/removebg/ticket",
-                "https://gpu.example.invalid/v1.0/direct-cutout",
+                "https://api.remove.ac/v1.0/direct-cutout",
             ],
         )
 
@@ -133,7 +137,7 @@ class PythonSdkTest(unittest.TestCase):
                     {
                         "data": {
                             "ticket": "tkt_long_idem",
-                            "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                            "directEndpoint": "https://api.remove.ac/v1.0/direct-cutout",
                         }
                     }
                 ).encode("utf-8")
@@ -206,6 +210,7 @@ class PythonSdkTest(unittest.TestCase):
             "https://127.0.0.1/v1.0/direct-cutout",
             "https://[::ffff:169.254.169.254]/latest/meta-data",
             "https://rebind.example.com/v1.0/direct-cutout",
+            "https://api.remove.ac/v1.0/direct-cutout",
         ]
         for bad_ep in bad_endpoints:
             calls = []
@@ -342,7 +347,7 @@ class PythonSdkTest(unittest.TestCase):
                         {
                             "data": {
                                 "ticket": "tkt_py_hold",
-                                "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                                "directEndpoint": "https://api.remove.ac/v1.0/direct-cutout",
                                 "holdId": "hold_py_1",
                                 "releaseToken": "rel_py_secret_1",
                             }
@@ -462,7 +467,7 @@ class PythonSdkTest(unittest.TestCase):
                             {
                                 "data": {
                                     "ticket": "tkt_py_bg",
-                                    "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                                    "directEndpoint": "https://api.remove.ac/v1.0/direct-cutout",
                                 }
                             }
                         ).encode("utf-8"),
@@ -496,7 +501,11 @@ class PythonSdkTest(unittest.TestCase):
                     ),
                 )
 
-            imp_client = RemoveAcClient(api_key="rac_live_py_imp", transport=improve_transport)
+            imp_client = RemoveAcClient(
+                api_key="rac_live_py_imp",
+                transport=improve_transport,
+                resolver=lambda _h: ["93.184.216.34"],
+            )
             imp1 = imp_client.submit_improve(
                 fg_path, tag="fur", description="Golden retriever fur edge"
             )
@@ -618,7 +627,7 @@ class PythonSdkTest(unittest.TestCase):
                             {
                                 "data": {
                                     "ticket": f"t_{status}",
-                                    "directEndpoint": "https://gpu.example.invalid/v1.0/direct-cutout",
+                                    "directEndpoint": "https://api.remove.ac/v1.0/direct-cutout",
                                     "holdId": f"h_{status}",
                                     "releaseToken": f"r_{status}",
                                 }
@@ -642,6 +651,385 @@ class PythonSdkTest(unittest.TestCase):
                 rel_calls,
                 [{"holdId": f"h_{status}", "releaseToken": f"r_{status}"}],
             )
+
+    def test_m_p1_07_allow_tun_fake_ip_inverted_boolean_regression(self):
+        with mock.patch("remove_ac.client._default_resolver", return_value=["198.18.0.42"]):
+            # Arbitrary HTTPS/HTTP domains & plain http://remove.ac MUST be rejected under default resolver
+            self.assertIsNotNone(validate_remote_image_url("https://evil.example.com/photo.png"))
+            self.assertIsNotNone(validate_remote_image_url("http://internal-mesh.attacker.example/a.png"))
+            self.assertIsNotNone(validate_remote_image_url("http://remove.ac/photo.png"))
+            self.assertIsNotNone(validate_remote_image_url("https://evil-remove.ac/photo.png"))
+            self.assertIsNotNone(validate_remote_image_url("https://198.18.0.42/photo.png"))
+
+            # Only first-party https://remove.ac & https://*.remove.ac are allowed under default resolver
+            self.assertIsNone(validate_remote_image_url("https://remove.ac/v1.0/removebg"))
+            self.assertIsNone(validate_remote_image_url("https://api.remove.ac/v1.0/direct-cutout"))
+
+            # Explicit custom resolver returning 198.18.x.x MUST still be rejected
+            self.assertIsNotNone(
+                validate_remote_image_url(
+                    "https://remove.ac/v1.0/removebg",
+                    resolver=lambda _h: ["198.18.0.42"],
+                )
+            )
+
+    def test_m_p1_08_strict_direct_endpoint_allowlist_and_pinned_fetch(self):
+        import http.server
+        import threading
+
+        public_resolver = lambda _h: ["93.184.216.34"]
+        self.assertIsNone(
+            validate_direct_endpoint_url(
+                "https://remove.ac/v1.0/direct-cutout",
+                base_url="https://remove.ac",
+                resolver=public_resolver,
+            )
+        )
+        self.assertIsNone(
+            validate_direct_endpoint_url(
+                "https://edge.remove.ac/v1.0/direct-cutout",
+                base_url="https://remove.ac",
+                resolver=public_resolver,
+            )
+        )
+        self.assertIsNone(
+            validate_direct_endpoint_url(
+                "https://gateway.corp.example/v1.0/direct-cutout",
+                base_url="https://gateway.corp.example",
+                resolver=public_resolver,
+            )
+        )
+        for bad_ep in (
+            "https://evil.modal.run/v1.0/direct-cutout",
+            "https://tenant--gpu-app.modal.run/v1.0/direct-cutout",
+            "https://gpu.example.invalid/v1.0/direct-cutout",
+            "https://attacker.example.com/v1.0/direct-cutout",
+            "https://evil-remove.ac/v1.0/direct-cutout",
+            "https://remove.ac:8443/v1.0/direct-cutout",
+        ):
+            err = validate_direct_endpoint_url(
+                bad_ep, base_url="https://remove.ac", resolver=public_resolver
+            )
+            self.assertIsNotNone(err, f"Expected rejection for {bad_ep}")
+
+        cross_err = validate_direct_endpoint_url(
+            "https://other.corp.example/v1.0/direct-cutout",
+            base_url="https://gateway.corp.example",
+            resolver=public_resolver,
+        )
+        self.assertIsNotNone(cross_err)
+        self.assertIn("untrusted host", cross_err.lower())
+
+        # Ticket flow rejects evil.modal.run with 0 direct uploads and releases hold
+        for bad_host_ep in (
+            "https://evil.modal.run/v1.0/direct-cutout",
+            "https://gpu.example.invalid/v1.0/direct-cutout",
+        ):
+            releases = []
+            direct_uploads = []
+
+            def bad_host_transport(method, url, headers, body, timeout):
+                if url.endswith("/v1.0/removebg/ticket"):
+                    return (
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps(
+                            {
+                                "data": {
+                                    "ticket": "tkt_bad_host",
+                                    "directEndpoint": bad_host_ep,
+                                    "holdId": "hold_bh",
+                                    "releaseToken": "rel_bh",
+                                }
+                            }
+                        ).encode("utf-8"),
+                    )
+                if url.endswith("/v1.0/removebg/ticket/release"):
+                    releases.append(json.loads(body.decode("utf-8")))
+                    return 200, {"content-type": "application/json"}, b'{"ok":true}'
+                direct_uploads.append(url)
+                return 200, {"content-type": "image/png"}, b"SHOULD_NOT_HIT"
+
+            c = RemoveAcClient(
+                api_key="rac_live_allowlist",
+                transport=bad_host_transport,
+                resolver=public_resolver,
+            )
+            with self.assertRaises(RemoveAcError) as ctx:
+                c.remove_background(b"\x89PNG\r\n\x1a\nabc", direct=True)
+            self.assertEqual(ctx.exception.status_code, 502)
+            self.assertEqual(len(direct_uploads), 0)
+            self.assertEqual(releases, [{"holdId": "hold_bh", "releaseToken": "rel_bh"}])
+
+        # Pinned HTTP fetch connects strictly to pinned IP, preserves Host header, rejects redirects, hides 5xx body, caps bytes
+        tiny_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        seen_hosts = []
+
+        class PinnedHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen_hosts.append(self.headers.get("Host"))
+                if self.path == "/ok.png":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.end_headers()
+                    self.wfile.write(tiny_png)
+                    return
+                if self.path == "/redir":
+                    self.send_response(302)
+                    self.send_header("Location", "/ok.png")
+                    self.end_headers()
+                    return
+                if self.path == "/secret-err":
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"AWS_SECRET_KEY=do_not_leak_py")
+                    return
+                if self.path == "/oversize":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.end_headers()
+                    self.wfile.write(b"A" * 2048)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), PinnedHandler)
+        port = srv.server_port
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            got = _fetch_pinned_remote_bytes(
+                f"http://pinned-py.example:{port}/ok.png",
+                ["127.0.0.1"],
+                max_bytes=1024,
+                timeout=5,
+            )
+            self.assertEqual(got, tiny_png)
+            self.assertEqual(seen_hosts[0], f"pinned-py.example:{port}")
+
+            with self.assertRaises(RemoveAcError) as r_ctx:
+                _fetch_pinned_remote_bytes(
+                    f"http://pinned-py.example:{port}/redir",
+                    ["127.0.0.1"],
+                    max_bytes=1024,
+                    timeout=5,
+                )
+            self.assertEqual(r_ctx.exception.status_code, 302)
+
+            with self.assertRaises(RemoveAcError) as e_ctx:
+                _fetch_pinned_remote_bytes(
+                    f"http://pinned-py.example:{port}/secret-err",
+                    ["127.0.0.1"],
+                    max_bytes=1024,
+                    timeout=5,
+                )
+            self.assertEqual(e_ctx.exception.status_code, 502)
+            self.assertNotIn("AWS_SECRET_KEY", str(e_ctx.exception))
+
+            with self.assertRaises(RemoveAcError) as s_ctx:
+                _fetch_pinned_remote_bytes(
+                    f"http://pinned-py.example:{port}/oversize",
+                    ["127.0.0.1"],
+                    max_bytes=512,
+                    timeout=5,
+                )
+            self.assertEqual(s_ctx.exception.status_code, 413)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_m_p0_04_url_mode_413_automatic_ticket_fallback(self):
+        import hashlib
+
+        remote_jpg = (
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+        )
+        expected_sha = hashlib.sha256(remote_jpg).hexdigest()
+        public_resolver = lambda _h: ["93.184.216.34"]
+        calls = []
+        ticket_payloads = []
+        remote_get_headers = []
+
+        def fallback_transport(method, url, headers, body, timeout):
+            calls.append((method, url))
+            if url == "https://remove.ac/v1.0/removebg":
+                return 413, {"content-type": "application/json"}, b'{"errors":[{"code":"result_too_large"}]}'
+            if url == "https://cdn.example.com/12mp.jpg":
+                remote_get_headers.append(dict(headers))
+                return 200, {"content-type": "image/jpeg"}, remote_jpg
+            if url == "https://remove.ac/v1.0/removebg/ticket":
+                ticket_payloads.append((headers.get("Idempotency-Key"), json.loads(body.decode("utf-8"))))
+                return (
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps(
+                        {
+                            "data": {
+                                "ticket": "tkt_py_url413",
+                                "directEndpoint": "https://api.remove.ac/v1.0/direct-cutout",
+                            }
+                        }
+                    ).encode("utf-8"),
+                )
+            if url == "https://api.remove.ac/v1.0/direct-cutout":
+                self.assertEqual(headers.get("Authorization"), "Bearer tkt_py_url413")
+                self.assertIn(remote_jpg, body)
+                return 200, {"content-type": "image/png"}, b"PY_URL_413_CUTOUT"
+            return 500, {}, b"unexpected"
+
+        client = RemoveAcClient(
+            api_key="rac_live_py_413",
+            transport=fallback_transport,
+            resolver=public_resolver,
+        )
+        out = client.remove_background(
+            "https://cdn.example.com/12mp.jpg",
+            size="full",
+            idempotency_key="py-url-idem",
+        )
+        self.assertEqual(out, b"PY_URL_413_CUTOUT")
+        self.assertEqual(
+            calls,
+            [
+                ("POST", "https://remove.ac/v1.0/removebg"),
+                ("GET", "https://cdn.example.com/12mp.jpg"),
+                ("POST", "https://remove.ac/v1.0/removebg/ticket"),
+                ("POST", "https://api.remove.ac/v1.0/direct-cutout"),
+            ],
+        )
+        self.assertEqual(ticket_payloads[0][0], "py-url-idem:fallback413")
+        self.assertEqual(ticket_payloads[0][1]["foregroundSha256"], expected_sha)
+        self.assertEqual(ticket_payloads[0][1]["foregroundByteLength"], len(remote_jpg))
+        self.assertNotIn("X-Api-Key", remote_get_headers[0])
+        self.assertNotIn("Authorization", remote_get_headers[0])
+
+        # RemoveBg.remove_background_from_img_url also recovers automatically from 413
+        rmbg = RemoveBg(
+            "rac_live_py_413",
+            transport=fallback_transport,
+            resolver=public_resolver,
+        )
+        out_shim = rmbg.remove_background_from_img_url(
+            "https://cdn.example.com/12mp.jpg",
+            size="full",
+            new_file_name="",
+        )
+        self.assertEqual(out_shim, b"PY_URL_413_CUTOUT")
+
+        # Negative cases: redirect, third-party error body leak, invalid magic bytes, >25 MB cap
+        ticket_hits = []
+
+        def make_neg_client(remote_tuple):
+            def neg_transport(method, url, headers, body, timeout):
+                if url.endswith("/v1.0/removebg"):
+                    return 413, {"content-type": "application/json"}, b'{"errors":[{"code":"result_too_large"}]}'
+                if url.endswith("/v1.0/removebg/ticket"):
+                    ticket_hits.append(url)
+                    return 200, {"content-type": "application/json"}, b'{"data":{"ticket":"x","directEndpoint":"https://api.remove.ac/v1.0/direct-cutout"}}'
+                return remote_tuple
+
+            return RemoveAcClient(
+                api_key="rac_live_py_neg",
+                transport=neg_transport,
+                resolver=public_resolver,
+            )
+
+        with self.assertRaises(RemoveAcError) as redir_ctx:
+            make_neg_client((302, {"location": "http://127.0.0.1/secret"}, b"")).remove_background(
+                "https://cdn.example.com/redir.jpg"
+            )
+        self.assertEqual(redir_ctx.exception.status_code, 302)
+
+        with self.assertRaises(RemoveAcError) as leak_ctx:
+            make_neg_client((403, {}, b"SUPER_SECRET_INTERNAL_TOKEN")).remove_background(
+                "https://cdn.example.com/err.jpg"
+            )
+        self.assertEqual(leak_ctx.exception.status_code, 502)
+        self.assertNotIn("SUPER_SECRET_INTERNAL_TOKEN", str(leak_ctx.exception))
+
+        with self.assertRaises(RemoveAcError) as magic_ctx:
+            make_neg_client((200, {"content-type": "text/html"}, b"<html>not an image</html>")).remove_background(
+                "https://cdn.example.com/html.jpg"
+            )
+        self.assertEqual(magic_ctx.exception.status_code, 400)
+
+        with self.assertRaises(RemoveAcError) as size_ctx:
+            make_neg_client((200, {"content-length": str(26 * 1024 * 1024)}, b"")).remove_background(
+                "https://cdn.example.com/huge.jpg"
+            )
+        self.assertEqual(size_ctx.exception.status_code, 413)
+        self.assertEqual(len(ticket_hits), 0)
+
+    def test_m_p2_16_removebg_data_uri_base64_and_error_log_file(self):
+        import os
+        import pathlib
+        import tempfile
+
+        tiny_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        # "data:image/png;base64," has 18 base64-alphabet chars; pick payloads testing both len%4==1 crash & silent garbage cases
+        data_uri_png = f"data:image/png;base64,{base64.b64encode(tiny_png).decode('ascii')}"
+        data_uri_jpg = f"data:image/jpeg;base64,{base64.b64encode(b'\xff\xd8\xff\xd9A').decode('ascii')}"
+
+        uploaded_bodies = []
+
+        def capture_transport(method, url, headers, body, timeout):
+            uploaded_bodies.append(body)
+            return 200, {"content-type": "image/png"}, b"DATA_URI_OK"
+
+        rmbg = RemoveBg("rac_live_datauri", transport=capture_transport)
+        res1 = rmbg.remove_background_from_base64_img(data_uri_png, new_file_name="")
+        self.assertEqual(res1, b"DATA_URI_OK")
+        # Uploaded multipart must contain exact raw PNG bytes right after header CRLFCRLF (zero prepended garbage)
+        self.assertIn(b"\r\n\r\n" + tiny_png + b"\r\n", uploaded_bodies[0])
+
+        res2 = rmbg.remove_background_from_base64_img(data_uri_jpg, new_file_name="")
+        self.assertEqual(res2, b"DATA_URI_OK")
+        self.assertIn(b"\r\n\r\n\xff\xd8\xff\xd9A\r\n", uploaded_bodies[1])
+
+        # error_log_file records API & validation errors before re-raising RemoveAcError
+        temp_root = (
+            "/Volumes/Expansion/dev-tools/build-temp"
+            if os.path.isdir("/Volumes/Expansion/dev-tools/build-temp")
+            else None
+        )
+        with tempfile.TemporaryDirectory(dir=temp_root, prefix="rac-py-errlog-") as tmp_dir:
+            log_path = pathlib.Path(tmp_dir) / "removebg-errors.log"
+            fg_path = pathlib.Path(tmp_dir) / "sample.png"
+            fg_path.write_bytes(tiny_png)
+
+            failing_rmbg = RemoveBg(
+                "rac_live_errlog",
+                error_log_file=str(log_path),
+                transport=lambda m, u, h, b, t: (402, {"content-type": "application/json"}, b'{"errors":[{"title":"Insufficient credits"}]}'),
+                resolver=lambda _h: ["93.184.216.34"],
+            )
+
+            with self.assertRaises(RemoveAcError) as c_b64:
+                failing_rmbg.remove_background_from_base64_img("data:image/png,missing-base64-marker", new_file_name="")
+            self.assertEqual(c_b64.exception.status_code, 400)
+
+            with self.assertRaises(RemoveAcError) as c_file:
+                failing_rmbg.remove_background_from_img_file(str(fg_path), new_file_name="")
+            self.assertEqual(c_file.exception.status_code, 402)
+
+            with self.assertRaises(RemoveAcError) as c_url:
+                failing_rmbg.remove_background_from_img_url("https://cdn.example.com/item.png", new_file_name="")
+            self.assertEqual(c_url.exception.status_code, 402)
+
+            log_text = log_path.read_text(encoding="utf-8")
+            lines = [ln for ln in log_text.splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 3)
+            self.assertIn("malformed data URI", lines[0])
+            self.assertIn("Insufficient credits", lines[1])
+            self.assertIn("Insufficient credits", lines[2])
 
 
 if __name__ == "__main__":

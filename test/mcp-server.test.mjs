@@ -119,7 +119,7 @@ test("MCP remove_background_file writes cutout output and upgrades >4 MB files v
           return Response.json({
             data: {
               ticket: "mcp_signed_ticket",
-              directEndpoint: "https://gpu.example.invalid/v1.0/direct-cutout",
+              directEndpoint: "https://api.remove.ac/v1.0/direct-cutout",
             },
           });
         }
@@ -541,6 +541,124 @@ test("R2 MF-05 & MF-02: MCP blocks non-image file exfiltration (.env, SSH keys, 
     }
 
     assert.equal(networkCalls, 0, "MCP must make 0 HTTP calls on non-image or >30 MB inputs");
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("M-P0-04 & M-P1-08: MCP remove_background_url recovers from HTTP 413 via ticket fallback and rejects untrusted directEndpoint (*.modal.run)", async () => {
+  const sandbox = fs.mkdtempSync(path.join(tempRoot, "remove-ac-mcp-413-"));
+  const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
+  try {
+    const outOk = path.join(sandbox, "url-413-cutout.png");
+    const calls = [];
+    const fallbackClientFactory = () =>
+      new RemoveAcClient({
+        apiKey: "rac_live_mcp_413",
+        lookup: publicLookup,
+        fetch: async (url, init = {}) => {
+          const u = String(url);
+          calls.push(u);
+          if (u === "https://remove.ac/v1.0/removebg") {
+            return new Response(JSON.stringify({ errors: [{ code: "result_too_large" }] }), {
+              status: 413,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (u === "https://cdn.example.com/big-photo.png") {
+            assert.equal(init.redirect, "error");
+            return new Response(TINY_PNG, { status: 200, headers: { "Content-Type": "image/png" } });
+          }
+          if (u === "https://remove.ac/v1.0/removebg/ticket") {
+            return Response.json({
+              data: {
+                ticket: "mcp_413_ticket",
+                directEndpoint: "https://api.remove.ac/v1.0/direct-cutout",
+              },
+            });
+          }
+          if (u === "https://api.remove.ac/v1.0/direct-cutout") {
+            return new Response(Buffer.from("MCP_413_OK"), {
+              status: 200,
+              headers: { "Content-Type": "image/png", "X-Width": "4000", "X-Height": "3000", "X-Credits-Charged": "1" },
+            });
+          }
+          return new Response("unexpected", { status: 500 });
+        },
+      });
+
+    const okRes = await handleMcpRequest(
+      {
+        jsonrpc: "2.0",
+        id: 601,
+        method: "tools/call",
+        params: {
+          name: "remove_background_url",
+          arguments: {
+            imageUrl: "https://cdn.example.com/big-photo.png",
+            outputPath: outOk,
+          },
+        },
+      },
+      fallbackClientFactory,
+      { lookup: publicLookup },
+    );
+    assert.equal(okRes.result.isError, undefined);
+    const body = JSON.parse(okRes.result.content[0].text);
+    assert.equal(body.ok, true);
+    assert.equal(body.width, 4000);
+    assert.equal(fs.readFileSync(outOk, "utf8"), "MCP_413_OK");
+    assert.deepEqual(calls, [
+      "https://remove.ac/v1.0/removebg",
+      "https://cdn.example.com/big-photo.png",
+      "https://remove.ac/v1.0/removebg/ticket",
+      "https://api.remove.ac/v1.0/direct-cutout",
+    ]);
+
+    // Untrusted *.modal.run directEndpoint must be rejected with 0 direct uploads
+    let evilUploads = 0;
+    const evilClientFactory = () =>
+      new RemoveAcClient({
+        apiKey: "rac_live_mcp_413",
+        lookup: publicLookup,
+        fetch: async (url) => {
+          const u = String(url);
+          if (u === "https://remove.ac/v1.0/removebg") return new Response("too large", { status: 413 });
+          if (u === "https://cdn.example.com/big-photo.png") {
+            return new Response(TINY_PNG, { status: 200, headers: { "Content-Type": "image/png" } });
+          }
+          if (u === "https://remove.ac/v1.0/removebg/ticket") {
+            return Response.json({
+              data: {
+                ticket: "tkt_evil",
+                directEndpoint: "https://evil.modal.run/v1.0/direct-cutout",
+              },
+            });
+          }
+          evilUploads += 1;
+          return new Response("SHOULD_NOT_HIT", { status: 200 });
+        },
+      });
+
+    const badRes = await handleMcpRequest(
+      {
+        jsonrpc: "2.0",
+        id: 602,
+        method: "tools/call",
+        params: {
+          name: "remove_background_url",
+          arguments: {
+            imageUrl: "https://cdn.example.com/big-photo.png",
+            outputPath: path.join(sandbox, "should-not-exist.png"),
+          },
+        },
+      },
+      evilClientFactory,
+      { lookup: publicLookup },
+    );
+    assert.equal(badRes.result.isError, true);
+    assert.match(badRes.result.content[0].text, /untrusted host/i);
+    assert.equal(evilUploads, 0);
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true });
   }

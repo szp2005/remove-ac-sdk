@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 import socket
+import ssl
 import struct
 import urllib.error
 import urllib.parse
@@ -176,6 +179,20 @@ def derive_sub_idempotency_key(idem: str, suffix: str) -> str:
         return direct
     digest = hashlib.sha256(trimmed.encode("utf-8")).hexdigest()[:32]
     return f"{trimmed[:180]}:{digest}:{suffix}"
+
+
+def _detect_supported_image_format(data: bytes) -> Optional[Tuple[str, str]]:
+    if not data or len(data) < 4:
+        return None
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png", "png"
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg", "jpg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if len(data) >= 6 and data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif", "gif"
+    return None
 
 
 def _infer_mime_type(data: bytes, filename: str = "") -> str:
@@ -371,24 +388,54 @@ def _assert_valid_binary_envelope(data: bytes, label: str) -> None:
     _assert_valid_image_dimensions(data, label)
 
 
-def validate_remote_image_url(
+def is_first_party_remove_ac_host(raw_host: str) -> bool:
+    host = (raw_host or "").strip().lower().strip("[]").rstrip(".")
+    return host == "remove.ac" or host.endswith(".remove.ac")
+
+
+def _extract_normalized_host(raw_url: Optional[str]) -> str:
+    if not raw_url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(str(raw_url).strip())
+    except Exception:
+        return ""
+    return (parsed.hostname or "").lower().strip("[]").rstrip(".")
+
+
+def is_allowed_direct_endpoint_host(
+    raw_host: str, allowed_base_url: Optional[str] = None
+) -> bool:
+    host = (raw_host or "").strip().lower().strip("[]").rstrip(".")
+    if not host:
+        return False
+    if is_first_party_remove_ac_host(host):
+        return True
+    if allowed_base_url:
+        base_host = _extract_normalized_host(allowed_base_url)
+        if base_host and host == base_host:
+            return True
+    return False
+
+
+def _resolve_validated_remote_url(
     raw_url: str,
     *,
     resolver: Optional[ResolverFn] = None,
     label: str = "image_url",
-) -> Optional[str]:
+) -> Tuple[Optional[str], List[str]]:
     trimmed = (raw_url or "").strip()
     if not trimmed or "\x00" in trimmed or "\r" in trimmed or "\n" in trimmed:
-        return f"Invalid {label} URL"
+        return f"Invalid {label} URL", []
     try:
         parsed = urllib.parse.urlsplit(trimmed)
     except Exception:
-        return f"Invalid {label} URL"
+        return f"Invalid {label} URL", []
     scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
-        return f"Disallowed {label} (only http:// and https:// image URLs are allowed)"
+        return f"Disallowed {label} (only http:// and https:// image URLs are allowed)", []
     if parsed.username or parsed.password:
-        return f"Disallowed {label} (embedded credentials are not permitted)"
+        return f"Disallowed {label} (embedded credentials are not permitted)", []
 
     raw_host = (parsed.hostname or "").lower()
     host = raw_host.strip("[]").rstrip(".")
@@ -400,7 +447,7 @@ def validate_remote_image_url(
         or host.endswith(".internal")
         or host.endswith(".home.arpa")
     ):
-        return f"Disallowed {label} (local or internal hostname)"
+        return f"Disallowed {label} (local or internal hostname)", []
 
     clean_host = host.split("%", 1)[0]
     try:
@@ -411,8 +458,8 @@ def validate_remote_image_url(
 
     if is_literal or ":" in clean_host:
         if _is_disallowed_ip(clean_host):
-            return f"Disallowed {label} (private, loopback, or reserved IP address)"
-        return None
+            return f"Disallowed {label} (private, loopback, or reserved IP address)", []
+        return None, [clean_host]
 
     labels = host.split(".")
     if (
@@ -420,39 +467,64 @@ def validate_remote_image_url(
         or any(not lbl for lbl in labels)
         or all(lbl.isdigit() or lbl.startswith("0x") for lbl in labels)
     ):
-        return f"Disallowed {label} (single-label or numeric hostname)"
+        return f"Disallowed {label} (single-label or numeric hostname)", []
 
     is_default_resolver = resolver is None
     resolve_fn = resolver or _default_resolver
     try:
         addrs = list(resolve_fn(host))
     except Exception:
-        return f"Disallowed {label} (unable to resolve hostname '{host}')"
+        return f"Disallowed {label} (unable to resolve hostname '{host}')", []
     if not addrs:
-        return f"Disallowed {label} (hostname '{host}' returned no DNS records)"
+        return f"Disallowed {label} (hostname '{host}' returned no DNS records)", []
 
-    allow_tun_fake_ip = is_default_resolver or (
-        scheme == "https" and (host == "remove.ac" or host.endswith(".remove.ac"))
+    allow_tun_fake_ip = is_default_resolver and (
+        scheme == "https" and is_first_party_remove_ac_host(host)
     )
+    validated_addrs: List[str] = []
     for addr in addrs:
         if not addr:
-            return f"Disallowed {label} (hostname '{host}' resolves to a private, loopback, or reserved IP)"
+            return (
+                f"Disallowed {label} (hostname '{host}' resolves to a private, loopback, or reserved IP)",
+                [],
+            )
         clean_addr = str(addr).strip().strip("[]").split("%", 1)[0]
         try:
             addr_obj = ipaddress.ip_address(clean_addr)
         except ValueError:
-            return f"Disallowed {label} (hostname '{host}' resolves to an invalid IP)"
-        if allow_tun_fake_ip and isinstance(addr_obj, ipaddress.IPv4Address) and addr_obj in _BENCHMARK_NET:
+            return f"Disallowed {label} (hostname '{host}' resolves to an invalid IP)", []
+        if (
+            allow_tun_fake_ip
+            and isinstance(addr_obj, ipaddress.IPv4Address)
+            and addr_obj in _BENCHMARK_NET
+        ):
+            validated_addrs.append(clean_addr)
             continue
         if _is_disallowed_ip(clean_addr):
-            return f"Disallowed {label} (hostname '{host}' resolves to a private, loopback, or reserved IP)"
-    return None
+            return (
+                f"Disallowed {label} (hostname '{host}' resolves to a private, loopback, or reserved IP)",
+                [],
+            )
+        validated_addrs.append(clean_addr)
+    return None, validated_addrs
+
+
+def validate_remote_image_url(
+    raw_url: str,
+    *,
+    resolver: Optional[ResolverFn] = None,
+    label: str = "image_url",
+) -> Optional[str]:
+    err, _ = _resolve_validated_remote_url(raw_url, resolver=resolver, label=label)
+    return err
 
 
 def validate_https_endpoint_url(
     raw_url: str,
     *,
     allow_loopback_origin: bool = False,
+    allowed_base_url: Optional[str] = None,
+    require_allowed_direct_host: bool = False,
     resolver: Optional[ResolverFn] = None,
     label: str = "directEndpoint",
 ) -> Optional[str]:
@@ -462,11 +534,164 @@ def validate_https_endpoint_url(
         return f"Invalid {label} URL"
     if parsed.username or parsed.password:
         return f"{label} must not contain embedded credentials"
+    host = (parsed.hostname or "").lower().strip("[]").rstrip(".")
     if allow_loopback_origin and _is_loopback_test_origin(raw_url):
+        if require_allowed_direct_host and allowed_base_url:
+            base_host = _extract_normalized_host(allowed_base_url)
+            if base_host and host != base_host:
+                return (
+                    f"Disallowed {label} (host '{host}' does not match configured "
+                    f"loopback base_url host '{base_host}')"
+                )
         return None
     if parsed.scheme.lower() != "https":
         return f"{label} must use https://"
+    if require_allowed_direct_host:
+        if not is_allowed_direct_endpoint_host(host, allowed_base_url):
+            return (
+                f"Disallowed {label} (untrusted host '{host}'; only remove.ac, "
+                "*.remove.ac, or configured base_url host are permitted)"
+            )
+        if parsed.port is not None and parsed.port != 443:
+            matches_origin = False
+            if allowed_base_url:
+                try:
+                    bp = urllib.parse.urlsplit(str(allowed_base_url).strip())
+                    b_port = bp.port or (443 if bp.scheme.lower() == "https" else 80)
+                    matches_origin = (
+                        bp.scheme.lower() == parsed.scheme.lower()
+                        and (bp.hostname or "").lower().strip("[]").rstrip(".") == host
+                        and b_port == parsed.port
+                    )
+                except Exception:
+                    matches_origin = False
+            if not matches_origin:
+                return f"Disallowed {label} (non-standard port '{parsed.port}' is not permitted)"
     return validate_remote_image_url(raw_url, resolver=resolver, label=label)
+
+
+def validate_direct_endpoint_url(
+    raw_url: str,
+    *,
+    base_url: Optional[str] = None,
+    allow_loopback_origin: Optional[bool] = None,
+    resolver: Optional[ResolverFn] = None,
+    label: str = "directEndpoint",
+) -> Optional[str]:
+    eff_loopback = (
+        bool(allow_loopback_origin)
+        if allow_loopback_origin is not None
+        else _is_loopback_test_origin(base_url or "")
+    )
+    return validate_https_endpoint_url(
+        raw_url,
+        allow_loopback_origin=eff_loopback,
+        allowed_base_url=base_url,
+        require_allowed_direct_host=True,
+        resolver=resolver,
+        label=label,
+    )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, pinned_ip: str, sni_hostname: str, port: int, timeout: int):
+        super().__init__(
+            pinned_ip,
+            port=port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._pinned_ip = pinned_ip
+        self._sni_hostname = sni_hostname
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = self._context.wrap_socket(sock, server_hostname=self._sni_hostname)
+
+
+def _fetch_pinned_remote_bytes(
+    raw_url: str,
+    pinned_addrs: Sequence[str],
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    timeout: int = 30,
+) -> bytes:
+    parsed = urllib.parse.urlsplit(raw_url.strip())
+    is_https = parsed.scheme.lower() == "https"
+    port = parsed.port or (443 if is_https else 80)
+    orig_host = (parsed.hostname or "").strip("[]")
+    host_part = f"[{orig_host}]" if ":" in orig_host else orig_host
+    if parsed.port and ((is_https and parsed.port != 443) or (not is_https and parsed.port != 80)):
+        host_header = f"{host_part}:{parsed.port}"
+    else:
+        host_header = host_part
+    path_query = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+
+    last_conn_err: Optional[Exception] = None
+    for safe_ip in pinned_addrs:
+        conn: Optional[http.client.HTTPConnection] = None
+        try:
+            if is_https:
+                conn = _PinnedHTTPSConnection(safe_ip, orig_host, port, timeout=timeout)
+            else:
+                conn = http.client.HTTPConnection(safe_ip, port=port, timeout=timeout)
+            conn.request(
+                "GET",
+                path_query,
+                headers={
+                    "Host": host_header,
+                    "User-Agent": USER_AGENT,
+                    "Accept": "image/*",
+                },
+            )
+            resp = conn.getresponse()
+            status = resp.status
+            if 300 <= status < 400:
+                raise RemoveAcError(
+                    status,
+                    f"Remote image_url HTTP {status} redirects are disallowed for security",
+                )
+            if status < 200 or status >= 300:
+                raise RemoveAcError(502, f"Failed to fetch remote image_url (HTTP {status})")
+            raw_cl = resp.getheader("Content-Length")
+            if raw_cl is not None:
+                try:
+                    if int(raw_cl.strip()) > max_bytes:
+                        raise RemoveAcError(
+                            413,
+                            f"Remote image_url exceeds 25 MB maximum download size ({max_bytes} bytes)",
+                        )
+                except ValueError:
+                    pass
+            buf = bytearray()
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise RemoveAcError(
+                        413,
+                        f"Remote image_url exceeds 25 MB maximum download size ({max_bytes} bytes)",
+                    )
+            return bytes(buf)
+        except RemoveAcError:
+            raise
+        except OSError as exc:
+            last_conn_err = exc
+            continue
+        except http.client.HTTPException as exc:
+            raise RemoveAcError(502, "Failed to read remote image_url response") from exc
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise RemoveAcError(502, "Failed to connect to remote image_url") from last_conn_err
 
 
 def _ensure_user_agent(headers: Dict[str, str]) -> Dict[str, str]:
@@ -518,8 +743,70 @@ class RemoveAcClient:
         )
         resolved_base = base_url or os.environ.get("REMOVE_AC_BASE_URL") or DEFAULT_BASE_URL
         self.base_url = resolved_base.rstrip("/")
+        self._uses_custom_transport = transport is not None
         self._transport = transport or _default_transport
         self._resolver = resolver
+
+    def _fetch_safe_remote_image_bytes(
+        self, img_url: str, *, timeout: int = 30
+    ) -> Tuple[bytes, str]:
+        url_err, addrs = _resolve_validated_remote_url(
+            img_url, resolver=self._resolver, label="image_url"
+        )
+        if url_err or not addrs:
+            raise RemoveAcError(400, url_err or "Disallowed image_url")
+
+        eff_timeout = min(timeout, 30) if timeout > 0 else 30
+        if self._uses_custom_transport:
+            try:
+                r_status, r_headers, r_body = self._transport(
+                    "GET",
+                    img_url,
+                    _ensure_user_agent({"Accept": "image/*"}),
+                    None,
+                    eff_timeout,
+                )
+            except RemoveAcError:
+                raise
+            except Exception as exc:
+                raise RemoveAcError(502, "Failed to fetch remote image_url") from exc
+            if 300 <= r_status < 400:
+                raise RemoveAcError(
+                    r_status,
+                    f"Remote image_url HTTP {r_status} redirects are disallowed for security",
+                )
+            if r_status < 200 or r_status >= 300:
+                raise RemoveAcError(502, f"Failed to fetch remote image_url (HTTP {r_status})")
+            lower_headers = {str(k).lower(): str(v) for k, v in (r_headers or {}).items()}
+            raw_cl = lower_headers.get("content-length")
+            if raw_cl is not None:
+                try:
+                    if int(raw_cl.strip()) > MAX_UPLOAD_BYTES:
+                        raise RemoveAcError(
+                            413,
+                            f"Remote image_url exceeds 25 MB maximum download size ({MAX_UPLOAD_BYTES} bytes)",
+                        )
+                except ValueError:
+                    pass
+            raw_bytes = bytes(r_body or b"")
+            if len(raw_bytes) > MAX_UPLOAD_BYTES:
+                raise RemoveAcError(
+                    413,
+                    f"Remote image_url exceeds 25 MB maximum download size ({MAX_UPLOAD_BYTES} bytes)",
+                )
+        else:
+            raw_bytes = _fetch_pinned_remote_bytes(
+                img_url, addrs, max_bytes=MAX_UPLOAD_BYTES, timeout=eff_timeout
+            )
+
+        if len(raw_bytes) == 0:
+            raise RemoveAcError(400, "Remote image_url returned an empty response")
+        detected = _detect_supported_image_format(raw_bytes)
+        if detected is None:
+            raise RemoveAcError(
+                400, "Remote image_url did not return a valid PNG, JPEG, WebP, or GIF image"
+            )
+        return raw_bytes, f"remote-image.{detected[1]}"
 
     def _release_ticket_hold(
         self, hold_id: Optional[str], release_token: Optional[str]
@@ -811,9 +1098,9 @@ class RemoveAcClient:
             ):
                 self._release_ticket_hold(hold_id, release_tok)
                 raise RemoveAcError(502, "Missing ticket or directEndpoint in /v1.0/removebg/ticket response")
-            ep_err = validate_https_endpoint_url(
+            ep_err = validate_direct_endpoint_url(
                 direct_ep,
-                allow_loopback_origin=_is_loopback_test_origin(self.base_url),
+                base_url=self.base_url,
                 resolver=self._resolver,
                 label="directEndpoint",
             )
@@ -931,8 +1218,25 @@ class RemoveAcClient:
                 mp_body,
                 timeout,
             )
-        if status == 413 and img_bytes is not None:
-            return _via_ticket("fallback413")
+        if status == 413:
+            if img_bytes is None and img_url is not None:
+                fetched_bytes, fetched_name = self._fetch_safe_remote_image_bytes(
+                    img_url, timeout=timeout
+                )
+                img_bytes = fetched_bytes
+                if fetched_name:
+                    img_name = fetched_name
+                _assert_valid_binary_envelope(img_bytes, "Foreground image")
+                if (
+                    ticket_bg_bytes is not None
+                    and len(img_bytes) + len(ticket_bg_bytes) > MAX_COMBINED_UPLOAD_BYTES
+                ):
+                    raise RemoveAcError(
+                        413,
+                        "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+                    )
+            if img_bytes is not None:
+                return _via_ticket("fallback413")
         if status < 200 or status >= 300:
             raise RemoveAcError(status, body.decode("utf-8", errors="replace"))
         return body
@@ -1050,6 +1354,19 @@ class RemoveBg:
         )
         self.error_log_file = error_log_file
 
+    def _log_error(self, exc: Exception) -> None:
+        if not self.error_log_file:
+            return
+        try:
+            log_path = os.fspath(self.error_log_file)
+            if not log_path or os.path.islink(log_path):
+                return
+            ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"[{ts}] {exc}\n")
+        except OSError:
+            pass
+
     def remove_background_from_img_file(
         self,
         img_file_path: Union[str, os.PathLike],
@@ -1061,15 +1378,19 @@ class RemoveBg:
         bg_image_file_b64: Optional[str] = None,
         **kwargs: Any,
     ) -> bytes:
-        out = self.client.remove_background(
-            img_file_path,
-            size=size,
-            bg_color=bg_color,
-            bg_image_file=bg_image_file,
-            bg_image_url=bg_image_url,
-            bg_image_file_b64=bg_image_file_b64,
-            **kwargs,
-        )
+        try:
+            out = self.client.remove_background(
+                img_file_path,
+                size=size,
+                bg_color=bg_color,
+                bg_image_file=bg_image_file,
+                bg_image_url=bg_image_url,
+                bg_image_file_b64=bg_image_file_b64,
+                **kwargs,
+            )
+        except RemoveAcError as exc:
+            self._log_error(exc)
+            raise
         if new_file_name:
             with open(new_file_name, "wb") as fh:
                 fh.write(out)
@@ -1086,22 +1407,26 @@ class RemoveBg:
         bg_image_file_b64: Optional[str] = None,
         **kwargs: Any,
     ) -> bytes:
-        if not isinstance(img_url, str) or not img_url.strip():
-            raise RemoveAcError(400, "Missing image_url")
-        url_err = validate_remote_image_url(
-            img_url.strip(), resolver=self.client._resolver, label="image_url"
-        )
-        if url_err:
-            raise RemoveAcError(400, url_err)
-        out = self.client.remove_background(
-            img_url.strip(),
-            size=size,
-            bg_color=bg_color,
-            bg_image_file=bg_image_file,
-            bg_image_url=bg_image_url,
-            bg_image_file_b64=bg_image_file_b64,
-            **kwargs,
-        )
+        try:
+            if not isinstance(img_url, str) or not img_url.strip():
+                raise RemoveAcError(400, "Missing image_url")
+            url_err = validate_remote_image_url(
+                img_url.strip(), resolver=self.client._resolver, label="image_url"
+            )
+            if url_err:
+                raise RemoveAcError(400, url_err)
+            out = self.client.remove_background(
+                img_url.strip(),
+                size=size,
+                bg_color=bg_color,
+                bg_image_file=bg_image_file,
+                bg_image_url=bg_image_url,
+                bg_image_file_b64=bg_image_file_b64,
+                **kwargs,
+            )
+        except RemoveAcError as exc:
+            self._log_error(exc)
+            raise
         if new_file_name:
             with open(new_file_name, "wb") as fh:
                 fh.write(out)
@@ -1109,7 +1434,7 @@ class RemoveBg:
 
     def remove_background_from_base64_img(
         self,
-        base64_img: str,
+        base64_img: Union[str, bytes, bytearray],
         size: str = "regular",
         new_file_name: str = "no-bg.png",
         bg_color: Optional[str] = None,
@@ -1118,15 +1443,29 @@ class RemoveBg:
         bg_image_file_b64: Optional[str] = None,
         **kwargs: Any,
     ) -> bytes:
-        out = self.client.remove_background(
-            base64.b64decode(base64_img),
-            size=size,
-            bg_color=bg_color,
-            bg_image_file=bg_image_file,
-            bg_image_url=bg_image_url,
-            bg_image_file_b64=bg_image_file_b64,
-            **kwargs,
-        )
+        try:
+            if isinstance(base64_img, (bytes, bytearray)):
+                try:
+                    raw_b64 = base64_img.decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise RemoveAcError(400, "Invalid base64_img: malformed base64 payload") from exc
+            elif isinstance(base64_img, str):
+                raw_b64 = base64_img
+            else:
+                raise RemoveAcError(400, "base64_img must be a base64 string")
+            _, decoded_fg = _decode_base64_image(raw_b64, "base64_img")
+            out = self.client.remove_background(
+                decoded_fg,
+                size=size,
+                bg_color=bg_color,
+                bg_image_file=bg_image_file,
+                bg_image_url=bg_image_url,
+                bg_image_file_b64=bg_image_file_b64,
+                **kwargs,
+            )
+        except RemoveAcError as exc:
+            self._log_error(exc)
+            raise
         if new_file_name:
             with open(new_file_name, "wb") as fh:
                 fh.write(out)

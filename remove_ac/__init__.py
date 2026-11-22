@@ -12,7 +12,10 @@ from .client import (
     SizeLiteral,
     __version__,
     derive_sub_idempotency_key,
+    is_allowed_direct_endpoint_host,
+    is_first_party_remove_ac_host,
     parse_image_dimensions,
+    validate_direct_endpoint_url,
     validate_https_endpoint_url,
     validate_remote_image_url,
 )
@@ -32,6 +35,9 @@ __all__ = [
     "RemoveAcError",
     "parse_image_dimensions",
     "derive_sub_idempotency_key",
+    "is_first_party_remove_ac_host",
+    "is_allowed_direct_endpoint_host",
+    "validate_direct_endpoint_url",
     "validate_https_endpoint_url",
     "validate_remote_image_url",
 ]
