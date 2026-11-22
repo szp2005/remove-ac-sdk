@@ -975,8 +975,9 @@ class PythonSdkTest(unittest.TestCase):
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
         )
         # "data:image/png;base64," has 18 base64-alphabet chars; pick payloads testing both len%4==1 crash & silent garbage cases
+        tiny_jpg = b"\xff\xd8\xff\xd9A"
         data_uri_png = f"data:image/png;base64,{base64.b64encode(tiny_png).decode('ascii')}"
-        data_uri_jpg = f"data:image/jpeg;base64,{base64.b64encode(b'\xff\xd8\xff\xd9A').decode('ascii')}"
+        data_uri_jpg = f"data:image/jpeg;base64,{base64.b64encode(tiny_jpg).decode('ascii')}"
 
         uploaded_bodies = []
 
