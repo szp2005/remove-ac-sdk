@@ -37,7 +37,7 @@ export {
 };
 
 export const SERVER_NAME = "remove-ac-mcp";
-export const SERVER_VERSION = "1.3.0";
+export const SERVER_VERSION = "1.3.1";
 export const MAX_MCP_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_BG_IMAGE_BYTES = MAX_IMAGE_BYTES;

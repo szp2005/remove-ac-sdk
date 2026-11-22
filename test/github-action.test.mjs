@@ -358,7 +358,7 @@ test("MF-3 & MF-4: GitHub Action protects GITHUB_STATE, uncreated runner files u
 });
 
 test("v1.3.0 GitHub Action supports bg-image-file and bg-image-url and blocks traversal/SSRF/conflicts", async (t) => {
-  assert.equal(ACTION_VERSION, "1.3.0");
+  assert.equal(ACTION_VERSION, "1.3.1");
   const ws = createTempWorkspace(t);
   const fgFile = path.join(ws, "subject.png");
   const bgFile = path.join(ws, "backdrop.png");

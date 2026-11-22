@@ -9,7 +9,7 @@ import {
   validateRemoteImageUrl,
 } from "./net-safety.mjs";
 
-export const SDK_VERSION = "1.3.0";
+export const SDK_VERSION = "1.3.1";
 export const USER_AGENT = `remove-ac-node-sdk/${SDK_VERSION}`;
 
 export const VALID_SIZES = Object.freeze([
