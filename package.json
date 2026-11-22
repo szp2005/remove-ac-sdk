@@ -1,6 +1,6 @@
 {
   "name": "remove-ac",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "mcpName": "io.github.szp2005/remove-ac",
   "description": "Official zero-dependency Node.js 18+ SDK, CLI, GitHub Action & MCP Server for remove.ac (/v1.0/removebg + up to 25 MB / 50 MP zero-disk GPU streaming).",
   "type": "module",

@@ -17,7 +17,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 SDK_VERSION = __version__
 USER_AGENT = f"remove-ac-python-sdk/{SDK_VERSION}"
 

@@ -280,14 +280,14 @@ class PythonSdkTest(unittest.TestCase):
         import http.server
         import threading
 
-        self.assertEqual(__version__, "1.3.0")
-        self.assertEqual(SDK_VERSION, "1.3.0")
-        self.assertEqual(USER_AGENT, "remove-ac-python-sdk/1.3.0")
+        self.assertEqual(__version__, "1.3.1")
+        self.assertEqual(SDK_VERSION, "1.3.1")
+        self.assertEqual(USER_AGENT, "remove-ac-python-sdk/1.3.1")
         self.assertIn("25mp", VALID_SIZES)
         self.assertIn("50mp", VALID_SIZES)
         self.assertIsNotNone(SizeLiteral)
 
-        # Verify real urllib _default_transport sends remove-ac-python-sdk/1.3.0 User-Agent (not Python-urllib)
+        # Verify real urllib _default_transport sends remove-ac-python-sdk/1.3.1 User-Agent (not Python-urllib)
         captured_uas = []
 
         class UaHandler(http.server.BaseHTTPRequestHandler):
@@ -311,7 +311,7 @@ class PythonSdkTest(unittest.TestCase):
             )
             acct = real_client.get_account(timeout=5)
             self.assertEqual(acct["data"]["attributes"]["credits"]["total"], 5)
-            self.assertEqual(captured_uas, ["remove-ac-python-sdk/1.3.0"])
+            self.assertEqual(captured_uas, ["remove-ac-python-sdk/1.3.1"])
         finally:
             ua_srv.shutdown()
             ua_srv.server_close()
@@ -338,7 +338,7 @@ class PythonSdkTest(unittest.TestCase):
         released_bodies = []
 
         def hold_release_transport(method, url, headers, body, timeout):
-            self.assertEqual(headers.get("User-Agent"), "remove-ac-python-sdk/1.3.0")
+            self.assertEqual(headers.get("User-Agent"), "remove-ac-python-sdk/1.3.1")
             if url.endswith("/v1.0/removebg/ticket"):
                 return (
                     200,

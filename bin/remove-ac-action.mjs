@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { RemoveAcClient } from "../node/index.mjs";
 import { validateRemoteImageUrl } from "../node/net-safety.mjs";
 
-export const ACTION_VERSION = "1.3.0";
+export const ACTION_VERSION = "1.3.1";
 const MAX_ACTION_FG_BYTES = 25 * 1024 * 1024;
 const MAX_ACTION_BG_BYTES = 25 * 1024 * 1024;
 const MAX_ACTION_COMBINED_BYTES = 30 * 1024 * 1024;

@@ -23,7 +23,7 @@ import {
   validateRemoteImageUrl,
 } from "../node/net-safety.mjs";
 
-export const CLI_VERSION = "1.3.0";
+export const CLI_VERSION = "1.3.1";
 export const USER_AGENT = `remove-ac-cli/${CLI_VERSION}`;
 export const VALID_SIZES = Object.freeze([
   "auto",

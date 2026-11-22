@@ -337,17 +337,17 @@ test("MF-1 & MF-2: Node SDK and CLI block 3xx redirects without leaking X-Api-Ke
 });
 
 test("v1.3.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight, CLI --flag=value/--concurrency/--version, and ticket hold release", async () => {
-  assert.equal(SDK_VERSION, "1.3.0");
-  assert.equal(USER_AGENT, "remove-ac-node-sdk/1.3.0");
-  assert.equal(CLI_VERSION, "1.3.0");
-  assert.equal(CLI_USER_AGENT, "remove-ac-cli/1.3.0");
+  assert.equal(SDK_VERSION, "1.3.1");
+  assert.equal(USER_AGENT, "remove-ac-node-sdk/1.3.1");
+  assert.equal(CLI_VERSION, "1.3.1");
+  assert.equal(CLI_USER_AGENT, "remove-ac-cli/1.3.1");
   assert.ok(VALID_SIZES.includes("25mp") && VALID_SIZES.includes("50mp"));
   assert.deepEqual(VALID_SIZES, CLI_VALID_SIZES);
 
   // CLI --version / -v
   const verRun = spawnSync(process.execPath, [cliBinPath, "--version"], { encoding: "utf8" });
   assert.equal(verRun.status, 0);
-  assert.equal(verRun.stdout.trim(), "1.3.0");
+  assert.equal(verRun.stdout.trim(), "1.3.1");
 
   // Exact README Section 3 invocations parse cleanly
   const readmeBatch = parseCliArgs([
@@ -447,8 +447,8 @@ test("v1.3.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight,
       fetchImpl: mockHandler(cliTrace),
     });
 
-    for (const item of sdkTrace) assert.equal(item.ua, "remove-ac-node-sdk/1.3.0");
-    for (const item of cliTrace) assert.equal(item.ua, "remove-ac-cli/1.3.0");
+    for (const item of sdkTrace) assert.equal(item.ua, "remove-ac-node-sdk/1.3.1");
+    for (const item of cliTrace) assert.equal(item.ua, "remove-ac-cli/1.3.1");
     return { sdkUrls: sdkTrace.map((x) => x.url), cliUrls: cliTrace.map((x) => x.url) };
   };
 
@@ -682,7 +682,7 @@ test("v1.3.0 bgImageFile, bgImageFileB64, combined >4 MB ticket routing, mutual 
     assert.equal(imp1.status, "received");
     assert.equal(improveCalls[0].url, "https://remove.ac/v1.0/improve");
     assert.equal(improveCalls[0].headers["X-Api-Key"], "rac_live_improve");
-    assert.equal(improveCalls[0].headers["User-Agent"], "remove-ac-node-sdk/1.3.0");
+    assert.equal(improveCalls[0].headers["User-Agent"], "remove-ac-node-sdk/1.3.1");
     assert.equal(improveCalls[0].body.get("tag"), "hair-edge");
     assert.equal(improveCalls[0].body.get("description"), "Fine flyaway strands against studio backdrop");
     assert.equal(improveCalls[0].body.get("image_file").name, "backdrop.png");
