@@ -1,4 +1,5 @@
 from .client import (
+    MAX_COMBINED_UPLOAD_BYTES,
     SDK_VERSION,
     USER_AGENT,
     VALID_CHANNELS,
@@ -24,6 +25,7 @@ __all__ = [
     "__version__",
     "SDK_VERSION",
     "USER_AGENT",
+    "MAX_COMBINED_UPLOAD_BYTES",
     "VALID_SIZES",
     "VALID_FORMATS",
     "VALID_CHANNELS",

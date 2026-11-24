@@ -9,7 +9,7 @@ import {
   validateRemoteImageUrl,
 } from "./net-safety.mjs";
 
-export const SDK_VERSION = "1.3.1";
+export const SDK_VERSION = "1.3.2";
 export const USER_AGENT = `remove-ac-node-sdk/${SDK_VERSION}`;
 
 export const VALID_SIZES = Object.freeze([
@@ -23,6 +23,7 @@ export const VALID_SIZES = Object.freeze([
   "25mp",
   "50mp",
   "full",
+  "maximum",
 ]);
 export const VALID_FORMATS = Object.freeze(["auto", "png", "jpg", "jpeg", "webp", "zip"]);
 export const VALID_CHANNELS = Object.freeze(["rgba", "alpha"]);
@@ -54,7 +55,7 @@ const VALID_SHADOW_SET = new Set(VALID_SHADOW_TYPES);
 const DEFAULT_BASE_URL = "https://remove.ac";
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
-const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024;
+export const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024 - 512 * 1024; // 29.5 MB (30,932,992 bytes; leaves 512 KB multipart framing headroom under 30 MB envelope)
 const MAX_IMAGE_PIXELS = 50_000_000;
 const MAX_IMAGE_DIMENSION = 50_000;
 const MAX_IMPROVE_TAG_LEN = 64;
@@ -502,7 +503,7 @@ export class RemoveAcClient {
     ) {
       throw new RemoveAcError(
         413,
-        "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+        "Combined foreground and background upload size exceeds 29.5 MB raw image limit (30932992 bytes; 30 MB multipart envelope)",
       );
     }
 
@@ -692,7 +693,7 @@ export class RemoveAcClient {
         ) {
           throw new RemoveAcError(
             413,
-            "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+            "Combined foreground and background upload size exceeds 29.5 MB raw image limit (30932992 bytes; 30 MB multipart envelope)",
           );
         }
       }

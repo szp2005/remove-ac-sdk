@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * remove.ac Official Zero-Dependency CLI v1.3.0 (Node.js >= 18)
+ * remove.ac Official Zero-Dependency CLI v1.3.2 (Node.js >= 18)
  * Compatible with POST https://remove.ac/v1.0/removebg, POST /v1.0/removebg/ticket, & GET /v1.0/account
  *
  * Usage:
@@ -23,7 +23,7 @@ import {
   validateRemoteImageUrl,
 } from "../node/net-safety.mjs";
 
-export const CLI_VERSION = "1.3.1";
+export const CLI_VERSION = "1.3.2";
 export const USER_AGENT = `remove-ac-cli/${CLI_VERSION}`;
 export const VALID_SIZES = Object.freeze([
   "auto",
@@ -36,6 +36,7 @@ export const VALID_SIZES = Object.freeze([
   "25mp",
   "50mp",
   "full",
+  "maximum",
 ]);
 export const VALID_FORMATS = Object.freeze(["auto", "png", "jpg", "jpeg", "webp", "zip"]);
 export const VALID_CHANNELS = Object.freeze(["rgba", "alpha"]);
@@ -68,7 +69,7 @@ const DEFAULT_BASE_URL = "https://remove.ac";
 const SUPPORTED_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const DIRECT_STREAM_THRESHOLD_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
-const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024;
+export const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024 - 512 * 1024; // 29.5 MB (30,932,992 bytes)
 const MAX_IMAGE_PIXELS = 50_000_000;
 const MAX_IMAGE_DIMENSION = 50_000;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
@@ -285,8 +286,8 @@ Options:
   --concurrency <1..8>     Parallel worker count for batch runs (default: 1)
   --watch                  Continuously watch input directory(ies) for new/updated images
   --poll-ms <ms>           Watch polling interval in milliseconds (default: 2000)
-  --size <value>           preview | small | regular | medium | hd | 4k | 25mp | 50mp | full | auto (default: auto)
-  --format <value>         auto | png | jpg | webp | zip (default: png)
+  --size <value>           preview | small | regular | medium | hd | 4k | 25mp | 50mp | full | maximum | auto (default: auto)
+  --format <value>         auto | png | jpg | jpeg | webp | zip (default: png)
   --channels <value>       rgba | alpha (default: rgba)
   --type <value>           auto | person | product | car | animal | graphic | transportation
   --type-level <value>     none | 1 | 2 | latest
@@ -610,7 +611,7 @@ export async function processImageBuffer({
     bytes.byteLength + effectiveBgInput.bytes.byteLength > MAX_COMBINED_UPLOAD_BYTES
   ) {
     throw new Error(
-      "Combined foreground and --bg-image size exceeds 30 MB maximum upload envelope (31457280 bytes).",
+      "Combined foreground and --bg-image size exceeds 29.5 MB raw image limit (30932992 bytes; 30 MB multipart envelope).",
     );
   }
 
@@ -989,7 +990,7 @@ export async function processSingleFile(filePath, opts, baseUrl, bgInput, runtim
   }
   if (bgInput?.kind === "file" && st.size + bgInput.bytes.byteLength > MAX_COMBINED_UPLOAD_BYTES) {
     console.error(
-      `[FAIL] ${path.basename(filePath)} -> Combined foreground and --bg-image size exceeds 30 MB limit.`,
+      `[FAIL] ${path.basename(filePath)} -> Combined foreground and --bg-image size exceeds 29.5 MB limit (30 MB multipart envelope).`,
     );
     return false;
   }

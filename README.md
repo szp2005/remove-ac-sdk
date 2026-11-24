@@ -1,4 +1,4 @@
-# remove.ac Official SDKs, CLI, GitHub Action & MCP Server (`v1.3.1`)
+# remove.ac Official SDKs, CLI, GitHub Action & MCP Server (`v1.3.2`)
 
 [![szp2005/remove-ac-sdk MCP server](https://glama.ai/mcp/servers/szp2005/remove-ac-sdk/badges/score.svg)](https://glama.ai/mcp/servers/szp2005/remove-ac-sdk)
 
@@ -173,9 +173,9 @@ Automate storefront product cutouts or PR asset cleanup directly inside GitHub A
 
 ---
 
-## 7. n8n Community Node (`n8n-nodes-remove-ac` `v1.0.2`)
+## 7. n8n Community Node (`n8n-nodes-remove-ac` `v1.0.3`)
 
-In self-hosted or desktop n8n, open **Settings → Community Nodes → Install** and enter `n8n-nodes-remove-ac` (`v1.0.2`) to replace deprecated `remove.bg` workflow steps with native binary and URL support up to `25 MB / 50 MP`.
+In self-hosted or desktop n8n, open **Settings → Community Nodes → Install** and enter `n8n-nodes-remove-ac` (`v1.0.3`) to replace deprecated `remove.bg` workflow steps with native binary and URL support up to `25 MB / 50 MP`.
 
 ---
 

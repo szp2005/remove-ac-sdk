@@ -8,6 +8,7 @@ export type RemoveBgSize =
   | "25mp"
   | "50mp"
   | "full"
+  | "maximum"
   | "auto";
 
 export type RemoveBgFormat = "auto" | "png" | "jpg" | "jpeg" | "webp" | "zip";
@@ -29,8 +30,9 @@ export type RemoveBgShadowType =
   | "reflection"
   | "none";
 
-export declare const SDK_VERSION: "1.3.0";
+export declare const SDK_VERSION: "1.3.2";
 export declare const USER_AGENT: string;
+export declare const MAX_COMBINED_UPLOAD_BYTES: number;
 export declare const VALID_SIZES: readonly RemoveBgSize[];
 export declare const VALID_FORMATS: readonly RemoveBgFormat[];
 export declare const VALID_CHANNELS: readonly RemoveBgChannels[];

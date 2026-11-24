@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Zero-dependency GitHub Action entrypoint v1.3.0 (node20) for remove.ac (/v1.0/removebg).
+ * Zero-dependency GitHub Action entrypoint v1.3.2 (node20) for remove.ac (/v1.0/removebg).
  * Supports single local image files, batch folders, and SSRF-validated public image URLs.
  */
 
@@ -12,13 +12,13 @@ import { fileURLToPath } from "node:url";
 import { RemoveAcClient } from "../node/index.mjs";
 import { validateRemoteImageUrl } from "../node/net-safety.mjs";
 
-export const ACTION_VERSION = "1.3.1";
+export const ACTION_VERSION = "1.3.2";
 const MAX_ACTION_FG_BYTES = 25 * 1024 * 1024;
 const MAX_ACTION_BG_BYTES = 25 * 1024 * 1024;
-const MAX_ACTION_COMBINED_BYTES = 30 * 1024 * 1024;
+export const MAX_ACTION_COMBINED_BYTES = 30 * 1024 * 1024 - 512 * 1024; // 29.5 MB (30,932,992 bytes)
 const SUPPORTED_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
-const ALLOWED_SIZES = new Set(["auto", "preview", "small", "regular", "medium", "hd", "4k", "25mp", "50mp", "full"]);
-const ALLOWED_FORMATS = new Set(["png", "jpg", "webp", "zip"]);
+const ALLOWED_SIZES = new Set(["auto", "preview", "small", "regular", "medium", "hd", "4k", "25mp", "50mp", "full", "maximum"]);
+const ALLOWED_FORMATS = new Set(["auto", "png", "jpg", "jpeg", "webp", "zip"]);
 const ALLOWED_TYPES = new Set(["auto", "person", "product", "car", "animal", "graphic", "transportation"]);
 const ALLOWED_SHADOW_TYPES = new Set(["auto", "car", "drop", "soft", "contact", "reflection", "none"]);
 
@@ -243,11 +243,25 @@ function writeBufferAtomically(destPath, buffer, overwrite) {
   void writeFlag;
 }
 
-function defaultCutoutPath(inputPath, format) {
+function outExtForActionFormat(format, mediaType = "") {
+  if (format === "auto") {
+    const mime = String(mediaType || "").split(";")[0].trim().toLowerCase();
+    if (mime === "image/jpeg" || mime === "image/jpg") return ".jpg";
+    if (mime === "image/webp") return ".webp";
+    if (mime === "application/zip" || mime === "application/x-zip-compressed") return ".zip";
+    return ".png";
+  }
+  if (format === "jpg" || format === "jpeg") return ".jpg";
+  if (format === "webp") return ".webp";
+  if (format === "zip") return ".zip";
+  return ".png";
+}
+
+function defaultCutoutPath(inputPath, format, mediaType = "") {
   const dir = path.dirname(inputPath);
   const ext = path.extname(inputPath);
   const stem = path.basename(inputPath, ext);
-  const outExt = format === "jpg" ? ".jpg" : format === "webp" ? ".webp" : format === "zip" ? ".zip" : ".png";
+  const outExt = outExtForActionFormat(format, mediaType);
   return path.join(dir, `${stem}-nobg${outExt}`);
 }
 
@@ -434,26 +448,53 @@ export async function runGithubAction({
       }
       if (bgFileByteLength > 0 && st.size + bgFileByteLength > MAX_ACTION_COMBINED_BYTES) {
         throw new Error(
-          `Combined input_path and bg-image-file size exceeds 30 MB limit (${st.size + bgFileByteLength} bytes)`
+          `Combined input_path and bg-image-file size exceeds 29.5 MB limit (${st.size + bgFileByteLength} > ${MAX_ACTION_COMBINED_BYTES} bytes; 30 MB multipart envelope)`
         );
       }
-      const destPath = rawOutputPath
-        ? resolveSafeActionPath(rawOutputPath, { env, cwd, allowOutsideWorkspace, forWrite: true })
-        : resolveSafeActionPath(defaultCutoutPath(srcPath, format), {
-            env,
-            cwd,
-            allowOutsideWorkspace,
-            forWrite: true,
-          });
-      if (canonicalBgImageFile && canonicalizePathWithRealAncestor(destPath) === canonicalBgImageFile) {
-        throw new Error(
-          `Refusing to overwrite bg-image-file with output_path: ${destPath}`
-        );
-      }
-      if (!overwrite && fs.existsSync(destPath)) {
-        throw new Error(`Output file already exists: ${destPath}`);
+      const hasExplicitDest = Boolean(rawOutputPath);
+      let destPath = "";
+      if (hasExplicitDest || format !== "auto") {
+        destPath = hasExplicitDest
+          ? resolveSafeActionPath(rawOutputPath, { env, cwd, allowOutsideWorkspace, forWrite: true })
+          : resolveSafeActionPath(defaultCutoutPath(srcPath, format), {
+              env,
+              cwd,
+              allowOutsideWorkspace,
+              forWrite: true,
+            });
+        if (canonicalBgImageFile && canonicalizePathWithRealAncestor(destPath) === canonicalBgImageFile) {
+          throw new Error(
+            `Refusing to overwrite bg-image-file with output_path: ${destPath}`
+          );
+        }
+        if (!overwrite && fs.existsSync(destPath)) {
+          throw new Error(`Output file already exists: ${destPath}`);
+        }
+      } else {
+        resolveSafeActionPath(defaultCutoutPath(srcPath, "png"), {
+          env,
+          cwd,
+          allowOutsideWorkspace,
+          forWrite: true,
+        });
       }
       const res = await client.removeBackground(srcPath, cutoutOpts);
+      if (!destPath) {
+        destPath = resolveSafeActionPath(defaultCutoutPath(srcPath, format, res.mediaType), {
+          env,
+          cwd,
+          allowOutsideWorkspace,
+          forWrite: true,
+        });
+        if (canonicalBgImageFile && canonicalizePathWithRealAncestor(destPath) === canonicalBgImageFile) {
+          throw new Error(
+            `Refusing to overwrite bg-image-file with output_path: ${destPath}`
+          );
+        }
+        if (!overwrite && fs.existsSync(destPath)) {
+          throw new Error(`Output file already exists: ${destPath}`);
+        }
+      }
       writeBufferAtomically(destPath, res.buffer, overwrite);
       generatedFiles.push(destPath);
       totalCredits += Number(res.creditsCharged ?? 0);
@@ -497,7 +538,7 @@ export async function runGithubAction({
         throw new Error(`No supported images (.png, .jpg, .jpeg, .webp) found in directory: ${srcPath}`);
       }
 
-      const outExt = format === "jpg" ? ".jpg" : format === "webp" ? ".webp" : format === "zip" ? ".zip" : ".png";
+      const outExt = outExtForActionFormat(format);
       const batchPlan = entries.map((fileName) => {
         const itemSrc = path.join(srcPath, fileName);
         const itemStat = fs.statSync(itemSrc);
@@ -509,7 +550,7 @@ export async function runGithubAction({
         }
         if (bgFileByteLength > 0 && itemStat.size + bgFileByteLength > MAX_ACTION_COMBINED_BYTES) {
           throw new Error(
-            `Combined batch image '${fileName}' and bg-image-file size exceeds 30 MB limit (${itemStat.size + bgFileByteLength} bytes)`
+            `Combined batch image '${fileName}' and bg-image-file size exceeds 29.5 MB limit (${itemStat.size + bgFileByteLength} > ${MAX_ACTION_COMBINED_BYTES} bytes; 30 MB multipart envelope)`
           );
         }
         const stem = path.basename(fileName, path.extname(fileName));
@@ -520,21 +561,42 @@ export async function runGithubAction({
           allowOutsideWorkspace,
           forWrite: true,
         });
-        if (canonicalBgImageFile && canonicalizePathWithRealAncestor(itemDest) === canonicalBgImageFile) {
-          throw new Error(
-            `Refusing to overwrite bg-image-file with batch output: ${itemDest}`
-          );
+        if (format !== "auto") {
+          if (canonicalBgImageFile && canonicalizePathWithRealAncestor(itemDest) === canonicalBgImageFile) {
+            throw new Error(
+              `Refusing to overwrite bg-image-file with batch output: ${itemDest}`
+            );
+          }
+          if (!overwrite && fs.existsSync(itemDest)) {
+            throw new Error(`Output file already exists: ${itemDest}`);
+          }
         }
-        if (!overwrite && fs.existsSync(itemDest)) {
-          throw new Error(`Output file already exists: ${itemDest}`);
-        }
-        return { itemSrc, itemDest };
+        return { itemSrc, itemDest, stem };
       });
 
-      for (const { itemSrc, itemDest } of batchPlan) {
+      for (const { itemSrc, itemDest, stem } of batchPlan) {
         const res = await client.removeBackground(itemSrc, cutoutOpts);
-        writeBufferAtomically(itemDest, res.buffer, overwrite);
-        generatedFiles.push(itemDest);
+        let finalDest = itemDest;
+        if (format === "auto") {
+          const actualExt = outExtForActionFormat("auto", res.mediaType);
+          const actualName = sameDir ? `${stem}-nobg${actualExt}` : `${stem}${actualExt}`;
+          finalDest = resolveSafeActionPath(path.join(outDir, actualName), {
+            env,
+            cwd,
+            allowOutsideWorkspace,
+            forWrite: true,
+          });
+          if (canonicalBgImageFile && canonicalizePathWithRealAncestor(finalDest) === canonicalBgImageFile) {
+            throw new Error(
+              `Refusing to overwrite bg-image-file with batch output: ${finalDest}`
+            );
+          }
+          if (!overwrite && fs.existsSync(finalDest)) {
+            throw new Error(`Output file already exists: ${finalDest}`);
+          }
+        }
+        writeBufferAtomically(finalDest, res.buffer, overwrite);
+        generatedFiles.push(finalDest);
         totalCredits += Number(res.creditsCharged ?? 0);
         lastWidth = res.width ? String(res.width) : lastWidth;
         lastHeight = res.height ? String(res.height) : lastHeight;

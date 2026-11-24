@@ -126,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           STAGE_DIR="$(mktemp -d)"
-          cp -R node bin action.yml smithery.yaml glama.json server.json LICENSE README.md package.json "$STAGE_DIR/"
+          cp -R node bin action.yml glama.json server.json LICENSE README.md package.json "$STAGE_DIR/"
           node -e '
             const fs = require("node:fs");
             const p = process.argv[1];

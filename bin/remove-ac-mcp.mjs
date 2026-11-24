@@ -37,12 +37,12 @@ export {
 };
 
 export const SERVER_NAME = "remove-ac-mcp";
-export const SERVER_VERSION = "1.3.1";
+export const SERVER_VERSION = "1.3.2";
 export const MAX_MCP_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_BG_IMAGE_BYTES = MAX_IMAGE_BYTES;
-const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024;
-const SUPPORTED_IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+export const MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024 - 512 * 1024; // 29.5 MB (30,932,992 bytes)
+const SUPPORTED_IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 const MAX_MCP_HEADER_BYTES = 16 * 1024;
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 const SUPPORTED_PROTOCOLS = new Set([
@@ -62,8 +62,11 @@ const MCP_SIZE_ENUM = [
   "25mp",
   "50mp",
   "full",
+  "maximum",
 ];
-const MCP_FORMAT_ENUM = ["png", "jpg", "webp", "zip"];
+const MCP_FORMAT_ENUM = ["auto", "png", "jpg", "jpeg", "webp", "zip"];
+export const VALID_SIZES = Object.freeze([...MCP_SIZE_ENUM]);
+export const VALID_FORMATS = Object.freeze([...MCP_FORMAT_ENUM]);
 const MCP_TYPE_ENUM = [
   "auto",
   "person",
@@ -238,12 +241,26 @@ function validateNoSymlinkPathChain(resolvedPath, label) {
   }
 }
 
-function resolveDefaultOutputPath(inputPath, format = "png") {
+function extensionFromMediaType(mediaType) {
+  const mime = String(mediaType || "").split(";")[0].trim().toLowerCase();
+  if (mime === "image/jpeg" || mime === "image/jpg") return "jpg";
+  if (mime === "image/webp") return "webp";
+  if (mime === "application/zip" || mime === "application/x-zip-compressed") return "zip";
+  return "png";
+}
+
+function resolveDefaultOutputPath(inputPath, format = "png", mediaType = "") {
   if (!ALLOWED_MCP_FORMATS.has(format)) {
     throw new Error(`Unsupported format '${format}'. Expected one of: ${MCP_FORMAT_ENUM.join(", ")}`);
   }
+  const outExt =
+    format === "auto"
+      ? extensionFromMediaType(mediaType)
+      : format === "jpeg"
+        ? "jpg"
+        : format;
   const parsed = path.parse(inputPath);
-  return path.join(parsed.dir, `${parsed.name}-nobg.${format}`);
+  return path.join(parsed.dir, `${parsed.name}-nobg.${outExt}`);
 }
 
 export function ensureSafeWriteTarget(targetPath, overwrite = false, sourcePath = null) {
@@ -490,7 +507,7 @@ function assertSupportedMcpImageExtension(filePath, label) {
   const ext = path.extname(filePath).toLowerCase();
   if (!SUPPORTED_IMAGE_EXTS.has(ext)) {
     throw new Error(
-      `Unsupported ${label} extension '${ext || "(none)"}'. Expected one of: .png, .jpg, .jpeg, .webp`,
+      `Unsupported ${label} extension '${ext || "(none)"}'. Expected one of: .png, .jpg, .jpeg, .webp, .gif`,
     );
   }
 }
@@ -526,6 +543,17 @@ function hasSupportedImageMagicBytes(bytes) {
   ) {
     return true;
   }
+  if (
+    bytes.byteLength >= 6 &&
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) &&
+    bytes[5] === 0x61
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -536,7 +564,7 @@ function assertSupportedMcpImageMagicHeader(filePath, label) {
     const bytesRead = fs.readSync(fd, header, 0, header.length, 0);
     if (!hasSupportedImageMagicBytes(header.subarray(0, bytesRead))) {
       throw new Error(
-        `Invalid ${label}: file header is not a valid PNG, JPEG, or WebP image`,
+        `Invalid ${label}: file header is not a valid PNG, JPEG, WebP, or GIF image`,
       );
     }
   } finally {
@@ -726,24 +754,41 @@ export async function handleMcpRequest(
         );
         if (bgByteLength > 0 && inputStat.size + bgByteLength > MAX_COMBINED_UPLOAD_BYTES) {
           throw new Error(
-            `Combined inputPath and bg_image_path size exceeds 30 MB limit (${inputStat.size + bgByteLength} bytes)`,
+            `Combined inputPath and bg_image_path size exceeds 29.5 MB limit (${inputStat.size + bgByteLength} > ${MAX_COMBINED_UPLOAD_BYTES} bytes; 30 MB multipart envelope)`,
           );
         }
 
-        const rawOut =
-          typeof args.outputPath === "string" && args.outputPath.trim()
+        const hasExplicitOut = typeof args.outputPath === "string" && args.outputPath.trim() !== "";
+        const overwrite = Boolean(args.overwrite);
+        let resolvedOutput = "";
+        if (hasExplicitOut || cutoutOpts.format !== "auto") {
+          const rawOut = hasExplicitOut
             ? args.outputPath
             : resolveDefaultOutputPath(resolvedInput, cutoutOpts.format);
-        const overwrite = Boolean(args.overwrite);
-        const resolvedOutput = ensureSafeWriteTarget(rawOut, overwrite, resolvedInput);
-        if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile) {
-          throw new Error(
-            "outputPath resolves to bg_image_path; specify a separate outputPath",
-          );
+          resolvedOutput = ensureSafeWriteTarget(rawOut, overwrite, resolvedInput);
+          if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile) {
+            throw new Error(
+              "outputPath resolves to bg_image_path; specify a separate outputPath",
+            );
+          }
+        } else {
+          validateNoSymlinkPathChain(path.join(path.dirname(resolvedInput), "_probe"), "outputPath");
         }
 
         const client = effectiveClientFactory();
         const res = await client.removeBackground(resolvedInput, cutoutOpts);
+        if (!resolvedOutput) {
+          resolvedOutput = ensureSafeWriteTarget(
+            resolveDefaultOutputPath(resolvedInput, cutoutOpts.format, res.mediaType),
+            overwrite,
+            resolvedInput,
+          );
+          if (cutoutOpts.bgImageFile && resolvedOutput === cutoutOpts.bgImageFile) {
+            throw new Error(
+              "outputPath resolves to bg_image_path; specify a separate outputPath",
+            );
+          }
+        }
         writeBufferAtomically(resolvedOutput, res.buffer, overwrite, resolvedInput);
         return {
           jsonrpc: "2.0",

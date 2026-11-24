@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   deriveSubIdempotencyKey,
+  MAX_COMBINED_UPLOAD_BYTES,
   parseImageDimensions,
   RemoveAcClient,
   RemoveAcError,
@@ -337,17 +338,21 @@ test("MF-1 & MF-2: Node SDK and CLI block 3xx redirects without leaking X-Api-Ke
 });
 
 test("v1.3.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight, CLI --flag=value/--concurrency/--version, and ticket hold release", async () => {
-  assert.equal(SDK_VERSION, "1.3.1");
-  assert.equal(USER_AGENT, "remove-ac-node-sdk/1.3.1");
-  assert.equal(CLI_VERSION, "1.3.1");
-  assert.equal(CLI_USER_AGENT, "remove-ac-cli/1.3.1");
-  assert.ok(VALID_SIZES.includes("25mp") && VALID_SIZES.includes("50mp"));
+  assert.equal(SDK_VERSION, "1.3.2");
+  assert.equal(USER_AGENT, "remove-ac-node-sdk/1.3.2");
+  assert.equal(CLI_VERSION, "1.3.2");
+  assert.equal(CLI_USER_AGENT, "remove-ac-cli/1.3.2");
+  assert.ok(
+    VALID_SIZES.includes("25mp") &&
+      VALID_SIZES.includes("50mp") &&
+      VALID_SIZES.includes("maximum"),
+  );
   assert.deepEqual(VALID_SIZES, CLI_VALID_SIZES);
 
   // CLI --version / -v
   const verRun = spawnSync(process.execPath, [cliBinPath, "--version"], { encoding: "utf8" });
   assert.equal(verRun.status, 0);
-  assert.equal(verRun.stdout.trim(), "1.3.1");
+  assert.equal(verRun.stdout.trim(), "1.3.2");
 
   // Exact README Section 3 invocations parse cleanly
   const readmeBatch = parseCliArgs([
@@ -447,8 +452,8 @@ test("v1.3.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight,
       fetchImpl: mockHandler(cliTrace),
     });
 
-    for (const item of sdkTrace) assert.equal(item.ua, "remove-ac-node-sdk/1.3.1");
-    for (const item of cliTrace) assert.equal(item.ua, "remove-ac-cli/1.3.1");
+    for (const item of sdkTrace) assert.equal(item.ua, "remove-ac-node-sdk/1.3.2");
+    for (const item of cliTrace) assert.equal(item.ua, "remove-ac-cli/1.3.2");
     return { sdkUrls: sdkTrace.map((x) => x.url), cliUrls: cliTrace.map((x) => x.url) };
   };
 
@@ -456,7 +461,7 @@ test("v1.3.0 MF-01, MF-05 & MF-06: User-Agent, enum guards, 25mp/50mp preflight,
   assert.deepEqual(t4k.sdkUrls, ["https://remove.ac/v1.0/removebg"]);
   assert.deepEqual(t4k.cliUrls, ["https://remove.ac/v1.0/removebg"]);
 
-  for (const hiTier of ["25mp", "50mp"]) {
+  for (const hiTier of ["25mp", "50mp", "maximum"]) {
     const tHi = await traceTier(hiTier);
     assert.deepEqual(tHi.sdkUrls, [
       "https://remove.ac/v1.0/removebg/ticket",
@@ -682,7 +687,7 @@ test("v1.3.0 bgImageFile, bgImageFileB64, combined >4 MB ticket routing, mutual 
     assert.equal(imp1.status, "received");
     assert.equal(improveCalls[0].url, "https://remove.ac/v1.0/improve");
     assert.equal(improveCalls[0].headers["X-Api-Key"], "rac_live_improve");
-    assert.equal(improveCalls[0].headers["User-Agent"], "remove-ac-node-sdk/1.3.1");
+    assert.equal(improveCalls[0].headers["User-Agent"], "remove-ac-node-sdk/1.3.2");
     assert.equal(improveCalls[0].body.get("tag"), "hair-edge");
     assert.equal(improveCalls[0].body.get("description"), "Fine flyaway strands against studio backdrop");
     assert.equal(improveCalls[0].body.get("image_file").name, "backdrop.png");
@@ -943,7 +948,7 @@ test("R2 MF-01, MF-02 & MF-03: SSRF URL guards, submitImprove bounds, all-non-2x
           baseUrl: "https://remove.ac",
           fetchImpl: neverFetch,
         }),
-      /exceeds 30 MB/,
+      /exceeds 29\.5 MB/,
     );
     assert.equal(cliNetHits, 0);
 
@@ -1522,4 +1527,63 @@ test("M-P2-17: CLI --format=auto derives output extension from Content-Type, rej
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test("ENG-02 (v1.3.2): size='maximum', exact 29.5 MiB combined multipart headroom boundary, and obsolete smithery.yaml removal", async () => {
+  assert.equal(MAX_COMBINED_UPLOAD_BYTES, 30_932_992);
+  assert.ok(VALID_SIZES.includes("maximum"));
+
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  assert.equal(fs.existsSync(path.join(repoRoot, "smithery.yaml")), false);
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+  assert.equal(pkgJson.version, "1.3.2");
+  assert.equal(pkgJson.files.includes("smithery.yaml"), false);
+  assert.equal(pkgJson.dependencies, undefined);
+
+  const fg15 = Buffer.alloc(15 * 1024 * 1024, 0x11);
+  const bg14_5 = Buffer.alloc(14.5 * 1024 * 1024, 0x22);
+  const bgOverBy1 = Buffer.alloc(14.5 * 1024 * 1024 + 1, 0x22);
+  assert.equal(fg15.byteLength + bg14_5.byteLength, MAX_COMBINED_UPLOAD_BYTES);
+
+  // 1. Exact 29.5 MiB (30,932,992 B) with size="maximum" passes precheck and uploads cleanly via ticket
+  const okCalls = [];
+  const okClient = new RemoveAcClient({
+    apiKey: "rac_live_eng02",
+    lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    fetch: async (url, init) => {
+      okCalls.push({ url: String(url), body: init.body });
+      if (String(url).endsWith("/v1.0/removebg/ticket")) {
+        const parsed = JSON.parse(init.body);
+        assert.equal(parsed.size, "maximum");
+        return Response.json({
+          data: {
+            ticket: "tkt_max_295",
+            directEndpoint: "https://api.remove.ac/v1.0/direct-cutout",
+          },
+        });
+      }
+      return new Response(Buffer.from("MAX_OK"), {
+        status: 200,
+        headers: { "Content-Type": "image/png", "X-Credits-Charged": "1" },
+      });
+    },
+  });
+  const okRes = await okClient.removeBackground(fg15, { bgImageFile: bg14_5, size: "maximum" });
+  assert.equal(okRes.buffer.toString("utf8"), "MAX_OK");
+  assert.equal(okCalls.length, 2);
+
+  // 2. 29.5 MiB + 1 byte (30,932,993 B) rejects BEFORE minting a ticket (0 HTTP calls)
+  let overHits = 0;
+  const overClient = new RemoveAcClient({
+    apiKey: "rac_live_eng02",
+    fetch: async () => {
+      overHits += 1;
+      return new Response("unexpected");
+    },
+  });
+  await assert.rejects(
+    () => overClient.removeBackground(fg15, { bgImageFile: bgOverBy1, size: "maximum" }),
+    (err) => err instanceof RemoveAcError && err.statusCode === 413 && /29\.5 MB/.test(err.message),
+  );
+  assert.equal(overHits, 0);
 });
