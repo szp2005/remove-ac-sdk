@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 from remove_ac import (
+    MAX_COMBINED_UPLOAD_BYTES,
     SDK_VERSION,
     USER_AGENT,
     VALID_SIZES,
@@ -280,14 +281,15 @@ class PythonSdkTest(unittest.TestCase):
         import http.server
         import threading
 
-        self.assertEqual(__version__, "1.3.1")
-        self.assertEqual(SDK_VERSION, "1.3.1")
-        self.assertEqual(USER_AGENT, "remove-ac-python-sdk/1.3.1")
+        self.assertEqual(__version__, "1.3.2")
+        self.assertEqual(SDK_VERSION, "1.3.2")
+        self.assertEqual(USER_AGENT, "remove-ac-python-sdk/1.3.2")
         self.assertIn("25mp", VALID_SIZES)
         self.assertIn("50mp", VALID_SIZES)
+        self.assertIn("maximum", VALID_SIZES)
         self.assertIsNotNone(SizeLiteral)
 
-        # Verify real urllib _default_transport sends remove-ac-python-sdk/1.3.1 User-Agent (not Python-urllib)
+        # Verify real urllib _default_transport sends remove-ac-python-sdk/1.3.2 User-Agent (not Python-urllib)
         captured_uas = []
 
         class UaHandler(http.server.BaseHTTPRequestHandler):
@@ -311,7 +313,7 @@ class PythonSdkTest(unittest.TestCase):
             )
             acct = real_client.get_account(timeout=5)
             self.assertEqual(acct["data"]["attributes"]["credits"]["total"], 5)
-            self.assertEqual(captured_uas, ["remove-ac-python-sdk/1.3.1"])
+            self.assertEqual(captured_uas, ["remove-ac-python-sdk/1.3.2"])
         finally:
             ua_srv.shutdown()
             ua_srv.server_close()
@@ -338,7 +340,7 @@ class PythonSdkTest(unittest.TestCase):
         released_bodies = []
 
         def hold_release_transport(method, url, headers, body, timeout):
-            self.assertEqual(headers.get("User-Agent"), "remove-ac-python-sdk/1.3.1")
+            self.assertEqual(headers.get("User-Agent"), "remove-ac-python-sdk/1.3.2")
             if url.endswith("/v1.0/removebg/ticket"):
                 return (
                     200,
@@ -1031,6 +1033,82 @@ class PythonSdkTest(unittest.TestCase):
             self.assertIn("malformed data URI", lines[0])
             self.assertIn("Insufficient credits", lines[1])
             self.assertIn("Insufficient credits", lines[2])
+
+    def test_eng02_v132_size_maximum_and_295mib_combined_envelope(self):
+        import struct
+        from typing import get_args
+
+        self.assertEqual(MAX_COMBINED_UPLOAD_BYTES, 30_932_992)
+        self.assertIn("maximum", VALID_SIZES)
+        self.assertIn("maximum", get_args(SizeLiteral))
+
+        png_30mp = (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">I", 13)
+            + b"IHDR"
+            + struct.pack(">II", 6000, 5000)
+            + b"\x08\x06\x00\x00\x00"
+            + b"\x00" * 32
+        )
+        seen_ticket_sizes = []
+
+        def ticket_transport(method, url, headers, body, timeout):
+            if url.endswith("/v1.0/removebg/ticket"):
+                seen_ticket_sizes.append(json.loads(body.decode("utf-8"))["size"])
+                return (
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps(
+                        {
+                            "data": {
+                                "ticket": "tkt_max_py",
+                                "directEndpoint": "https://api.remove.ac/v1.0/direct-cutout",
+                            }
+                        }
+                    ).encode("utf-8"),
+                )
+            return 200, {"content-type": "image/png"}, b"MAX_PY_OK"
+
+        client = RemoveAcClient(
+            api_key="rac_live_py_eng02",
+            transport=ticket_transport,
+            resolver=lambda _h: ["93.184.216.34"],
+        )
+        self.assertEqual(client.remove_background(png_30mp, size="maximum"), b"MAX_PY_OK")
+        rmbg = RemoveBg(
+            "rac_live_py_eng02",
+            transport=ticket_transport,
+            resolver=lambda _h: ["93.184.216.34"],
+        )
+        self.assertEqual(
+            rmbg.remove_background_from_base64_img(
+                base64.b64encode(png_30mp).decode("ascii"),
+                size="maximum",
+                new_file_name="",
+            ),
+            b"MAX_PY_OK",
+        )
+        self.assertEqual(seen_ticket_sizes, ["maximum", "maximum"])
+
+        # Exact 29.5 MiB passes precheck; 29.5 MiB + 1 B fails upfront with 0 HTTP calls
+        fg_15 = b"F" * (15 * 1024 * 1024)
+        bg_14_5 = b"B" * (14 * 1024 * 1024 + 512 * 1024)
+        self.assertEqual(len(fg_15) + len(bg_14_5), MAX_COMBINED_UPLOAD_BYTES)
+        self.assertEqual(
+            client.remove_background(fg_15, bg_image_file=bg_14_5, size="maximum"),
+            b"MAX_PY_OK",
+        )
+
+        over_hits = []
+        over_client = RemoveAcClient(
+            api_key="rac_live_py_eng02",
+            transport=lambda m, u, h, b, t: over_hits.append(u) or (200, {}, b"BAD"),
+        )
+        with self.assertRaises(RemoveAcError) as over_ctx:
+            over_client.remove_background(fg_15, bg_image_file=bg_14_5 + b"X", size="maximum")
+        self.assertEqual(over_ctx.exception.status_code, 413)
+        self.assertIn("29.5 MB", str(over_ctx.exception))
+        self.assertEqual(len(over_hits), 0)
 
 
 if __name__ == "__main__":

@@ -10,11 +10,14 @@ import { RemoveAcClient } from "../node/index.mjs";
 import {
   handleMcpRequest,
   isDisallowedRemoteUrl,
+  MAX_COMBINED_UPLOAD_BYTES,
   MAX_MCP_MESSAGE_BYTES,
   MCP_TOOLS,
   SERVER_NAME,
   SERVER_VERSION,
   startStdioServer,
+  VALID_FORMATS,
+  VALID_SIZES,
   validateRemoteImageUrl,
 } from "../bin/remove-ac-mcp.mjs";
 
@@ -34,8 +37,8 @@ const tempRoot = fs.existsSync("/Volumes/Expansion/dev-tools/build-temp")
   ? "/Volumes/Expansion/dev-tools/build-temp"
   : os.tmpdir();
 
-test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.3.0", async () => {
-  assert.equal(SERVER_VERSION, "1.3.1");
+test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.3.2", async () => {
+  assert.equal(SERVER_VERSION, "1.3.2");
   const initRes = await handleMcpRequest({
     jsonrpc: "2.0",
     id: 1,
@@ -45,7 +48,7 @@ test("MCP initialize, ping, and tools/list follow JSON-RPC 2.0 contract at v1.3.
   assert.equal(initRes.id, 1);
   assert.equal(initRes.result.protocolVersion, "2024-11-05");
   assert.equal(initRes.result.serverInfo.name, SERVER_NAME);
-  assert.equal(initRes.result.serverInfo.version, "1.3.1");
+  assert.equal(initRes.result.serverInfo.version, "1.3.2");
 
   const notifRes = await handleMcpRequest({
     jsonrpc: "2.0",
@@ -316,12 +319,15 @@ test("MCP stdio child process handles newline-delimited JSON-RPC end-to-end", as
   assert.equal(lines.length, 2);
   assert.equal(lines[0].id, 10);
   assert.equal(lines[0].result.serverInfo.name, "remove-ac-mcp");
-  assert.equal(lines[0].result.serverInfo.version, "1.3.1");
+  assert.equal(lines[0].result.serverInfo.version, "1.3.2");
   assert.equal(lines[1].id, 11);
   assert.equal(lines[1].result.tools.length, 3);
   const fileTool = lines[1].result.tools.find((t) => t.name === "remove_background_file");
   assert.ok(fileTool.inputSchema.properties.size.enum.includes("25mp"));
   assert.ok(fileTool.inputSchema.properties.size.enum.includes("50mp"));
+  assert.ok(fileTool.inputSchema.properties.size.enum.includes("maximum"));
+  assert.ok(fileTool.inputSchema.properties.format.enum.includes("auto"));
+  assert.ok(fileTool.inputSchema.properties.format.enum.includes("jpeg"));
 });
 
 test("MF-02 & MF-03: server.json satisfies Official MCP Registry <=100-char limit and MCP runtime blocks format traversal, invalid enums, unknown args, and symlinks with 0 HTTP calls", async () => {
@@ -659,6 +665,123 @@ test("M-P0-04 & M-P1-08: MCP remove_background_url recovers from HTTP 413 via ti
     assert.equal(badRes.result.isError, true);
     assert.match(badRes.result.content[0].text, /untrusted host/i);
     assert.equal(evilUploads, 0);
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("ENG-02 (v1.3.2): MCP supports size='maximum', format='auto'/'jpeg' default output extensions, .gif magic check, and 29.5 MiB combined limit", async () => {
+  assert.equal(MAX_COMBINED_UPLOAD_BYTES, 30_932_992);
+  assert.ok(VALID_SIZES.includes("maximum"));
+  assert.deepEqual(VALID_FORMATS, ["auto", "png", "jpg", "jpeg", "webp", "zip"]);
+
+  const sandbox = fs.mkdtempSync(path.join(tempRoot, "remove-ac-mcp-eng02-"));
+  try {
+    const gifPath = path.join(sandbox, "anim.gif");
+    const fakeGifPath = path.join(sandbox, "disguised.gif");
+    fs.writeFileSync(gifPath, Buffer.from("GIF89a\x01\x00\x01\x00\x00\x00\x00;", "latin1"));
+    fs.writeFileSync(fakeGifPath, "NOT_A_GIF_SECRET=123\n");
+
+    const seenOpts = [];
+    const mockClient = (mediaType = "image/jpeg") => () => ({
+      removeBackground: async (_input, opts) => {
+        seenOpts.push(opts);
+        return {
+          buffer: Buffer.from("JPG_OUT"),
+          width: 400,
+          height: 300,
+          creditsCharged: 1,
+          mediaType,
+        };
+      },
+    });
+
+    // 1. format="jpeg" + size="maximum" + .gif input resolves default output to anim-nobg.jpg
+    const resJpeg = await handleMcpRequest(
+      {
+        jsonrpc: "2.0",
+        id: 701,
+        method: "tools/call",
+        params: {
+          name: "remove_background_file",
+          arguments: { inputPath: gifPath, size: "maximum", format: "jpeg" },
+        },
+      },
+      mockClient("image/jpeg"),
+    );
+    assert.equal(resJpeg.result.isError, undefined);
+    const bodyJpeg = JSON.parse(resJpeg.result.content[0].text);
+    assert.equal(bodyJpeg.outputPath, path.join(sandbox, "anim-nobg.jpg"));
+    assert.equal(seenOpts[0].size, "maximum");
+    assert.equal(seenOpts[0].format, "jpeg");
+    fs.unlinkSync(bodyJpeg.outputPath);
+
+    // 2. format="auto" with omitted outputPath derives extension from mediaType (never .auto!)
+    const resAuto = await handleMcpRequest(
+      {
+        jsonrpc: "2.0",
+        id: 702,
+        method: "tools/call",
+        params: {
+          name: "remove_background_file",
+          arguments: { inputPath: gifPath, size: "maximum", format: "auto", bgColor: "FFFFFF" },
+        },
+      },
+      mockClient("image/jpeg; charset=binary"),
+    );
+    assert.equal(resAuto.result.isError, undefined);
+    const bodyAuto = JSON.parse(resAuto.result.content[0].text);
+    assert.equal(bodyAuto.outputPath, path.join(sandbox, "anim-nobg.jpg"));
+    assert.equal(fs.existsSync(path.join(sandbox, "anim-nobg.auto")), false);
+
+    // 3. Disguised .gif and 29.5 MiB + 1 B combined files fail with 0 API calls
+    let badHits = 0;
+    const guardFactory = () => ({
+      removeBackground: async () => {
+        badHits += 1;
+        return { buffer: TINY_PNG, width: 1, height: 1, creditsCharged: 1, mediaType: "image/png" };
+      },
+    });
+    const fakeGifRes = await handleMcpRequest(
+      {
+        jsonrpc: "2.0",
+        id: 703,
+        method: "tools/call",
+        params: { name: "remove_background_file", arguments: { inputPath: fakeGifPath } },
+      },
+      guardFactory,
+    );
+    assert.equal(fakeGifRes.result.isError, true);
+
+    const fg15 = path.join(sandbox, "fg15.png");
+    const bg145Plus1 = path.join(sandbox, "bg145p1.png");
+    fs.writeFileSync(
+      fg15,
+      Buffer.concat([TINY_PNG, Buffer.alloc(15 * 1024 * 1024 - TINY_PNG.length, 0)]),
+    );
+    fs.writeFileSync(
+      bg145Plus1,
+      Buffer.concat([TINY_PNG, Buffer.alloc(14.5 * 1024 * 1024 + 1 - TINY_PNG.length, 0)]),
+    );
+    const overCombinedRes = await handleMcpRequest(
+      {
+        jsonrpc: "2.0",
+        id: 704,
+        method: "tools/call",
+        params: {
+          name: "remove_background_file",
+          arguments: {
+            inputPath: fg15,
+            bg_image_path: bg145Plus1,
+            outputPath: path.join(sandbox, "never.png"),
+          },
+        },
+      },
+      guardFactory,
+    );
+    assert.equal(overCombinedRes.result.isError, true);
+    assert.match(overCombinedRes.result.content[0].text, /29\.5 MB/);
+    assert.equal(badHits, 0);
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true });
   }

@@ -1,6 +1,6 @@
 # Installing remove-ac MCP Server (for AI Agents)
 
-Follow these steps in order to install and verify the official `remove.ac` Model Context Protocol (MCP) stdio server (`remove-ac@1.3.1`, Official MCP Registry ID `io.github.szp2005/remove-ac`) in Cline, Claude Desktop, Cursor, VS Code, or Windsurf.
+Follow these steps in order to install and verify the official `remove.ac` Model Context Protocol (MCP) stdio server (`remove-ac@1.3.2`, Official MCP Registry ID `io.github.szp2005/remove-ac`) in Cline, Claude Desktop, Cursor, VS Code, or Windsurf.
 
 ## 1. Check Node.js Prerequisite
 
@@ -12,15 +12,15 @@ Node.js `18.0.0` or newer is required. The `remove-ac` package has zero runtime 
 
 ## 2. Verify the MCP Server Binary and Handshake (No API Key Required)
 
-Run this read-only stdio handshake check to confirm `npx` fetches `remove-ac@1.3.1` cleanly and lists all three tools:
+Run this read-only stdio handshake check to confirm `npx` fetches `remove-ac@1.3.2` cleanly and lists all three tools:
 
 ```bash
-npx -y -p remove-ac@1.3.1 remove-ac-mcp --version
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cline-installer","version":"1.0.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | npx -y -p remove-ac@1.3.1 remove-ac-mcp
+npx -y -p remove-ac@1.3.2 remove-ac-mcp --version
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cline-installer","version":"1.0.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | npx -y -p remove-ac@1.3.2 remove-ac-mcp
 ```
 
 Expected output:
-- Version line: `1.3.1`
+- Version line: `1.3.2`
 - JSON-RPC `tools/list` response containing `remove_background_file`, `remove_background_url`, and `get_account_balance`.
 
 ## 3. Obtain an API Key from the User

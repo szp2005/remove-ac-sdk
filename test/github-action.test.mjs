@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   ACTION_VERSION,
+  MAX_ACTION_COMBINED_BYTES,
   resolveSafeActionPath,
   runGithubAction,
   validateActionBaseUrl,
@@ -332,7 +333,7 @@ test("MF-3 & MF-4: GitHub Action protects GITHUB_STATE, uncreated runner files u
     assert.equal(res.processed_count, "1");
   }
 
-  for (const validSize of ["25mp", "50mp", "full"]) {
+  for (const validSize of ["25mp", "50mp", "full", "maximum"]) {
     const res = await runGithubAction({
       env: {
         GITHUB_WORKSPACE: ws,
@@ -358,7 +359,7 @@ test("MF-3 & MF-4: GitHub Action protects GITHUB_STATE, uncreated runner files u
 });
 
 test("v1.3.0 GitHub Action supports bg-image-file and bg-image-url and blocks traversal/SSRF/conflicts", async (t) => {
-  assert.equal(ACTION_VERSION, "1.3.1");
+  assert.equal(ACTION_VERSION, "1.3.2");
   const ws = createTempWorkspace(t);
   const fgFile = path.join(ws, "subject.png");
   const bgFile = path.join(ws, "backdrop.png");
@@ -552,7 +553,7 @@ test("R2 MF-04 & MF-02: GitHub Action excludes bg-image-file from directory batc
           return new Response(TINY_PNG, { status: 200 });
         },
       }),
-    /exceeds 30 MB limit/,
+    /exceeds 29\.5 MB limit/,
   );
   assert.equal(overwriteApiCalls, 0);
 });
@@ -653,4 +654,55 @@ test("M-P0-04 & M-P1-08: GitHub Action image_url recovers from HTTP 413 via tick
     /untrusted host/i,
   );
   assert.equal(evilHits, 0);
+});
+
+test("ENG-02 (v1.3.2): GitHub Action supports size='maximum', format='jpeg'/'auto', and 29.5 MiB combined limit", async (t) => {
+  assert.equal(MAX_ACTION_COMBINED_BYTES, 30_932_992);
+  const ws = createTempWorkspace(t);
+  fs.writeFileSync(path.join(ws, "sku.png"), TINY_PNG);
+
+  const rJpeg = await runGithubAction({
+    env: {
+      GITHUB_WORKSPACE: ws,
+      INPUT_API_KEY: "rac_live_gha_eng02",
+      INPUT_INPUT_PATH: "sku.png",
+      INPUT_SIZE: "maximum",
+      INPUT_FORMAT: "jpeg",
+      INPUT_BASE_URL: "http://127.0.0.1:8787",
+    },
+    cwd: ws,
+    stdout: { write() {} },
+    allowLoopbackBaseUrlForTest: true,
+    fetchImpl: async (_url, init) => {
+      assert.equal(init.body.get("size"), "maximum");
+      assert.equal(init.body.get("format"), "jpeg");
+      return new Response(Buffer.from("JPG"), {
+        status: 200,
+        headers: { "Content-Type": "image/jpeg", "X-Credits-Charged": "1" },
+      });
+    },
+  });
+  assert.equal(rJpeg.output_path, path.join(ws, "sku-nobg.jpg"));
+  fs.unlinkSync(rJpeg.output_path);
+
+  const rAuto = await runGithubAction({
+    env: {
+      GITHUB_WORKSPACE: ws,
+      INPUT_API_KEY: "rac_live_gha_eng02",
+      INPUT_INPUT_PATH: "sku.png",
+      INPUT_SIZE: "maximum",
+      INPUT_FORMAT: "auto",
+      INPUT_BG_COLOR: "FFFFFF",
+      INPUT_BASE_URL: "http://127.0.0.1:8787",
+    },
+    cwd: ws,
+    stdout: { write() {} },
+    allowLoopbackBaseUrlForTest: true,
+    fetchImpl: async () =>
+      new Response(Buffer.from("AUTO_JPG"), {
+        status: 200,
+        headers: { "Content-Type": "image/jpeg", "X-Credits-Charged": "1" },
+      }),
+  });
+  assert.equal(rAuto.output_path, path.join(ws, "sku-nobg.jpg"));
 });

@@ -17,14 +17,14 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 SDK_VERSION = __version__
 USER_AGENT = f"remove-ac-python-sdk/{SDK_VERSION}"
 
 DEFAULT_BASE_URL = "https://remove.ac"
 DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024
+MAX_COMBINED_UPLOAD_BYTES = 30 * 1024 * 1024 - 512 * 1024  # 29.5 MB (30,932,992 bytes)
 MAX_IMAGE_PIXELS = 50_000_000
 MAX_IMAGE_DIMENSION = 50_000
 MAX_IMPROVE_TAG_LEN = 64
@@ -43,6 +43,7 @@ VALID_SIZES: Tuple[str, ...] = (
     "25mp",
     "50mp",
     "full",
+    "maximum",
 )
 VALID_FORMATS: Tuple[str, ...] = ("auto", "png", "jpg", "jpeg", "webp", "zip")
 VALID_CHANNELS: Tuple[str, ...] = ("rgba", "alpha")
@@ -76,6 +77,7 @@ SizeLiteral = Literal[
     "25mp",
     "50mp",
     "full",
+    "maximum",
 ]
 
 
@@ -1009,7 +1011,7 @@ class RemoveAcClient:
         ):
             raise RemoveAcError(
                 413,
-                "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+                "Combined foreground and background upload size exceeds 29.5 MB raw image limit (30932992 bytes; 30 MB multipart envelope)",
             )
 
         def _via_ticket(suffix: str) -> bytes:
@@ -1233,7 +1235,7 @@ class RemoveAcClient:
                 ):
                     raise RemoveAcError(
                         413,
-                        "Combined foreground and background upload size exceeds 30 MB maximum envelope (31457280 bytes)",
+                        "Combined foreground and background upload size exceeds 29.5 MB raw image limit (30932992 bytes; 30 MB multipart envelope)",
                     )
             if img_bytes is not None:
                 return _via_ticket("fallback413")
