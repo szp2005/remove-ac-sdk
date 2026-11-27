@@ -22,8 +22,41 @@ Zero-dependency official developer SDKs, hot-folder CLI, GitHub Action, and Mode
 - **Zero External Runtime Dependencies:** The Node.js 18+ SDK, CLI, GitHub Action, MCP stdio server, and Python 3.8+ SDK run purely on standard library primitives (`fetch`/`crypto` in Node, `urllib` in Python).
 - **Sub-2s Warm Cloud GPU Latency (Measured 2026-11-19 on Real AIM-500 Photos):** Full high-resolution matting and edge refinement finishes in **`0.88–1.04 s` on GPU (`1.58 s` end-to-end)** at 2.2 MP (`1696×1312`) and **`1.49–2.01 s` on GPU (`2.26 s` end-to-end)** at 4K (`3840×2160`); cold scale-from-zero 4K finishes in **`8.41 s` end-to-end**.
 - **Free Interactive Cloud GPU Previews (`~612px`, `0` Credits):** In the web studio ([remove.ac/upload](https://remove.ac/upload)), inspect `~612px` (`~0.25 MP`) Cloud GPU cutouts for `0` credits (`5/day` on free accounts, `30/day` with paid credits; images already within preview dimensions deliver full original resolution free) before spending `1` credit to unlock full-resolution Max HD (up to `50 MP / 25 MB`, keeping background/shadow/crop edits).
-- **Dec 1 Migration Grant (`30%-50%` Off Through Dec 31, 2026) & `14`-Day Self-Serve Refund:** Self-serve checkout auto-applies `30%` off Starter (`10-75` PAYG, `40` mo/yr), `40%` off Growth (`200-500`), and `50%` off High-Volume (`1,200-5,000` PAYG/mo + `1,200` yr) on first `3` monthly cycles, first annual year up to `1,200`, or non-expiring PAYG packs (up to `3` orders/account, max `1` on `2,800`/`5,000`; Enterprise `2,800`/`5,000` annual concierge-verified via `support@remove.ac`). Initial orders include a `14`-day self-serve trial refund (`100%` if `0` credits used, or 1-click prorated refund if `<= 20%` and `<= 100` credits used, minus `$1` gateway fee, `1` prorated refund/account).
+- **Dec 1 Migration Grant (`30%-50%` Off Through Dec 31, 2026) & `14`-Day Self-Serve Refund:** Self-serve checkout auto-applies `30%` off Starter (`10-75` PAYG, `40` mo/yr), `40%` off Growth (`200-500`), and `50%` off High-Volume (`1,200-5,000` PAYG/mo + `1,200` yr) on first `3` monthly cycles, first annual year up to `1,200`, or non-expiring PAYG packs (up to `3` orders/account, max `1` on `2,800`/`5,000`; Enterprise `2,800`/`5,000` annual concierge-verified via `support@remove.ac`). Initial (non-renewal) orders include a `14`-day self-serve refund (`100%` if `0` credits used; otherwise 1-click proportional refund of remaining unused credits, `$0` fee, `$0.50` min payout, up to `2` self-serve refunds/account; further requests via `support@remove.ac`).
 - **Bug & Workflow Idea Credit Rewards:** Report bugs, cutout edge cases, or workflow ideas on the [remove.ac](https://remove.ac) homepage (up to `3` submissions per 24h) to earn `5-20` non-expiring Cloud GPU credits automatically once verified and accepted.
+
+---
+
+## Default `size` per Surface & Credit Cost
+
+The default output `size` is **not the same on every surface**. If you leave `size` out, the cost per successful image depends on which client you use. To get predictable output and billing, always pass `size` explicitly.
+
+| Surface | Default `size` when omitted | Output cap | Credits per successful image |
+|---|---|---|---|
+| REST `POST /v1.0/removebg` (curl or any HTTP client, `remove.bg`-compatible) | `preview` | ~0.25 MP | `0.25` |
+| Node.js SDK `RemoveAcClient.removeBackground()` | `auto` | up to 50 MP | `1` |
+| CLI `remove-ac` (`--size`) | `auto` | up to 50 MP | `1` |
+| Python SDK `RemoveAcClient.remove_background()` | `auto` | up to 50 MP | `1` |
+| Python `RemoveBg` drop-in shim (`remove_background_from_img_file` / `_img_url` / `_base64_img`) | `regular` | ~0.25 MP | `0.25` |
+| MCP server tools (`remove_background_file`, `remove_background_url`) | `full` | up to 50 MP | `1` |
+| GitHub Action (`size` input) | `full` | up to 50 MP | `1` |
+| Desktop app | `full` | up to 50 MP | `1` |
+
+Credit cost depends only on the `size` tier:
+
+- `preview`, `small`, `regular`: output capped at ~0.25 MP (250,000 px). Costs **`0.25` credit**.
+- `medium` (1.5 MP), `hd` (4 MP), `4k` (10 MP), `25mp` (25 MP), `50mp`, `full`, `maximum`, `auto` (up to 50 MP): costs **`1` credit**.
+- Failed, rejected (for example `413`) or timed-out calls cost `0` credits. The response header `X-Credits-Charged` reports the actual charge.
+
+## Upload Size Limits
+
+| Limit | Value | Enforced by |
+|---|---|---|
+| Single image (foreground or background file) | 25 MiB (26,214,400 bytes) and 50 MP (max 50,000 px per side) | SDKs, CLI, MCP, Action, Desktop (before upload) and the remove.ac edge |
+| Combined foreground + local background file in one request | 29.5 MiB (30,932,992 bytes) of raw image bytes | SDKs, CLI, MCP and Action (before upload). This leaves 512 KiB of headroom for multipart framing |
+| Whole HTTP request body | 32 MiB (33,554,432 bytes) | remove.ac edge. Larger requests get `413 payload_too_large` and `X-Credits-Charged: 0` |
+
+The client-side 29.5 MiB check always trips before the 32 MiB edge cap. In `v1.3.2`, client error messages call this the "30 MB multipart envelope"; the byte values in the table above are the exact limits.
 
 ---
 
@@ -185,6 +218,7 @@ In self-hosted or desktop n8n, open **Settings → Community Nodes → Install**
 
 - **Direct Downloads:** https://remove.ac/plugins/desktop (or [GitHub Releases](https://github.com/szp2005/remove-ac-sdk/releases))
 - **Installers:** `remove-ac-for-windows-1.1.1.exe` (NSIS x64), `remove-ac-portable-1.1.1.exe` (zero-install portable x64), `remove-ac-for-macos-1.1.1.dmg` (Universal Apple Silicon + Intel), and `remove-ac-for-linux-1.1.1.AppImage` (x64)
+- **First launch:** The installers are not code-signed, and the macOS build is not notarized. See [Unsigned Binary Notes](./desktop/README.md#unsigned-binary-notes-first-launch) for SHA-256 verification and the macOS 15+ **System Settings → Privacy & Security → Open Anyway** steps.
 
 ---
 
