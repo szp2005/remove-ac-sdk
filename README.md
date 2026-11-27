@@ -27,6 +27,39 @@ Zero-dependency official developer SDKs, hot-folder CLI, GitHub Action, and Mode
 
 ---
 
+## Default `size` per Surface & Credit Cost
+
+The default output `size` is **not the same on every surface**. If you leave `size` out, the cost per successful image depends on which client you use. To get predictable output and billing, always pass `size` explicitly.
+
+| Surface | Default `size` when omitted | Output cap | Credits per successful image |
+|---|---|---|---|
+| REST `POST /v1.0/removebg` (curl or any HTTP client, `remove.bg`-compatible) | `preview` | ~0.25 MP | `0.25` |
+| Node.js SDK `RemoveAcClient.removeBackground()` | `auto` | up to 50 MP | `1` |
+| CLI `remove-ac` (`--size`) | `auto` | up to 50 MP | `1` |
+| Python SDK `RemoveAcClient.remove_background()` | `auto` | up to 50 MP | `1` |
+| Python `RemoveBg` drop-in shim (`remove_background_from_img_file` / `_img_url` / `_base64_img`) | `regular` | ~0.25 MP | `0.25` |
+| MCP server tools (`remove_background_file`, `remove_background_url`) | `full` | up to 50 MP | `1` |
+| GitHub Action (`size` input) | `full` | up to 50 MP | `1` |
+| Desktop app | `full` | up to 50 MP | `1` |
+
+Credit cost depends only on the `size` tier:
+
+- `preview`, `small`, `regular`: output capped at ~0.25 MP (250,000 px). Costs **`0.25` credit**.
+- `medium` (1.5 MP), `hd` (4 MP), `4k` (10 MP), `25mp` (25 MP), `50mp`, `full`, `maximum`, `auto` (up to 50 MP): costs **`1` credit**.
+- Failed, rejected (for example `413`) or timed-out calls cost `0` credits. The response header `X-Credits-Charged` reports the actual charge.
+
+## Upload Size Limits
+
+| Limit | Value | Enforced by |
+|---|---|---|
+| Single image (foreground or background file) | 25 MiB (26,214,400 bytes) and 50 MP (max 50,000 px per side) | SDKs, CLI, MCP, Action, Desktop (before upload) and the remove.ac edge |
+| Combined foreground + local background file in one request | 29.5 MiB (30,932,992 bytes) of raw image bytes | SDKs, CLI, MCP and Action (before upload). This leaves 512 KiB of headroom for multipart framing |
+| Whole HTTP request body | 32 MiB (33,554,432 bytes) | remove.ac edge. Larger requests get `413 payload_too_large` and `X-Credits-Charged: 0` |
+
+The client-side 29.5 MiB check always trips before the 32 MiB edge cap. In `v1.3.2`, client error messages call this the "30 MB multipart envelope"; the byte values in the table above are the exact limits.
+
+---
+
 ## 1. Quick `curl` Migration
 
 ```bash
@@ -185,6 +218,7 @@ In self-hosted or desktop n8n, open **Settings → Community Nodes → Install**
 
 - **Direct Downloads:** https://remove.ac/plugins/desktop (or [GitHub Releases](https://github.com/szp2005/remove-ac-sdk/releases))
 - **Installers:** `remove-ac-for-windows-1.1.1.exe` (NSIS x64), `remove-ac-portable-1.1.1.exe` (zero-install portable x64), `remove-ac-for-macos-1.1.1.dmg` (Universal Apple Silicon + Intel), and `remove-ac-for-linux-1.1.1.AppImage` (x64)
+- **First launch:** The installers are not code-signed, and the macOS build is not notarized. See [Unsigned Binary Notes](./desktop/README.md#unsigned-binary-notes-first-launch) for SHA-256 verification and the macOS 15+ **System Settings → Privacy & Security → Open Anyway** steps.
 
 ---
 

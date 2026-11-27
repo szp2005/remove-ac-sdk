@@ -1,4 +1,4 @@
-# Remove.ac Desktop App (`v1.1.0`)
+# Remove.ac Desktop App (`v1.1.1`)
 
 Standalone native Electron desktop application for **[remove.ac](https://remove.ac/plugins/desktop)** — built for high-volume bulk AI background removal on **Windows 10/11 (`.exe`)**, **macOS Universal (`.dmg`)**, and **Linux x64 (`.AppImage`)**.
 
@@ -25,12 +25,37 @@ npm start         # Launch interactive desktop window
 
 ```bash
 cd desktop
-npm run dist:win    # -> dist/remove-ac-for-windows-1.1.0.exe (NSIS) + dist/remove-ac-portable-1.1.0.exe
-npm run dist:mac    # -> dist/remove-ac-for-macos-1.1.0.dmg (Universal arm64 + x64)
-npm run dist:linux  # -> dist/remove-ac-for-linux-1.1.0.AppImage (x64)
+npm run dist:win    # -> dist/remove-ac-for-windows-1.1.1.exe (NSIS) + dist/remove-ac-portable-1.1.1.exe
+npm run dist:mac    # -> dist/remove-ac-for-macos-1.1.1.dmg (Universal arm64 + x64)
+npm run dist:linux  # -> dist/remove-ac-for-linux-1.1.1.AppImage (x64)
 ```
+
+The file names follow `version` in `desktop/package.json`. These names match the assets of the [`desktop-v1.1.1` GitHub Release](https://github.com/szp2005/remove-ac-sdk/releases/tag/desktop-v1.1.1), which also includes `SHA256SUMS.txt`.
 
 ### Unsigned Binary Notes (First Launch)
 
-- **Windows 10/11 SmartScreen:** If Windows Defender SmartScreen displays *"Windows protected your PC"*, click **More info → Run anyway** (verify the SHA-256 hash against `SHA256SUMS.txt` on the GitHub Release page).
-- **macOS Gatekeeper:** After dragging `Remove.ac.app` to `/Applications`, right-click `Remove.ac.app` → **Open** (or run `xattr -dr com.apple.quarantine /Applications/Remove.ac.app` once).
+The `v1.1.1` installers are **not code-signed**. The macOS build is also **not notarized by Apple**. Before you open any of them, check the download against `SHA256SUMS.txt` on the GitHub Release page:
+
+```bash
+# macOS / Linux
+shasum -a 256 remove-ac-for-macos-1.1.1.dmg     # compare with SHA256SUMS.txt
+# Windows (PowerShell)
+Get-FileHash .\remove-ac-for-windows-1.1.1.exe -Algorithm SHA256
+```
+
+- **Windows 10/11 SmartScreen:** If Windows Defender SmartScreen shows *"Windows protected your PC"*, click **More info → Run anyway**.
+- **macOS 15 Sequoia and later:** The Control-click / right-click → **Open** shortcut no longer bypasses Gatekeeper for apps that are not notarized. Instead:
+  1. Drag `Remove.ac.app` to `/Applications` and double-click it once. macOS blocks it with a message such as *"Remove.ac" Not Opened*. Click **Done** (do **not** click *Move to Trash*).
+  2. Open **System Settings → Privacy & Security**. Scroll down to the **Security** section.
+  3. Next to *"Remove.ac" was blocked to protect your Mac*, click **Open Anyway**. Then confirm with your login password or Touch ID.
+  4. Click **Open Anyway** in the final dialog. Later launches open normally.
+- **macOS 14 Sonoma and earlier:** Control-click (or right-click) `Remove.ac.app` in `/Applications`, choose **Open**, then click **Open** again in the dialog.
+- **macOS fallback (Terminal):** If macOS says the app *"is damaged and can't be opened"*, or the **Open Anyway** button does not appear, you can remove the download quarantine flag from this one app:
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/Remove.ac.app
+  ```
+
+  > **Caution:** This turns off Gatekeeper's download check for `Remove.ac.app`. Run it only after the SHA-256 of the `.dmg` matches `SHA256SUMS.txt` from the official GitHub Release. Never run it on apps from sources you don't trust.
+
+Until signed and notarized macOS builds are published, use the steps above to run the app.
