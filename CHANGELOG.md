@@ -10,22 +10,23 @@ Tag `v1.3.2` (`e3a6f17`, PR #12). Published to npm, PyPI and the MCP Registry as
 - MCP server: `format` handling (`auto`, `jpeg`) now matches the SDKs, and `.gif` input files are accepted.
 - Combined foreground + background upload is now checked before upload against a 29.5 MiB (30,932,992 bytes) limit.
 - Removed the obsolete `smithery.yaml`.
+- Docs (`9dc1e1c`, PR #11): added `llms-install.md` (agent install guide) and a 400×400 marketplace icon.
 
 ## [1.3.1] — 2026-11-22
 
 Tag `v1.3.1` (`84bbf53`; fixes in `5ad0fd0`, PR #9 and #10). Security and reliability patch.
 
-- Strict `directEndpoint` allowlist. Custom `serverUrl` values with unsafe protocols or userinfo are rejected, so credentials cannot leak (Node.js SDK, CLI, Python SDK, Desktop).
+- Strict `directEndpoint` validation (Node.js SDK, CLI, MCP server, GitHub Action, Python SDK, Desktop). The ticket-issued direct endpoint must be HTTPS on port 443, contain no userinfo, and resolve to an allowed first-party host or the configured `baseUrl` / `base_url` host.
+- API origin overrides (CLI `--endpoint`, Action `base_url`, Desktop `baseUrl`) must use HTTPS and contain no userinfo.
 - SSRF hardening for `image_url` / `bg_image_url`: resolved public IPs are pinned (`node/net-safety.mjs`, Python pinned HTTPS connection).
 - URL fallback when the server returns `413`. Plus CLI file-output edge cases and MCP server error-handling fixes.
-- Docs (`9dc1e1c`, PR #11): added `llms-install.md` (agent install guide) and a 400×400 marketplace icon.
 
 ## [1.3.0] — 2026-11-17
 
 Tag `v1.3.0` (`e581dcd`, PR #5).
 
 - Client-side limits raised to 25 MB / 50 MP per image across the Node.js SDK, Python SDK, CLI, GitHub Action and MCP server.
-- Custom background image upload: `bgImageFile` / `bg_image_file`, CLI `--bg-image-file`, Action `bg-image-file`, MCP `bgImagePath`.
+- Custom background image upload: `bgImageFile` / `bg_image_file`, CLI `--bg-image`, Action `bg-image-file`, MCP `bgImagePath`.
 - New `submitImprove` / `submit_improve` for the zero-charge `POST /v1.0/improve` feedback endpoint.
 
 ## Desktop [1.1.1] — 2026-11-22
